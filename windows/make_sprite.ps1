@@ -4,13 +4,19 @@
 # rotated rectangle (convex hull + rotating calipers), which is robust against
 # the notch left where a finger used to overlap the screen.
 #
+# SeedX/SeedY are in SOURCE-IMAGE pixels and must land on the black panel. Any
+# pixel of that panel works - the flood fill spreads from there. To find one,
+# load the art at 1024, flood the opaque pixels with luminance <= 30 and take the
+# centroid of the biggest blob, then multiply by sourceWidth / 1024.
+# The defaults below are the current art (2880x2880, blue-haired maid).
+#
 # ASCII-only on purpose: Windows PowerShell 5.1 reads .ps1 without a BOM as ANSI.
 param(
   [string]$Source = $env:DSHPET_SOURCE,
   [string]$Out    = "sprite.png",
   [int]$Size      = 1024,
-  [int]$SeedX     = 1990,
-  [int]$SeedY     = 2190,
+  [int]$SeedX     = 2155,
+  [int]$SeedY     = 2205,
   [int]$DarkMax   = 30
 )
 
@@ -121,13 +127,38 @@ public class Caliper {
             px[i] = u * bux + v * bvx;
             py[i] = u * buy + v * bvy;
         }
+        // Build the on-screen TL,TR,BR,BL directly from the rectangle's axes
+        // instead of relabelling the calipers corners. The (u,v) tags flip when
+        // the panel tilts the other way (current art: 170.89 deg, where the true
+        // top-left has the LARGEST x), and pairing diagonals is fragile too.
+        // Classify the four rectangle corners into on-screen TL,TR,BR,BL.
+        // Do NOT try to infer which axis is which: the (u,v) tags flip with the
+        // tilt and "longer axis = horizontal" was wrong twice on this artwork.
+        // For a panel that is not steeply rotated, the sum/difference extremes
+        // give an unambiguous answer:
+        //   min(x+y) = top-left      max(x+y) = bottom-right
+        //   max(x-y) = top-right     min(x-y) = bottom-left
+        // The current panel is tilted only ~9 deg, so this is safe. A panel
+        // rotated past ~45 deg would need a different rule - re-check by
+        // rendering --selftest whenever the artwork changes.
+        int iTL = 0, iBR = 0, iTR = 0, iBL = 0;
+        for (int i = 1; i < 4; i++) {
+            if ((px[i] + py[i]) < (px[iTL] + py[iTL])) iTL = i;
+            if ((px[i] + py[i]) > (px[iBR] + py[iBR])) iBR = i;
+            if ((px[i] - py[i]) > (px[iTR] - py[iTR])) iTR = i;
+            if ((px[i] - py[i]) < (px[iBL] - py[iBL])) iBL = i;
+        }
+        double[] qx = new double[] { px[iTL], px[iTR], px[iBR], px[iBL] };
+        double[] qy = new double[] { py[iTL], py[iTR], py[iBR], py[iBL] };
         string[] nm = new string[] { "TL", "TR", "BR", "BL" };
-        string s = "region pixels=" + pts.Count + " hull=" + m + " area=" + Math.Round(bestArea) + "\n";
-        s += "angle=" + Math.Round(Math.Atan2(buy, bux) * 180 / Math.PI, 2) + " deg  size=" +
-             Math.Round(maxU - minU, 1) + " x " + Math.Round(maxV - minV, 1) + "\n";
-        s += "corners: ";
-        for (int i = 0; i < 4; i++) s += nm[i] + "=(" + Math.Round(px[i], 1) + "," + Math.Round(py[i], 1) + ") ";
-        return s;
+        string rep = "region pixels=" + pts.Count + " hull=" + m + " area=" + Math.Round(bestArea) + "\n";
+        rep += "angle=" + Math.Round(Math.Atan2(buy, bux) * 180 / Math.PI, 2) + " deg  size=" +
+               Math.Round(maxU - minU, 1) + " x " + Math.Round(maxV - minV, 1) + "\n";
+        rep += "corners: ";
+        for (int i = 0; i < 4; i++) {
+            rep += nm[i] + "=(" + Math.Round(qx[i], 1) + "," + Math.Round(qy[i], 1) + ") ";
+        }
+        return rep;
     }
 }
 '@ -ReferencedAssemblies System.Drawing

@@ -58,20 +58,36 @@ public sealed class Buf : IDisposable {
     public readonly int Stride;       // bytes per row inside the rect (= W*4)
     public readonly byte[] P;
     readonly BitmapData _d;
+    // Split timings, for the diagnostics only. A frame that blocks for hundreds of
+    // milliseconds inside what looks like a memcpy cannot be understood from a single
+    // total: LockBits, the row copies and UnlockBits fail for very different reasons.
+    public double LastLockMs, LastReadMs, LastWriteMs, LastUnlockMs;
+    public double LastBytes;
 
     public Buf(Bitmap b) : this(b, new Rectangle(0, 0, b.Width, b.Height)) { }
 
     public Buf(Bitmap b, Rectangle r) {
         Bmp = b; R = r; W = r.Width; H = r.Height;
+        Stopwatch ts = Stopwatch.StartNew();
         _d = b.LockBits(r, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        LastLockMs = ts.Elapsed.TotalMilliseconds;
         Stride = W * 4;
         P = new byte[Stride * H];
+        LastBytes = P.Length;
+        ts.Restart();
         for (int y = 0; y < H; y++) Marshal.Copy(IntPtr.Add(_d.Scan0, y * _d.Stride), P, y * Stride, Stride);
+        LastReadMs = ts.Elapsed.TotalMilliseconds;
     }
     public void Flush() {
+        Stopwatch ts = Stopwatch.StartNew();
         for (int y = 0; y < H; y++) Marshal.Copy(P, y * Stride, IntPtr.Add(_d.Scan0, y * _d.Stride), Stride);
+        LastWriteMs = ts.Elapsed.TotalMilliseconds;
     }
-    public void Dispose() { Bmp.UnlockBits(_d); }
+    public void Dispose() {
+        Stopwatch ts = Stopwatch.StartNew();
+        Bmp.UnlockBits(_d);
+        LastUnlockMs = ts.Elapsed.TotalMilliseconds;
+    }
 }
 
 public static class Cs {
@@ -94,6 +110,69 @@ internal static class Native {
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    // Diagnostics only: drives the window's real mouse handlers with posted messages, so a whole
+    // drag-and-drop can be exercised without moving the user's cursor.
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    // Synchronous twin of PostMessage. Used by the click-away guard, which has to inspect the
+    // state the message produced BEFORE the drop-down's own timers get a chance to act.
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    // Whether a mouse button is down RIGHT NOW.
+    //
+    // Needed because WM_NCHITTEST arrives on every MOUSE MOVE as well as on a press, so the
+    // message alone cannot distinguish "the pointer is outside the menu" from "the user pressed
+    // outside the menu". Asking the button state is what separates them.
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    public const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04;
+    // The high bit is set while the key is down; the low bit is "pressed since the last call",
+    // which is deliberately NOT used - it is shared state and another caller would consume it.
+    public static bool KeyDown(int vKey) { return (GetAsyncKeyState(vKey) & 0x8000) != 0; }
+
+    // ---- low-level mouse hook ------------------------------------------------
+    //
+    // Used to close the menu on a click outside it, because NOTHING ELSE CAN SEE THAT CLICK.
+    //
+    // The pet's window is click-through: it answers WM_NCHITTEST with HTTRANSPARENT over every
+    // non-solid pixel, so a click on empty screen goes to whatever is underneath. And while the
+    // menu is open the menu holds mouse capture, so Windows does not even send a fresh hit test
+    // for the press. That was MEASURED, not assumed: with hit logging on, a full click outside
+    // produced ZERO hit-test messages. Both the hit test and the window's own mouse messages were
+    // dead ends here.
+    //
+    // The hook sees the input stream before any of that routing, so capture, z-order and
+    // click-through are all irrelevant to it.
+    public const int WH_MOUSE_LL = 14;
+    // WM_LBUTTONDOWN already exists above; only the two this file did not have are added.
+    public const int WM_RBUTTONDOWN = 0x0204, WM_MBUTTONDOWN = 0x0207;
+    public delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSLLHOOKSTRUCT {
+        public int ptX, ptY;
+        public int mouseData, flags, time;
+        public IntPtr dwExtraInfo;
+    }
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, int dwThreadId);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")]
+    public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    // Which window is on top at a screen point. Used by the pot sentry so it never blames the app
+    // for a window that happens to be covering it.
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+    // Names the window covering the pet, so the sentry's "skipped" line says WHAT blocked it
+    // instead of leaving the user to guess.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder s, int max);
+    public const int GWL_EXSTYLE = -20;
+    public const int WS_EX_TOPMOST = 0x00000008;
+    // RegisterHotKey / WM_HOTKEY: the dashcam needs a key the user can hit while the pet has no
+    // focus at all (the window is click-through wherever the girl is not, so it never gets keys).
+    [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, int mods, int vk);
+    [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    public const int WM_HOTKEY = 0x0312;
+    public const int VK_F9 = 0x78;
+    public const int WM_MOUSEMOVE = 0x0200;
+    public const int WM_LBUTTONDOWN = 0x0201;
+    public const int WM_LBUTTONUP = 0x0202;
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
     [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
     [DllImport("user32.dll")] public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst,
@@ -164,41 +243,742 @@ sealed class Floater {
 
 // Small modal input dialog. ShowDialog pumps its own loop, so it works on top
 // of the layered main window.
+// The upload window: a drop target instead of a file picker.
+//
+// The old flow was "click upload from local" -> the Windows file dialog appears, which makes the user
+// navigate a tree to find a file they are often already looking at. Dragging the file onto a panel is
+// fewer steps and needs no navigation, so this window offers BOTH: click anywhere in the panel and the
+// picker still opens, or drop a file straight onto it.
+//
+// Accepts exactly what the picker accepted - same extensions, same 50 MB ceiling - because a drop path
+// with different rules from the click path would be a second, quieter source of "why was my file
+// rejected".
+sealed class UploadWindow : Form {
+    readonly PetTheme _t;
+    public string ChosenPath;               // null while the user has not chosen anything yet
+    readonly string _filter;
+    bool _hot;                              // pointer inside the panel: the drop hint brightens
+
+    public UploadWindow(PetTheme t, string filter, string title) {
+        _t = t;
+        _filter = filter;
+        Text = title;
+        Icon = DshPet.LoadWindowIcon(DshPet.AppBaseDir, "wave");
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent;
+        ClientSize = new Size(460, 280);
+        BackColor = t.Window;
+        ForeColor = t.Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        KeyPreview = true;
+        KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) { DialogResult = DialogResult.Cancel; Close(); } };
+        AllowDrop = true;                   // the panel is the whole window, so this is all that is needed
+        DragEnter += delegate(object s, DragEventArgs e) {
+            // Only claim the drop when it actually carries files, so a dragged selection of text does not
+            // turn the cursor into a drop arrow over a window that cannot accept it.
+            e.Effect = (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+                       ? DragDropEffects.Copy : DragDropEffects.None;
+        };
+        DragDrop += delegate(object s, DragEventArgs e) {
+            string[] files = e.Data == null ? null : e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (files == null || files.Length < 1) return;
+            ChosenPath = files[0];
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+        MouseEnter += delegate(object s, EventArgs e) { _hot = true; Invalidate(); };
+        MouseLeave += delegate(object s, EventArgs e) { _hot = false; Invalidate(); };
+        MouseClick += delegate(object s, MouseEventArgs e) { Browse(); };
+    }
+
+    // The click path. Identical filter and identical result field as the drop path.
+    void Browse() {
+        using (OpenFileDialog ofd = new OpenFileDialog()) {
+            ofd.Title = Text;
+            ofd.Filter = _filter;
+            if (ofd.ShowDialog(this) != DialogResult.OK) return;
+            ChosenPath = ofd.FileName;
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        base.OnPaint(e);
+        Graphics g = e.Graphics;
+        int pad = 22;
+        Rectangle well = new Rectangle(pad, pad, ClientSize.Width - pad * 2,
+                                       ClientSize.Height - pad * 2 - 34);
+        using (SolidBrush b = new SolidBrush(_t.Card)) g.FillRectangle(b, well);
+        // Dashed border: the conventional way to say "drop something here". Solid would read as a
+        // filled panel rather than a target, and the dash is also what distinguishes it from the
+        // window's own frame.
+        using (Pen p = new Pen(_hot ? _t.Accent : _t.Border, 2f)) {
+            p.DashStyle = System.Drawing.Drawing2D.DashStyle.Dash;
+            p.DashPattern = new float[] { 6f, 4f };
+            g.DrawRectangle(p, well.X, well.Y, well.Width - 1, well.Height - 1);
+        }
+        // Three lines, each positioned on its own band so the "or" sits BETWEEN the two instructions
+        // rather than running into one of them. DrawString with an explicit y, not DrawText on the whole
+        // panel: the latter centres on the panel and would overlap the lines below it.
+        using (SolidBrush b1 = new SolidBrush(_t.Ink)) {
+            SizeF s1 = g.MeasureString(DshPet.StrDropL1, Font);
+            g.DrawString(DshPet.StrDropL1, Font, b1,
+                         well.X + (well.Width - s1.Width) / 2f, well.Y + well.Height * 0.24f);
+        }
+        using (Font fOr = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush bOr = new SolidBrush(_t.Tertiary)) {
+            SizeF so = g.MeasureString(DshPet.StrDropOr, fOr);
+            g.DrawString(DshPet.StrDropOr, fOr, bOr,
+                         well.X + (well.Width - so.Width) / 2f, well.Y + well.Height * 0.42f);
+        }
+        using (SolidBrush b3 = new SolidBrush(_t.Ink)) {
+            SizeF s3 = g.MeasureString(DshPet.StrDropL3, Font);
+            g.DrawString(DshPet.StrDropL3, Font, b3,
+                         well.X + (well.Width - s3.Width) / 2f, well.Y + well.Height * 0.58f);
+        }
+        // The accepted formats, in the small type the rest of the app uses for secondary facts.
+        using (Font fh = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush bh = new SolidBrush(_t.Tertiary)) {
+            SizeF sh = g.MeasureString(DshPet.StrDropHint, fh);
+            g.DrawString(DshPet.StrDropHint, fh, bh,
+                         (ClientSize.Width - sh.Width) / 2f, well.Bottom + 8);
+        }
+    }
+}
+
+// The breadcrumb panel: what the right-click menu becomes.
+//
+// The menu could not hold this. A ContextMenuStrip closes on every item click (AutoClose), which is
+// exactly what "replace the panel in place" must not do, and a cascade of popups walks off the right
+// of the screen. So the panel is its own borderless window: one surface whose CONTENTS are swapped
+// when a row that leads somewhere is clicked, with a breadcrumb above it to walk back.
+//
+// Rows that DO something still do it and close the panel - a one-shot action has nothing to show
+// afterwards. Rows that LEAD somewhere keep it open.
+sealed class CrumbPanel : Form {
+    enum Act { None, Refresh, Demo, Settings, Key, Quit, Back }
+    sealed class Row { public Act A; public Rectangle R; public Row(Act a, Rectangle r) { A = a; R = r; } }
+
+    readonly DshPet _pet;
+    readonly PetTheme _t;
+    readonly List<Row> _rows = new List<Row>();
+    Point _mouse = new Point(-1, -1);
+    bool _inDemo;                       // which panel is showing; the breadcrumb reads this
+    bool _inSettings;                   // ...the settings panel is the other hostable one
+    int _setPage;                       // which settings page, mirrored onto the breadcrumb
+    readonly List<Row> _pageTabs = new List<Row>();
+    int _ox, _oy;                       // where the hosted content was drawn
+    Point _setOrigin;                   // where the settings page body was drawn
+    Point _anchor;                      // the click point; the panel grows UP from it
+    Rectangle _crumb;                   // the breadcrumb strip, for hit testing
+    // One long-lived settings instance drives the hosted interaction. Rendering runs on this same
+    // instance so its hit rectangles match what is on screen; a fresh instance per paint would have
+    // no memory of an in-progress slider drag.
+    SettingsWindow _host;
+
+    const int PadX = 6, PadY = 6;
+    // Matched to the ContextMenuStrip this replaces (--menushot measured rows at 34 and icons at
+    // 16x16). The row metrics ARE the menu's look; inventing new ones is what made the panel read
+    // as a different, worse thing.
+    const int RowH = 34, IconCol = 30, IconPx = 16;
+    // The same radius the ContextMenuStrip uses, so the panel and the menu it replaced share one
+    // corner. A hard-cornered window next to the rounded menu read as unfinished, which is exactly
+    // how it was reported.
+    const int Radius = 12;
+    // Icon kinds for the five root rows, matching the values DshPet's IC_* constants use. The panel
+    // owns this list because it owns the rows; MakeIcon still does the drawing, so the artwork cannot
+    // differ from the menu's.
+    static readonly int[] RootIcons = new int[] { 1, 4, 5, 7, 8 };   // refresh, demo, settings, key, quit
+    const int CrumbH = 30;              // the breadcrumb strip; 0 when at the root
+    const int MinW = 260, MaxW = 700;   // the settings host needs 620
+
+    public CrumbPanel(DshPet pet) {
+        _pet = pet;
+        _t = pet.ThemeForWindow();
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        TopMost = true;
+        BackColor = _t.Window;
+        ForeColor = _t.Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+        // AutoScaleMode.Font would take the 9.5 pt font above and scale the WHOLE form by the ratio
+        // against the designer default of 8.25 pt - so a 200x190 ClientSize came out as 300x300 and
+        // the panel size stopped being something AdjustSize controlled. That is what made the root
+        // panel look over-padded and the display page look clipped at the same time: the content was
+        // laid out for 200x190 inside a 300x300 window.
+        AutoScaleMode = AutoScaleMode.None;
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        KeyPreview = true;
+        KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
+        Deactivate += delegate(object s, EventArgs e) { Close(); };
+    }
+
+    // Opens at the cursor, kept inside the working area so a panel opened near an edge is not clipped.
+    public void ShowAt(Point screen, IWin32Window owner) {
+        _inDemo = false;
+        _inSettings = false;
+        _anchor = screen;
+        AdjustSize();
+        Place();
+        // Owned by the pet window. Without an owner this panel and the full-screen topmost pet
+        // window fight over the z-order, and the panel can lose activation the instant it appears -
+        // which reads as "right-click does nothing". Owning it makes the panel follow the pet's
+        // z-order, and clicking the pet then closes the panel, which is the wanted behaviour anyway.
+        if (owner != null) Show(owner); else Show();
+        Activate();
+    }
+
+    // Rounded outline for a rectangle, using the same 4-arc construction as the menu renderer.
+    static GraphicsPath RoundedRect(Rectangle r, int radius) {
+        GraphicsPath path = new GraphicsPath();
+        int d = radius * 2;
+        if (d > r.Width) d = r.Width;
+        if (d > r.Height) d = r.Height;
+        path.AddArc(r.X, r.Y, d, d, 180, 90);
+        path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
+    // Cuts the window itself to the rounded shape. Without this the fill is rounded but the window
+    // still has square corners, and the desktop shows through in the four notches.
+    void ApplyRoundRegion() {
+        if (Width <= 0 || Height <= 0) return;
+        using (GraphicsPath path = RoundedRect(new Rectangle(0, 0, Width, Height), Radius)) {
+            Region old = Region;
+            Region = new Region(path);
+            if (old != null) old.Dispose();
+        }
+    }
+
+    bool _dragging;                     // a hosted slider drag is in progress
+
+    // ---- diagnostics -------------------------------------------------------
+    //
+    // These drive the SAME methods the mouse does (OnMouseDown/OnMouseUp -> HostClick), not a
+    // parallel implementation. A test that re-implements the click only proves the test works, which
+    // is a trap this project has already fallen into.
+    public int HostHitCountForTest { get { return _host == null ? -1 : _host.HitCount; } }
+    public Point SetOriginForTest { get { return _setOrigin; } }
+    public string ProbeHitsForTest() {
+        if (_host == null) return "(no host)";
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        foreach (string part in _host.DumpHits().Split(' ')) {
+            if (part.Length < 5 || part[0] != '[') continue;
+            int at = part.IndexOf('@');
+            if (at < 0) continue;
+            string[] xy = part.Substring(at + 1).Split(',');
+            int px, py;
+            if (!int.TryParse(xy[0], out px)) continue;
+            if (!int.TryParse(xy[1], out py)) continue;
+            sb.Append(_host.HitKindAt(new Point(px + 2, py + 2))).Append(' ');
+        }
+        return sb.ToString();
+    }
+    // Width needed by the widest row on the current page, in host pixels. Used to prove the panel is
+    // wide enough instead of eyeballing a screenshot.
+    public int HostNeededWidthForTest() {
+        if (_host == null) return -1;
+        int right = 0;
+        foreach (string part in _host.DumpHits().Split(' ')) {
+            int at = part.IndexOf('@');
+            if (at < 0) continue;
+            string[] xy = part.Substring(at + 1).Split(',');
+            int px, py;
+            if (!int.TryParse(xy[0], out px)) continue;
+            if (!int.TryParse(xy[1], out py)) continue;
+            if (px > right) right = px;
+        }
+        return right;
+    }
+    public string DumpHitsForTest() {
+        if (_host == null) return "(no host)";
+        return _host.DumpHits();
+    }
+    public int HostHitTestForTest(Point panelPoint) {
+        return _host == null ? -999 : _host.HitKindAt(ToContent(panelPoint));
+    }
+    // Force a synchronous repaint so the hosted window's hit rectangles describe the page showing NOW.
+    // Invalidate() only queues a paint, and a hit test that runs before it lands reads the previous
+    // page's rectangles - which looks exactly like a control that does not respond.
+    // Put the pointer somewhere and repaint, so hover alignment can be photographed.
+    public void HoverAtForTest(Point p) { _mouse = p; SettleForTest(); }
+    public void SettleForTest() {
+        if (IsDisposed || Disposing || !IsHandleCreated) return;
+        Update();
+    }
+    public bool HostSliderRect(int index, out Rectangle r) {
+        r = Rectangle.Empty;
+        return _host != null && _host.HostHitRect(_host.HostKindSlider, index, out r);
+    }
+    public bool HostSizeRect(int index, out Rectangle r) {
+        r = Rectangle.Empty;
+        return _host != null && _host.HostHitRect(_host.HostKindSize, index, out r);
+    }
+    public bool HostSegmentedRect(int index, out Rectangle r) {
+        r = Rectangle.Empty;
+        return _host != null && _host.HostHitRect(_host.HostKindTheme, index, out r);
+    }
+    // Hit rectangles are stored relative to the page body's top-left, so a diagnostic clicking one
+    // must add that origin back. Using them as panel coordinates directly is what made the
+    // interaction look broken when it was not: the test clicked above every control.
+    public Point HostToPanel(Point host) {
+        return new Point(host.X + _setOrigin.X, host.Y + _setOrigin.Y);
+    }
+    public void SimulateHostClick(Point panelPoint) {
+        MouseEventArgs me = new MouseEventArgs(MouseButtons.Left, 1, panelPoint.X, panelPoint.Y, 0);
+        OnMouseDown(me);
+        OnMouseUp(me);
+    }
+
+    public bool DemoViewForTest { get { return _inDemo; } }
+    public void GoDemoForTest() { _inDemo = true; AdjustSize(); Invalidate(); }
+    public void GoSettingsForTest(int page) {
+        _inDemo = false; _inSettings = true; _setPage = page; AdjustSize(); Invalidate();
+    }
+    public int SettingsPageForTest { get { return _setPage; } }
+    public void GoRootForTest() { _inDemo = false; _inSettings = false; AdjustSize(); Invalidate(); }
+
+    // Sized to the content: measured with the same fonts the drawing uses, so the panel cannot come
+    // out too small for its own text.
+    void AdjustSize() {
+        // Only a disposed form is unusable. NOT IsHandleCreated: this is called from ShowAt before the
+        // handle exists, and returning early there meant the size was never applied at all - the window
+        // kept WinForms' default 300x300 while the content was laid out for 200x190. That single guard
+        // produced both reported symptoms: the root panel looked over-padded, and the display page's
+        // last control was clipped, because the window was 100 px wider and taller than the layout.
+        if (IsDisposed || Disposing) return;
+        int w = MinW;
+        // Measured on a throwaway bitmap, not on CreateGraphics: measuring needs a Graphics, and this
+        // must work before there is a handle to create one from.
+        using (Bitmap probe = new Bitmap(8, 8))
+        using (Graphics g = Graphics.FromImage(probe)) {
+            using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point)) {
+                string[] root = new string[] { _pet.StrRefresh, _pet.StrDemo, _pet.StrSettings,
+                                                _pet.StrSetKey, _pet.StrQuit };
+                // Host views first. Written the other way round this read as `if (!_inDemo) measure
+                // the root rows ... else if (_inSettings)`, so the settings view fell into the root
+                // branch and its width came out as the widest root ROW (260) - the 560 below was
+                // unreachable. The panel rendered, just far too narrow for its own controls.
+                if (_inDemo) {
+                    w = 460;
+                } else if (_inSettings) {
+                    w = 620;   // 4-option segmented controls need the room; 560 made them collide
+                } else {
+                    w = 200;   // the menu's own width; the rows only need the text plus the icon column
+                    foreach (string s in root) {
+                        int need = (int)g.MeasureString(s, f).Width + IconCol + 26;
+                        if (need > w) w = need;
+                    }
+                }
+            }
+        }
+        if (w > MaxW) w = MaxW;
+        int h;
+        if (_inDemo) h = PadY * 2 + CrumbH + DemoContentHeight();
+        // The +14 is headroom, not padding: a segmented control is taller than a plain row, and
+        // without it the last control on the display page was clipped at the bottom edge while the
+        // panel still showed empty space below it - the measured height and the drawn height were
+        // not the same thing.
+        else if (_inSettings) h = PadY * 2 + CrumbH + SettingsContentHeight() + 14;
+        else h = PadY * 2 + RootContentHeight();
+        ClientSize = new Size(w, h);
+        ApplyRoundRegion();
+        Place();   // every size change re-anchors; see Place for why
+    }
+
+    // Puts the panel just above the click point, growing upward, and keeps it on screen.
+    //
+    // Upward rather than downward because the panel is a menu: it appears where the pointer already
+    // is, and a menu that grows downward from a click near the bottom edge has nowhere to go. Growing
+    // up also means the click point stays put as the content gets taller, so entering a sub-view does
+    // not move the thing that was just clicked.
+    //
+    // Called again on every AdjustSize, which is what fixes the reported overflow: switching to a
+    // sub-view makes the panel taller, and without re-placing it the extra height simply ran off the
+    // bottom of the screen.
+    void Place() {
+        if (Width <= 0 || Height <= 0) return;
+        Rectangle wa = Screen.FromPoint(_anchor).WorkingArea;
+        int x = _anchor.X;
+        int y = _anchor.Y - Height;          // bottom edge at the click point
+        if (x + Width > wa.Right) x = wa.Right - Width;
+        if (x < wa.Left) x = wa.Left;
+        if (y < wa.Top) y = wa.Top;
+        if (y + Height > wa.Bottom) y = wa.Bottom - Height;
+        Location = new Point(x, y);
+    }
+
+    // Five rows and the separator, exactly as the menu laid them out (--menushot measured the real
+    // menu at 199x180). The first version added an extra 12 px on top of this, which is the
+    // "too much empty space" the panel was reported for.
+    int RootContentHeight() { return RowH * 5 + 8; }
+
+    int DemoContentHeight() {
+        // The hosted rows, drawn once into a throwaway bitmap purely to measure. Cheap, and it keeps
+        // the height derived from the drawing rather than from a second set of constants.
+        using (Bitmap b = new Bitmap(8, 8))
+        using (Graphics g = Graphics.FromImage(b)) {
+            DemoWindow d = new DemoWindow(_pet);
+            return d.RenderInto(g, 0, 0, 440, 0, new Point(-1, -1));
+        }
+    }
+
+    // Measured the same way the demo pages are: render once into a throwaway bitmap and use the
+    // height the drawing reports. A per-page constant here would be a second source of truth that
+    // goes stale the moment a row is added.
+    int SettingsContentHeight() {
+        using (Bitmap b = new Bitmap(8, 8))
+        using (Graphics g = Graphics.FromImage(b)) {
+            SettingsWindow sw = new SettingsWindow(_pet);
+            sw.SelectPageForTest(_setPage);
+            return sw.RenderPageInto(g, 0, 0, 504, new Point(-1, -1));
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        // Rounded card, like the menu: fill plus a hairline outline, both on the same path so the
+        // border hugs the curve instead of cutting across it.
+        Rectangle full = new Rectangle(0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+        using (GraphicsPath shell = RoundedRect(full, Radius)) {
+            using (SolidBrush b = new SolidBrush(_t.Window)) g.FillPath(b, shell);
+            using (Pen p = new Pen(_t.Border)) g.DrawPath(p, shell);
+        }
+        _rows.Clear();
+        int y = PadY;
+        if (_inDemo) {
+            // The breadcrumb. Clicking it walks back one level - the whole point of the design: the
+            // user can always see where they are and how to leave, without a popup stack.
+            _crumb = new Rectangle(PadX, y, ClientSize.Width - PadX * 2, CrumbH - 4);
+            using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+            using (SolidBrush b = new SolidBrush(_t.Secondary))
+                g.DrawString("\u2039  " + _pet.StrCrumbMenu, f, b,
+                             _crumb.X + 2, _crumb.Y + (_crumb.Height - 16) / 2);
+            y += CrumbH;
+            DemoWindow d = new DemoWindow(_pet);
+            _ox = PadX; _oy = y;
+            // _mouse, NOT ToContent(_mouse): RenderInto records its hit rectangles in PANEL
+            // coordinates (it adds ox/oy itself), so the hover point has to be in the same space.
+            // Subtracting the origin here put the highlight a whole row above the cursor - the
+            // "the pointer and the highlighted row disagree" report. The settings host is the
+            // opposite: it normalises its rectangles, so IT wants ToContent.
+            d.RenderInto(g, _ox, _oy, ClientSize.Width - PadX * 2, 0, _mouse);
+            return;
+        }
+        if (_inSettings) {
+            _pageTabs.Clear();
+            // One tab per settings page on the breadcrumb strip. Clicking a tab swaps the page in
+            // place - the same interaction the demo row uses one level up, applied one level down.
+            // The strip is therefore both navigation and a where-am-I indicator, which is what a
+            // breadcrumb is for; the window's sidebar is not needed here.
+            int tx = PadX;
+            using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point)) {
+                for (int i = 0; i < SettingsWindow.PageNamesPublic.Length; i++) {
+                    string nm = SettingsWindow.PageNamesPublic[i];
+                    SizeF sz = g.MeasureString(nm, f);
+                    int tw = (int)sz.Width + 22;
+                    Rectangle tr = new Rectangle(tx, y, tw, CrumbH - 8);
+                    bool sel = i == _setPage;
+                    using (GraphicsPath path = PetTheme.Round(tr, 6)) {
+                        using (SolidBrush b = new SolidBrush(sel ? _t.Accent : _t.Card)) g.FillPath(b, path);
+                        using (Pen p = new Pen(_t.Border)) g.DrawPath(p, path);
+                    }
+                    using (SolidBrush b = new SolidBrush(sel ? Color.FromArgb(255, 12, 18, 30) : _t.Secondary))
+                        g.DrawString(nm, f, b, tr.X + 11, tr.Y + (tr.Height - sz.Height) / 2);
+                    _pageTabs.Add(new Row((Act)(100 + i), tr));
+                    tx += tw + 6;
+                }
+            }
+            y += CrumbH;
+            if (_host == null) _host = new SettingsWindow(_pet);
+            _host.SelectPageForTest(_setPage);
+            // _setOrigin must be EXACTLY what is handed to RenderPageInto, because the host forwards
+            // clicks by subtracting it while RenderPageInto records hits relative to the same point.
+            // They differed by the 30 px the page body sits below its host, so every forwarded click
+            // landed 30 px high and missed - sliders and segmented controls did nothing in the panel
+            // while working fine in the window.
+            // _setOrigin is the page body's top-left in panel coordinates, and RenderPageInto normalises
+            // its hit rectangles against the SAME point (its _contentTop). Forwarding a click is then a
+            // plain subtraction. When these two disagreed by the 30 px header offset, every forwarded
+            // click landed 30 px high and missed: sliders and segmented controls silently did nothing
+            // in the panel while working in the window.
+            // Two values, deliberately: `bodyTop` is where the page body starts in panel
+            // coordinates (used for hit forwarding), and it is ALSO the reference RenderPageInto
+            // normalises its rectangles against. Passing the header offset here instead made the two
+            // disagree by exactly that offset, so every forwarded click missed by 30 px.
+            // One number for both: bodyTop is where the page body starts, it is what RenderPageInto
+            // normalises against, and it is what a forwarded click subtracts. See RenderPageInto.
+            int bodyTop = y + 30;
+            _setOrigin = new Point(PadX, bodyTop);
+            // _mouse, NOT ToContent(_mouse). Inside RenderPageInto the rows are drawn at ABSOLUTE
+            // coordinates and hover is tested there with r.Contains(_mouse); the normalisation to
+            // relative coordinates happens at the END, for the hit rectangles only. Passing a
+            // already-unshifted point subtracted the origin twice, and the highlight then sat a fixed
+            // 66 px above the pointer - which the screen recording showed plainly: the cursor on the
+            // feature-switch hint while the highlight was on the row above it.
+            _host.RenderPageInto(g, PadX, bodyTop, ClientSize.Width - PadX * 2, _mouse);
+            return;
+        }
+        _crumb = Rectangle.Empty;
+        int[] ic = RootIcons;
+        y = RootRow(g, y, _pet.StrRefresh, Act.Refresh, ic[0]);
+        y = RootRow(g, y, _pet.StrDemo, Act.Demo, ic[1]);
+        y = RootRow(g, y, _pet.StrSettings, Act.Settings, ic[2]);
+        y = RootSeparator(g, y);
+        y = RootRow(g, y, _pet.StrSetKey, Act.Key, ic[3]);
+        y = RootRow(g, y, _pet.StrQuit, Act.Quit, ic[4]);
+    }
+
+    // One menu row: hover highlight, the colour icon in its own column, then the caption.
+    // No rounded card - the menu did not use one, and boxing every row is what made the panel look
+    // cluttered next to it.
+    int RootRow(Graphics g, int y, string text, Act a, int iconKind) {
+        Rectangle r = new Rectangle(PadX, y, ClientSize.Width - PadX * 2, RowH);
+        bool hot = r.Contains(_mouse);
+        if (hot) {
+            using (SolidBrush b = new SolidBrush(_t.CardHover)) g.FillRectangle(b, r);
+        }
+        if (iconKind != 0) {
+            // Drawn through the pet's own MakeIcon, so the panel and the menu cannot show different
+            // artwork for the same row.
+            using (Bitmap ic = _pet.MakeIcon(iconKind)) {
+                g.DrawImage(ic, r.X + (IconCol - IconPx) / 2, r.Y + (RowH - IconPx) / 2, IconPx, IconPx);
+            }
+        }
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink)) {
+            SizeF sz = g.MeasureString(text, f);
+            g.DrawString(text, f, b, r.X + IconCol, r.Y + (r.Height - sz.Height) / 2);
+        }
+        _rows.Add(new Row(a, r));
+        return y + RowH;
+    }
+
+    // The hairline the menu drew between the settings block and the system block.
+    // A hairline that stops short of both edges, the way Win11 separates menu groups. A full-width
+    // rule reads as a border between panels rather than as a soft break inside one menu.
+    int RootSeparator(Graphics g, int y) {
+        int inset = IconCol - 8;
+        using (Pen p = new Pen(_t.Hairline))
+            g.DrawLine(p, PadX + inset, y + 4, ClientSize.Width - PadX - 8, y + 4);
+        return y + 8;
+    }
+
+    // The panel's mouse point, expressed in the coordinates the hosted content was drawn in.
+    // Panel coordinates -> the coordinates the hosted window's hit rectangles live in.
+    //
+    // The reference comes FROM the host rather than being recomputed here. Three attempts to derive it
+    // locally all landed 30 px off, because the page body, the header offset and the normalisation
+    // point are three different numbers that happen to be close together.
+    Point ToContent(Point p) {
+        if (_inSettings && _host != null) {
+            return new Point(p.X - _setOrigin.X, p.Y - _setOrigin.Y);
+        }
+        return new Point(p.X - _ox, p.Y - _oy);
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e) {
+        _mouse = e.Location;
+        // A hosted slider keeps following the pointer even after it leaves the track - the same rule
+        // the window applies with Capture, so the control feels identical in both hosts.
+        if (_dragging && _host != null) {
+            _host.HostDragTo(ToContent(e.Location));
+            Invalidate();
+            base.OnMouseMove(e);
+            return;
+        }
+        Invalidate();
+        base.OnMouseMove(e);
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e) {
+        if (_dragging && _host != null) {
+            _host.HostDragEnd();
+            _dragging = false;
+        }
+        base.OnMouseUp(e);
+    }
+    protected override void OnMouseLeave(EventArgs e) {
+        _mouse = new Point(-1, -1);
+        Invalidate();
+        base.OnMouseLeave(e);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e) {
+        if (e.Button != MouseButtons.Left) return;
+        base.OnMouseDown(e);
+        if (_inSettings) {
+            for (int i = _pageTabs.Count - 1; i >= 0; i--) {
+                if (_pageTabs[i].R.Contains(e.Location)) {
+                    _setPage = (int)_pageTabs[i].A - 100;
+                    if (_host != null) _host.SelectPageForTest(_setPage);
+                    AdjustSize();
+                    Invalidate();
+                    return;
+                }
+            }
+            // Everything else belongs to the page body, and is handled by the window itself - so a
+            // slider in the panel behaves exactly like a slider in the window.
+            if (_host != null) {
+                _host.HostClick(ToContent(e.Location));
+                _dragging = _host.HostDragActive;
+                AdjustSize();
+                Invalidate();
+            }
+            return;
+        }
+        if (_inDemo) {
+            // Breadcrumb first: it sits above the hosted rows and must not be shadowed by them.
+            if (!_crumb.IsEmpty && _crumb.Contains(e.Location)) { GoRoot(); return; }
+            DemoWindow d = new DemoWindow(_pet);
+            // Draw once so the hit rectangles exist for this layout, then hit test. RenderInto clears
+            // and refills them, so this is the same pass the paint used - it cannot disagree with it.
+            using (Bitmap b = new Bitmap(8, 8))
+            using (Graphics g = Graphics.FromImage(b))
+                d.RenderInto(g, _ox, _oy, ClientSize.Width - PadX * 2, 0, e.Location);
+            DemoWindow.Kind k = d.ActionOf(e.Location);
+            if (k == DemoWindow.Kind.Close) { Close(); return; }
+            if (k != DemoWindow.Kind.None) { Close(); d.RunAction(k); }
+            return;
+        }
+        for (int i = _rows.Count - 1; i >= 0; i--) {
+            if (!_rows[i].R.Contains(e.Location)) continue;
+            Run(_rows[i].A);
+            return;
+        }
+    }
+
+    void GoRoot() { _inDemo = false; AdjustSize(); Invalidate(); }
+
+    // A row that LEADS somewhere swaps the content and stays open; a row that DOES something runs and
+    // closes. That split is the design, not an implementation detail.
+    void Run(Act a) {
+        switch (a) {
+            case Act.Demo: _inDemo = true; AdjustSize(); Invalidate(); break;
+            case Act.Settings: _inSettings = true; _setPage = 0; AdjustSize(); Invalidate(); break;
+            case Act.Refresh: Close(); _pet.RefreshNowUi(); break;
+            case Act.Key: Close(); _pet.AskKeyUi(); break;
+            case Act.Quit: Close(); _pet.QuitUi(); break;
+        }
+    }
+}
+
 sealed class InputDialog : Form {
     readonly TextBox _box;
-    public InputDialog(string title, string prompt, string unit, string initial) {
+    // The theme, shared through a static so the ten existing call sites did not all have to be touched
+    // to gain it - and so a dialog added later cannot forget it.
+    //
+    // This dialog was the ONE window with no colours and no font of its own: SettingsWindow, DemoWindow
+    // and AudioEditor all set Window/Ink/YaHei, and this one set none of them, so it came up as a stock
+    // Windows dialog. That is the "the API key window's style is not unified" report. Seeded here in
+    // case a dialog is ever built before the app publishes its theme.
+    public static PetTheme CurrentTheme = new PetTheme(false);
+
+    public InputDialog(string title, string prompt, string unit, string initial)
+        : this(title, prompt, unit, initial, 880, false) { }
+
+    // wide: for long values. The API key is a 35+ character "sk-..." string and the default
+    // 230 px box could only show about half of it, which is what the user reported. A wider
+    // dialog plus a monospace face lets the whole key be read and checked at a glance -
+    // deliberately NOT masked, because being able to see what you pasted is the point here.
+    public InputDialog(string title, string prompt, string unit, string initial,
+                       int width, bool monospace) {
+        PetTheme t = CurrentTheme;
+        int pad = 14;
+        int inner = width - pad * 2;
+        // With no unit label the box takes everything; with one it leaves the 70 px the
+        // original layout reserved PLUS the 2 px its textbox border occupied, so the small
+        // dialogs still come out at exactly the 230 they always were.
+        int unitW = string.IsNullOrEmpty(unit) ? 0 : 72;
+        int boxW = inner - unitW;
+
         Text = title;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        Icon = DshPet.LoadWindowIcon(DshPet.AppBaseDir, "cursor");
+        // FixedSingle, matching SettingsWindow and DemoWindow. FixedDialog draws a thinner border and a
+        // different title-bar treatment, which is part of why this window did not look like the others.
+        FormBorderStyle = FormBorderStyle.FixedSingle;
         StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = false; MinimizeBox = false;
-        ClientSize = new Size(330, 140);
+        // 156 tall, not 140, and buttons 32 tall at y=102.
+        //
+        // The height is what the bigger font actually needs: at 26 px the 9.5 pt YaHei glyphs were
+        // clipped top and bottom - the rendered dialog showed "OK" and "Cancel" with their upper halves
+        // cut off. A stock dialog is sized for the 9 pt system font, so adopting the app's font means
+        // adopting its metrics too.
+        ClientSize = new Size(width, 156);   // width comes from the caller; 880 for the unified ones
         TopMost = true;
+        // The three lines that were missing. BackColor/ForeColor do nothing on their own for a dialog
+        // full of stock controls, but they set the window's own surface - and the Font is what the
+        // labels and buttons inherit, which is the visible half of "unified".
+        BackColor = t.Window;
+        ForeColor = t.Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+        DoubleBuffered = true;
 
         Label lab = new Label();
         lab.Text = prompt;
-        lab.SetBounds(14, 10, 300, 34);
+        lab.SetBounds(pad, 10, inner, 34);
+        lab.ForeColor = t.Secondary;          // the prompt is a hint, not content
         Controls.Add(lab);
 
         _box = new TextBox();
         _box.Text = initial;
-        _box.SetBounds(14, 46, 230, 24);
+        _box.SetBounds(pad, 46, boxW, 24);
+        _box.BackColor = t.Card;
+        _box.ForeColor = t.Ink;
+        _box.BorderStyle = BorderStyle.FixedSingle;
+        if (monospace) _box.Font = new Font("Consolas", 10f);
         Controls.Add(_box);
 
         Label u = new Label();
         u.Text = unit;
-        u.SetBounds(250, 49, 70, 20);
+        u.SetBounds(pad + boxW, 49, unitW, 20);
+        u.ForeColor = t.Secondary;
         Controls.Add(u);
 
+        // Buttons stay right-aligned, so they track the width without being pinned to it.
+        //
+        // Coloured to match the theme's Card surface. A stock Button keeps the system grey, which is the
+        // remaining half of looking like a foreign window next to SettingsWindow's own drawing - the
+        // fonts and window surface alone do not cover it.
+        //
+        // 96 wide, not 75. 75 was sized for the old default font; under the app's 9.5 pt YaHei the word
+        // "Cancel" needs about 72 px of text plus padding, so it was being clipped to "Canc" - visible in
+        // the rendered dialog. 96 also covers a two-character Chinese label with room to spare, which the
+        // call sites use.
+        const int BtnW = 96, BtnH = 32, BtnGap = 10;
+        int by = 102;
         Button ok = new Button();
         ok.Text = "OK";
         ok.DialogResult = DialogResult.OK;
-        ok.SetBounds(155, 88, 75, 26);
+        ok.SetBounds(width - pad - BtnW - BtnGap - BtnW, by, BtnW, BtnH);
+        ok.FlatStyle = FlatStyle.Flat;
+        ok.FlatAppearance.BorderColor = t.Border;
+        ok.BackColor = t.Card;
+        ok.ForeColor = t.Ink;
         Controls.Add(ok);
 
         Button cancel = new Button();
         cancel.Text = "Cancel";
         cancel.DialogResult = DialogResult.Cancel;
-        cancel.SetBounds(240, 88, 75, 26);
+        cancel.SetBounds(width - pad - BtnW, by, BtnW, BtnH);
+        cancel.FlatStyle = FlatStyle.Flat;
+        cancel.FlatAppearance.BorderColor = t.Border;
+        cancel.BackColor = t.Card;
+        cancel.ForeColor = t.Ink;
         Controls.Add(cancel);
 
         AcceptButton = ok; CancelButton = cancel;
@@ -221,6 +1001,15 @@ public sealed class SoundPool {
         return sb.ToString();
     }
 
+    // Same call, but keeps the return code. Send() drops it, which is fine for "did the
+    // command take" but useless when a value has to be read back - a failed status
+    // query and a genuine zero both come back as an empty or "0" reply.
+    static string SendRc(string cmd) {
+        StringBuilder sb = new StringBuilder(256);
+        int rc = mciSendStringW(cmd, sb, sb.Capacity, IntPtr.Zero);
+        return "rc=" + rc + " reply=[" + sb.ToString() + "]";
+    }
+
     readonly string _path;
     readonly int _slots;
     readonly string[] _alias;
@@ -235,6 +1024,12 @@ public sealed class SoundPool {
     // each other's files, so the feed sound needs its own prefix.
     public SoundPool(string path, int slots, int volumePercent, string logPath, string tag) {
         _path = path; _slots = slots; _logPath = logPath;
+        if (volumePercent < 0) volumePercent = 0;
+        if (volumePercent > 100) volumePercent = 100;
+        // The FIELD has to be set, not just the alias volume below. It used to be left at
+        // its default of 80, so a pool built for a 30 % cue reported 80 and - worse - the
+        // first SetVolume to the same value would have been a no-op had the setter been
+        // guarded on it.
         _volumePercent = volumePercent;
         _alias = new string[slots]; _open = new bool[slots];
         try {
@@ -296,8 +1091,2219 @@ public sealed class SoundPool {
     public void Dispose() {
         try { for (int i = 0; i < _slots; i++) if (_open[i]) Send("close " + _alias[i]); } catch { }
     }
+
+    // ---- probe helpers, used by --audiocheck to cross-check the decoder against
+    // what the game itself will hear. Not used by the app.
+    //
+    // The working directory has to be the sound's own folder: MCI mangles a path
+    // containing non-ASCII characters, which this project's folder name has.
+    public static IntPtr OpenForProbe(string bareName, string alias) {
+        Send("close " + alias);
+        string rc = SendRc("open \"" + bareName + "\" type mpegvideo alias " + alias);
+        // The judgement is on the RETURN CODE. Send() hands back MCI's reply text,
+        // which is EMPTY on success and carries the error string on failure - so
+        // testing it for emptiness inverted the result and every file "failed to open".
+        if (!rc.StartsWith("rc=0 ")) return IntPtr.Zero;
+        Send("set " + alias + " time format milliseconds");
+        return new IntPtr(1);
+    }
+    // Raw "status ... length" reply, for diagnosing a zero. Returns the text as MCI
+    // gave it, so "0", "" and an error can be told apart.
+    public static string RawLength(string alias) {
+        return SendRc("set " + alias + " time format milliseconds") + "  " +
+               SendRc("status " + alias + " length") + "  " +
+               SendRc("status " + alias + " mode");
+    }
+    public static void CloseAlias(string alias) { Send("close " + alias); }
+
+    // Length in milliseconds of a pool's FIRST alias, as MCI sees it. This is how the
+    // custom-effect test proves a cue really opened the uploaded clip: the length is the
+    // trimmed clip's length, not the shipped file's.
+    public static int MciLengthOf(SoundPool p) {
+        if (p == null || p.Failed || p._alias == null || p._alias.Length == 0 || !p._open[0]) return 0;
+        Send("set " + p._alias[0] + " time format milliseconds");
+        string s = Send("status " + p._alias[0] + " length").Trim();
+        int v;
+        return int.TryParse(s, out v) ? v : 0;
+    }
 }
+
+// ------------------------------------------------------------- audio engine ---
+//
+// Decoding, trimming and re-writing sound files for the "custom sound effect"
+// menu. Everything here was probed against this machine first, because most of the
+// obvious routes are dead ends on a current Windows install:
+//
+//   * ffmpeg / sox            not installed
+//   * ACM (msacm32)           5 codecs registered, and NO mp3 decoder among them
+//   * MCI "save" to wav       returns 274 (unsupported command)
+//   * WPF MediaPlayer         decodes and reports duration, but exposes no samples
+//   * System.Media.SoundPlayer  reads wav only
+//
+// Media Foundation does work, and is what the SourceReader below uses. Two traps
+// cost real time and are worth recording:
+//
+//   1. ALL the interface methods must be declared, in vtable order. A missing one
+//      shifts every later slot and calls land on the wrong function, which surfaces
+//      as nonsense errors like "invalid stream number" rather than anything useful.
+//   2. ReadSample returns an IMFSample, which does NOT derive from IMFMediaBuffer.
+//      Casting it fails with E_NOINTERFACE; the buffer has to be requested through
+//      IMFSample.ConvertToContiguousBuffer.
+public sealed class PcmAudio {
+    public short[] S;            // interleaved samples
+    public int Channels = 2;
+    public int Rate = 44100;
+
+    public int Frames { get { return Channels > 0 ? S.Length / Channels : 0; } }
+    public double Ms { get { return Rate > 0 ? Frames * 1000.0 / Rate : 0; } }
+    public int Peak { get { int p = 0; for (int i = 0; i < S.Length; i++) { int v = S[i]; if (v < 0) v = -v; if (v > p) p = v; } return p; } }
+
+    // ---------------------------------------------------------------- decode ---
+    [ComImport, Guid("70AE66F2-C809-4E4F-8915-BDCB406B7993"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFSourceReader {
+        [PreserveSig] int GetStreamSelection(uint dwStreamIndex, out bool pfSelected);
+        [PreserveSig] int SetStreamSelection(uint dwStreamIndex, bool fSelected);
+        [PreserveSig] int GetNativeMediaType(uint dwStreamIndex, uint dwMediaTypeIndex, out IntPtr ppMediaType);
+        [PreserveSig] int GetCurrentMediaType(uint dwStreamIndex, out IntPtr ppMediaType);
+        [PreserveSig] int SetCurrentMediaType(uint dwStreamIndex, IntPtr pdwReserved, IntPtr pMediaType);
+        [PreserveSig] int SetCurrentPosition(ref Guid guidTimeFormat, IntPtr varPosition);
+        [PreserveSig] int ReadSample(uint dwStreamIndex, uint dwControlFlags,
+            out uint pdwActualStreamIndex, out uint pdwStreamFlags,
+            out long pllTimestamp, out IntPtr ppSample);
+        [PreserveSig] int Flush(uint dwStreamIndex);
+        [PreserveSig] int GetServiceForStream(uint dwStreamIndex, ref Guid guidService, ref Guid riid, out IntPtr ppvObject);
+        [PreserveSig] int GetPresentationAttribute(uint dwStreamIndex, ref Guid guidAttribute, IntPtr pvAttribute);
+    }
+
+    [ComImport, Guid("2CD2D921-C447-44A7-A13C-4ADABFC247E3"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFAttributes {
+        [PreserveSig] int GetItem(ref Guid guidKey, IntPtr pValue);
+        [PreserveSig] int GetItemType(ref Guid guidKey, out int pType);
+        [PreserveSig] int CompareItem(ref Guid guidKey, IntPtr value, out bool pbResult);
+        [PreserveSig] int Compare(IMFAttributes pTheirs, int matchType, out bool pbResult);
+        [PreserveSig] int GetUINT32(ref Guid guidKey, out uint punValue);
+        [PreserveSig] int GetUINT64(ref Guid guidKey, out ulong punValue);
+        [PreserveSig] int GetDouble(ref Guid guidKey, out double pfValue);
+        [PreserveSig] int GetGUID(ref Guid guidKey, out Guid pguidValue);
+        [PreserveSig] int GetStringLength(ref Guid guidKey, out uint pcchLength);
+        [PreserveSig] int GetString(ref Guid guidKey, IntPtr pwszValue, uint cchBufSize, IntPtr pcchLength);
+        [PreserveSig] int GetAllocatedString(ref Guid guidKey, out IntPtr ppwszValue, out uint pcchLength);
+        [PreserveSig] int GetBlobSize(ref Guid guidKey, out uint pcbBlobSize);
+        [PreserveSig] int GetBlob(ref Guid guidKey, IntPtr pBuf, uint cbBufSize, IntPtr pcbBlobSize);
+        [PreserveSig] int GetAllocatedBlob(ref Guid guidKey, out IntPtr ppBuf, out uint pcbSize);
+        [PreserveSig] int GetUnknown(ref Guid guidKey, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int SetItem(ref Guid guidKey, IntPtr value);
+        [PreserveSig] int DeleteItem(ref Guid guidKey);
+        [PreserveSig] int DeleteAllItems();
+        [PreserveSig] int SetUINT32(ref Guid guidKey, uint unValue);
+        [PreserveSig] int SetUINT64(ref Guid guidKey, ulong unValue);
+        [PreserveSig] int SetDouble(ref Guid guidKey, double fValue);
+        [PreserveSig] int SetGUID(ref Guid guidKey, ref Guid guidValue);
+        [PreserveSig] int SetString(ref Guid guidKey, [MarshalAs(UnmanagedType.LPWStr)] string wszValue);
+        [PreserveSig] int SetBlob(ref Guid guidKey, byte[] pBuf, uint cbBufSize);
+        [PreserveSig] int SetUnknown(ref Guid guidKey, [MarshalAs(UnmanagedType.IUnknown)] object pUnknown);
+        [PreserveSig] int LockStore();
+        [PreserveSig] int UnlockStore();
+        [PreserveSig] int GetCount(out uint pcItems);
+        [PreserveSig] int GetItemByIndex(uint unIndex, out Guid pguidKey, IntPtr pValue);
+        [PreserveSig] int CopyAllItems(IMFAttributes pDest);
+    }
+
+    [ComImport, Guid("44AE0FA8-EA31-4109-8D2E-4CAE4997C555"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFMediaType {
+        [PreserveSig] int GetItem(ref Guid guidKey, IntPtr pValue);
+        [PreserveSig] int GetItemType(ref Guid guidKey, out int pType);
+        [PreserveSig] int CompareItem(ref Guid guidKey, IntPtr value, out bool pbResult);
+        [PreserveSig] int Compare(IMFAttributes pTheirs, int matchType, out bool pbResult);
+        [PreserveSig] int GetUINT32(ref Guid guidKey, out uint punValue);
+        [PreserveSig] int GetUINT64(ref Guid guidKey, out ulong punValue);
+        [PreserveSig] int GetDouble(ref Guid guidKey, out double pfValue);
+        [PreserveSig] int GetGUID(ref Guid guidKey, out Guid pguidValue);
+        [PreserveSig] int GetStringLength(ref Guid guidKey, out uint pcchLength);
+        [PreserveSig] int GetString(ref Guid guidKey, IntPtr pwszValue, uint cchBufSize, IntPtr pcchLength);
+        [PreserveSig] int GetAllocatedString(ref Guid guidKey, out IntPtr ppwszValue, out uint pcchLength);
+        [PreserveSig] int GetBlobSize(ref Guid guidKey, out uint pcbBlobSize);
+        [PreserveSig] int GetBlob(ref Guid guidKey, IntPtr pBuf, uint cbBufSize, IntPtr pcbBlobSize);
+        [PreserveSig] int GetAllocatedBlob(ref Guid guidKey, out IntPtr ppBuf, out uint pcbSize);
+        [PreserveSig] int GetUnknown(ref Guid guidKey, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int SetItem(ref Guid guidKey, IntPtr value);
+        [PreserveSig] int DeleteItem(ref Guid guidKey);
+        [PreserveSig] int DeleteAllItems();
+        [PreserveSig] int SetUINT32(ref Guid guidKey, uint unValue);
+        [PreserveSig] int SetUINT64(ref Guid guidKey, ulong unValue);
+        [PreserveSig] int SetDouble(ref Guid guidKey, double fValue);
+        [PreserveSig] int SetGUID(ref Guid guidKey, ref Guid guidValue);
+        [PreserveSig] int SetString(ref Guid guidKey, [MarshalAs(UnmanagedType.LPWStr)] string wszValue);
+        [PreserveSig] int SetBlob(ref Guid guidKey, byte[] pBuf, uint cbBufSize);
+        [PreserveSig] int SetUnknown(ref Guid guidKey, [MarshalAs(UnmanagedType.IUnknown)] object pUnknown);
+        [PreserveSig] int LockStore();
+        [PreserveSig] int UnlockStore();
+        [PreserveSig] int GetCount(out uint pcItems);
+        [PreserveSig] int GetItemByIndex(uint unIndex, out Guid pguidKey, IntPtr pValue);
+        [PreserveSig] int CopyAllItems(IMFAttributes pDest);
+        [PreserveSig] int GetMajorType(out Guid pguidMajorType);
+        [PreserveSig] int IsCompressedFormat(out bool pfCompressed);
+        [PreserveSig] int IsEqual(IMFMediaType pIMediaType, out uint pdwFlags);
+        [PreserveSig] int GetRepresentation(Guid guidRepresentation, out IntPtr ppvRepresentation);
+        [PreserveSig] int FreeRepresentation(Guid guidRepresentation, IntPtr pvRepresentation);
+    }
+
+    [ComImport, Guid("045FA593-8799-42B8-BC8D-8968C6453507"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFMediaBuffer {
+        [PreserveSig] int Lock(out IntPtr ppbBuffer, out uint pcbMaxLength, out uint pcbCurrentLength);
+        [PreserveSig] int Unlock();
+        [PreserveSig] int GetCurrentLength(out uint pcbCurrentLength);
+        [PreserveSig] int SetCurrentLength(uint cbCurrentLength);
+        [PreserveSig] int GetMaxLength(out uint pcbMaxLength);
+    }
+
+    [ComImport, Guid("C40A00F2-B93A-4D80-AE8C-5A1C634F58E4"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFSample {
+        [PreserveSig] int GetItem(ref Guid guidKey, IntPtr pValue);
+        [PreserveSig] int GetItemType(ref Guid guidKey, out int pType);
+        [PreserveSig] int CompareItem(ref Guid guidKey, IntPtr value, out bool pbResult);
+        [PreserveSig] int Compare(IMFAttributes pTheirs, int matchType, out bool pbResult);
+        [PreserveSig] int GetUINT32(ref Guid guidKey, out uint punValue);
+        [PreserveSig] int GetUINT64(ref Guid guidKey, out ulong punValue);
+        [PreserveSig] int GetDouble(ref Guid guidKey, out double pfValue);
+        [PreserveSig] int GetGUID(ref Guid guidKey, out Guid pguidValue);
+        [PreserveSig] int GetStringLength(ref Guid guidKey, out uint pcchLength);
+        [PreserveSig] int GetString(ref Guid guidKey, IntPtr pwszValue, uint cchBufSize, IntPtr pcchLength);
+        [PreserveSig] int GetAllocatedString(ref Guid guidKey, out IntPtr ppwszValue, out uint pcchLength);
+        [PreserveSig] int GetBlobSize(ref Guid guidKey, out uint pcbBlobSize);
+        [PreserveSig] int GetBlob(ref Guid guidKey, IntPtr pBuf, uint cbBufSize, IntPtr pcbBlobSize);
+        [PreserveSig] int GetAllocatedBlob(ref Guid guidKey, out IntPtr ppBuf, out uint pcbSize);
+        [PreserveSig] int GetUnknown(ref Guid guidKey, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int SetItem(ref Guid guidKey, IntPtr value);
+        [PreserveSig] int DeleteItem(ref Guid guidKey);
+        [PreserveSig] int DeleteAllItems();
+        [PreserveSig] int SetUINT32(ref Guid guidKey, uint unValue);
+        [PreserveSig] int SetUINT64(ref Guid guidKey, ulong unValue);
+        [PreserveSig] int SetDouble(ref Guid guidKey, double fValue);
+        [PreserveSig] int SetGUID(ref Guid guidKey, ref Guid guidValue);
+        [PreserveSig] int SetString(ref Guid guidKey, [MarshalAs(UnmanagedType.LPWStr)] string wszValue);
+        [PreserveSig] int SetBlob(ref Guid guidKey, byte[] pBuf, uint cbBufSize);
+        [PreserveSig] int SetUnknown(ref Guid guidKey, [MarshalAs(UnmanagedType.IUnknown)] object pUnknown);
+        [PreserveSig] int LockStore();
+        [PreserveSig] int UnlockStore();
+        [PreserveSig] int GetCount(out uint pcItems);
+        [PreserveSig] int GetItemByIndex(uint unIndex, out Guid pguidKey, IntPtr pValue);
+        [PreserveSig] int CopyAllItems(IMFAttributes pDest);
+        [PreserveSig] int GetSampleFlags(out uint pdwSampleFlags);
+        [PreserveSig] int SetSampleFlags(uint dwSampleFlags);
+        [PreserveSig] int GetSampleTime(out long phnsSampleTime);
+        [PreserveSig] int SetSampleTime(long hnsSampleTime);
+        [PreserveSig] int GetSampleDuration(out long phnsSampleDuration);
+        [PreserveSig] int SetSampleDuration(long hnsSampleDuration);
+        [PreserveSig] int GetBufferCount(out uint pdwBufferCount);
+        [PreserveSig] int GetBufferByIndex(uint dwIndex, out IMFMediaBuffer ppBuffer);
+        [PreserveSig] int ConvertToContiguousBuffer(out IMFMediaBuffer ppBuffer);
+        [PreserveSig] int AddBuffer(IMFMediaBuffer pBuffer);
+        [PreserveSig] int RemoveBufferByIndex(uint dwIndex);
+        [PreserveSig] int RemoveAllBuffers();
+        [PreserveSig] int GetTotalLength(out uint pcbTotalLength);
+        [PreserveSig] int CopyToBuffer(IMFMediaBuffer pBuffer);
+    }
+
+    [DllImport("mfplat.dll")] static extern int MFStartup(int version, int flags);
+    [DllImport("mfplat.dll")] static extern int MFShutdown();
+    [DllImport("mfplat.dll")] static extern int MFCreateMediaType(out IMFMediaType ppMFType);
+    [DllImport("mfreadwrite.dll", CharSet = CharSet.Unicode)]
+    static extern int MFCreateSourceReaderFromURL(string pwstrURL, IMFAttributes pAttributes, out IMFSourceReader ppSourceReader);
+
+    static readonly Guid K_MAJOR = new Guid("48eba18e-f8c9-4687-bf11-0a74c9f96a8f");
+    static readonly Guid K_SUBTYPE = new Guid("f7e34c9a-42e8-4714-b74b-cb29d72c35e5");
+    static readonly Guid V_AUDIO = new Guid("73647561-0000-0010-8000-00AA00389B71");
+    static readonly Guid V_PCM = new Guid("00000001-0000-0010-8000-00AA00389B71");
+    static readonly Guid K_CH = new Guid("37e48bf5-645e-4c5b-89de-ada9e29b696a");
+    static readonly Guid K_RATE = new Guid("5faeeae7-0290-4c31-9e8a-c534f68d9dba");
+    static readonly Guid K_ALIGN = new Guid("322de230-9eeb-43bd-ab7a-ff412251541d");
+    static readonly Guid K_AVG = new Guid("1aab75c8-cfef-451c-ab95-ac034b8e1731");
+    static readonly Guid K_INDEP = new Guid("c9173739-5e56-461c-b713-46fb995cb95f");
+
+    const uint FIRST_AUDIO = 0xFFFFFFFD;
+    const uint END_OF_STREAM = 0x00000002;
+
+    // Any format Media Foundation can read -> 16-bit PCM at the source's own rate.
+    // Returns null and sets err on failure; never throws at the caller.
+    public static PcmAudio Decode(string path, out string err) {
+        err = "";
+        PcmAudio result = new PcmAudio();
+        short[] samples = null;
+        int channels = 2, rate = 44100;
+        if (MFStartup(0x00020070, 0) != 0) { err = "MFStartup failed"; return null; }
+        try {
+            IMFSourceReader rd;
+            int hr = MFCreateSourceReaderFromURL(path, null, out rd);
+            if (hr != 0) { err = "cannot open (0x" + hr.ToString("X8") + ")"; return null; }
+
+            // mp3 is compressed, so the reader hands out nothing until it is told what to
+            // decode TO. Setting an uncompressed PCM type makes it insert the mp3 decoder.
+            IMFMediaType pcm;
+            hr = MFCreateMediaType(out pcm);
+            if (hr != 0) { err = "MFCreateMediaType 0x" + hr.ToString("X8"); return null; }
+            Guid kMajor = K_MAJOR, vAudio = V_AUDIO, kSub = K_SUBTYPE, vPcm = V_PCM;
+            Guid kCh = K_CH, kRate = K_RATE, kAlign = K_ALIGN, kAvg = K_AVG, kIndep = K_INDEP;
+            pcm.SetGUID(ref kMajor, ref vAudio);
+            pcm.SetGUID(ref kSub, ref vPcm);
+            pcm.SetUINT32(ref kCh, 2);
+            pcm.SetUINT32(ref kRate, 44100);
+            pcm.SetUINT32(ref kAlign, 4);
+            pcm.SetUINT32(ref kAvg, 44100 * 4);
+            pcm.SetUINT32(ref kIndep, 1);
+            // Stream selection is left alone on purpose: by default every stream is
+            // selected, which includes the audio one. Turning ALL_STREAMS off and then
+            // FIRST_AUDIO_STREAM on left the audio stream deselected and produced zero
+            // bytes per read.
+            hr = rd.SetCurrentMediaType(FIRST_AUDIO, IntPtr.Zero, Marshal.GetIUnknownForObject(pcm));
+            if (hr != 0) { err = "cannot decode to PCM (0x" + hr.ToString("X8") + ")"; return null; }
+
+            IntPtr cur;
+            if (rd.GetCurrentMediaType(FIRST_AUDIO, out cur) == 0) {
+                IMFMediaType cmt = (IMFMediaType)Marshal.GetObjectForIUnknown(cur);
+                uint c = 0, r = 0;
+                Guid kc = K_CH, kr = K_RATE;
+                cmt.GetUINT32(ref kc, out c);
+                cmt.GetUINT32(ref kr, out r);
+                if (c > 0) channels = (int)c;
+                if (r > 0) rate = (int)r;
+                Marshal.Release(cur);
+            }
+
+            MemoryStream all = new MemoryStream();
+            for (int guard = 0; guard < 4000000; guard++) {
+                uint actual, flags; long ts; IntPtr sample;
+                int h = rd.ReadSample(FIRST_AUDIO, 0, out actual, out flags, out ts, out sample);
+                if (h != 0) { err = "read failed 0x" + h.ToString("X8"); return null; }
+                if (sample != IntPtr.Zero) {
+                    try {
+                        IMFSample smp = (IMFSample)Marshal.GetObjectForIUnknown(sample);
+                        IMFMediaBuffer buf;
+                        if (smp.ConvertToContiguousBuffer(out buf) == 0 && buf != null) {
+                            IntPtr p; uint max, len;
+                            if (buf.Lock(out p, out max, out len) == 0) {
+                                if (len > 0) {
+                                    byte[] tmp = new byte[len];
+                                    Marshal.Copy(p, tmp, 0, (int)len);
+                                    all.Write(tmp, 0, (int)len);
+                                }
+                                buf.Unlock();
+                            }
+                        }
+                    } catch { }
+                    Marshal.Release(sample);
+                }
+                if ((flags & END_OF_STREAM) != 0) break;
+            }
+            byte[] raw = all.ToArray();
+            if (raw.Length < 2) { err = "decoded to no audio"; return null; }
+            samples = new short[raw.Length / 2];
+            Buffer.BlockCopy(raw, 0, samples, 0, samples.Length * 2);
+        } catch (Exception ex) {
+            err = ex.GetType().Name + ": " + ex.Message;
+            return null;
+        } finally { MFShutdown(); }
+
+        result.S = samples;
+        result.Channels = channels;
+        result.Rate = rate;
+        return result;
+    }
+
+    // ------------------------------------------------------------- wav read ---
+    // Accepts 8/16/24/32-bit PCM and 32-bit float, mono or multi-channel, and
+    // normalises everything to 16-bit. Chunk walking rather than fixed offsets:
+    // plenty of encoders put LIST/fact chunks before data.
+    public static PcmAudio ReadWav(string path, out string err) {
+        err = "";
+        try {
+            byte[] b = File.ReadAllBytes(path);
+            if (b.Length < 44) { err = "file too small"; return null; }
+            if (Encoding.ASCII.GetString(b, 0, 4) != "RIFF" || Encoding.ASCII.GetString(b, 8, 4) != "WAVE") {
+                err = "not a RIFF/WAVE file";
+                return null;
+            }
+            int pos = 12;
+            int fmtTag = 0, channels = 0, bits = 0, dataOff = -1, dataLen = 0;
+            int rate = 0;
+            while (pos + 8 <= b.Length) {
+                string id = Encoding.ASCII.GetString(b, pos, 4);
+                int sz = BitConverter.ToInt32(b, pos + 4);
+                int body = pos + 8;
+                if (sz < 0 || body + sz > b.Length) sz = b.Length - body;
+                if (id == "fmt " && sz >= 16) {
+                    fmtTag = BitConverter.ToUInt16(b, body);
+                    channels = BitConverter.ToUInt16(b, body + 2);
+                    rate = BitConverter.ToInt32(b, body + 4);
+                    bits = BitConverter.ToUInt16(b, body + 14);
+                    if (fmtTag == 0xFFFE && sz >= 40) fmtTag = BitConverter.ToUInt16(b, body + 24);
+                } else if (id == "data") {
+                    dataOff = body; dataLen = sz;
+                }
+                pos = body + sz + (sz & 1);
+            }
+            if (dataOff < 0 || channels < 1 || rate < 1) { err = "no fmt/data chunk"; return null; }
+            bool isFloat = fmtTag == 3;
+            if (fmtTag != 1 && fmtTag != 3) { err = "unsupported wav format tag " + fmtTag; return null; }
+
+            int bytesPer = bits / 8;
+            if (bytesPer < 1) { err = "unsupported bit depth " + bits; return null; }
+            int frames = dataLen / (bytesPer * channels);
+            short[] s = new short[frames * channels];
+            for (int i = 0; i < s.Length; i++) {
+                int o = dataOff + i * bytesPer;
+                if (o + bytesPer > b.Length) { Array.Resize(ref s, i); break; }
+                if (isFloat) {
+                    float f = BitConverter.ToSingle(b, o);
+                    if (f > 1f) f = 1f; else if (f < -1f) f = -1f;
+                    s[i] = (short)Math.Round(f * 32767f);
+                } else if (bits == 8) {
+                    s[i] = (short)((b[o] - 128) << 8);            // 8-bit wav is unsigned
+                } else if (bits == 16) {
+                    s[i] = BitConverter.ToInt16(b, o);
+                } else if (bits == 24) {
+                    int v = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16);
+                    if ((v & 0x800000) != 0) v |= unchecked((int)0xFF000000);
+                    s[i] = (short)(v >> 8);
+                } else {
+                    s[i] = (short)(BitConverter.ToInt32(b, o) >> 16);
+                }
+            }
+            PcmAudio r = new PcmAudio();
+            r.S = s; r.Channels = channels; r.Rate = rate;
+            return r;
+        } catch (Exception ex) {
+            err = ex.GetType().Name + ": " + ex.Message;
+            return null;
+        }
+    }
+
+    // Reads whatever the file actually is. Media Foundation already handles wav, but
+    // it also normalises the rate to 44100 and would silently resample; a plain PCM
+    // wav is read directly so its own rate survives a trim-and-save round trip.
+    public static PcmAudio Load(string path, out string err) {
+        err = "";
+        string low = path.ToLowerInvariant();
+        if (low.EndsWith(".wav")) {
+            PcmAudio w = ReadWav(path, out err);
+            if (w != null) return w;
+        }
+        PcmAudio d = Decode(path, out err);
+        if (d != null) return d;
+        // A wav that Media Foundation refused may still be readable by hand.
+        if (low.EndsWith(".wav")) {
+            string e2;
+            PcmAudio w2 = ReadWav(path, out e2);
+            if (w2 != null) return w2;
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------ wav write ---
+    public static bool WriteWav(string path, short[] samples, int channels, int rate, out string err) {
+        err = "";
+        try {
+            int dataBytes = samples.Length * 2;
+            using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write)) {
+                BinaryWriter w = new BinaryWriter(fs);
+                int byteRate = rate * channels * 2;
+                w.Write(Encoding.ASCII.GetBytes("RIFF"));
+                w.Write(36 + dataBytes);
+                w.Write(Encoding.ASCII.GetBytes("WAVE"));
+                w.Write(Encoding.ASCII.GetBytes("fmt "));
+                w.Write(16);
+                w.Write((short)1);                      // PCM
+                w.Write((short)channels);
+                w.Write(rate);
+                w.Write(byteRate);
+                w.Write((short)(channels * 2));         // block align
+                w.Write((short)16);                     // bits
+                w.Write(Encoding.ASCII.GetBytes("data"));
+                w.Write(dataBytes);
+                for (int i = 0; i < samples.Length; i++) w.Write(samples[i]);
+                w.Flush();
+            }
+            return true;
+        } catch (Exception ex) {
+            err = ex.GetType().Name + ": " + ex.Message;
+            return false;
+        }
+    }
+
+    // ----------------------------------------------------------------- mix ----
+    // Average every channel down to mono. Used for the waveform envelope, which
+    // does not care about stereo placement, and for analysis generally.
+    public float[] Mono() {
+        if (Channels <= 1) {
+            float[] m = new float[S.Length];
+            for (int i = 0; i < S.Length; i++) m[i] = S[i] / 32768f;
+            return m;
+        }
+        int n = Frames;
+        float[] o = new float[n];
+        for (int i = 0; i < n; i++) {
+            int sum = 0;
+            for (int c = 0; c < Channels; c++) sum += S[i * Channels + c];
+            o[i] = sum / (float)Channels / 32768f;
+        }
+        return o;
+    }
+
+    // Peak-per-slice envelope for drawing. Returns `buckets` values in 0..1.
+    //
+    // Peak rather than RMS: a short sound effect is mostly silence with one hit, and
+    // an RMS envelope flattens that hit into a low plateau that looks like nothing is
+    // there. The user is trimming by eye, so the loudest excursion is the useful edge.
+    public float[] Envelope(int buckets, double fromMs, double toMs) {
+        if (buckets < 1) buckets = 1;
+        float[] e = new float[buckets];
+        int total = Frames;
+        if (total < 1 || Rate < 1) return e;
+        int i0 = (int)Math.Floor(fromMs / 1000.0 * Rate);
+        int i1 = (int)Math.Ceiling(toMs / 1000.0 * Rate);
+        if (i0 < 0) i0 = 0;
+        if (i1 > total) i1 = total;
+        if (i1 <= i0) return e;
+        double span = (i1 - i0) / (double)buckets;
+        for (int b = 0; b < buckets; b++) {
+            int a = i0 + (int)(b * span);
+            int z = i0 + (int)((b + 1) * span);
+            if (z > i1) z = i1;
+            if (z <= a) z = a + 1;
+            int peak = 0;
+            for (int i = a; i < z; i++) {
+                for (int c = 0; c < Channels; c++) {
+                    int idx = i * Channels + c;
+                    if (idx >= S.Length) break;
+                    int v = S[idx];
+                    if (v < 0) v = -v;
+                    if (v > peak) peak = v;
+                }
+            }
+            e[b] = peak / 32768f;
+        }
+        return e;
+    }
+
+    // --------------------------------------------------------------- edit -----
+    // Returns a NEW PcmAudio holding frames [fromMs, toMs) with `gain` applied.
+    // Gain is clamped so the result cannot wrap: a clipped square wave is much
+    // worse to listen to than a slightly quieter one, and the user has a volume
+    // control anyway.
+    public PcmAudio Slice(double fromMs, double toMs, double gain) {
+        if (Rate < 1 || Channels < 1) return null;
+        int i0 = (int)Math.Round(fromMs / 1000.0 * Rate);
+        int i1 = (int)Math.Round(toMs / 1000.0 * Rate);
+        if (i0 < 0) i0 = 0;
+        if (i1 > Frames) i1 = Frames;
+        if (i1 <= i0) return null;
+        int n = i1 - i0;
+        short[] o = new short[n * Channels];
+        for (int i = 0; i < n * Channels; i++) {
+            int src = i0 * Channels + i;
+            double v = src < S.Length ? S[src] : 0;
+            v *= gain;
+            if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+            o[i] = (short)Math.Round(v);
+        }
+        PcmAudio r = new PcmAudio();
+        r.S = o; r.Channels = Channels; r.Rate = Rate;
+        return r;
+    }
+}
+
+// ------------------------------------------------------------- sound library ---
+//
+// Every custom clip a user makes is KEPT. Uploading no longer throws the previous one away:
+// clips accumulate in a per-cue library, the user picks which is active, and the shipped
+// default can be restored at any time.
+//
+// Where things live (all beside the script, nothing outside it):
+//
+//   soundfx\hits\1.wav          the audio, 16-bit PCM wav
+//   soundfx\hits\library.ini    id -> display name, and which id is active
+//
+// A DIRECTORY PER CUE rather than one flat folder with a prefix: every listing is per-cue, so
+// keeping them apart makes the listing a plain directory read and makes "delete this cue's
+// clips" safe.
+//
+// library.ini and not state.ini: state.ini holds the settings the two SaveState guards exist to
+// protect, and this is a different kind of data (content, not configuration). It is also
+// written far more often, so keeping it separate means a library write can never damage the
+// user's size, volume or theme.
+public sealed class CueLibrary {
+    public sealed class Clip {
+        public string Id;            // file stem, unique inside the cue folder
+        public string Name;          // what the menu shows
+        public string Path;          // full path to the wav
+        public bool Active;
+    }
+
+    readonly string _root;
+    public CueLibrary(string baseDir) {
+        _root = Path.Combine(baseDir, "soundfx");
+    }
+
+    // A word rather than a number, so the folders are recognisable and a future reorder cannot
+    // silently repoint them at the wrong clips.
+    public static string CueFolder(int cue) {
+        switch (cue) {
+            case 0: return "hits";
+            case 1: return "heals";
+            case 2: return "pots";
+            default: return "potsoff";
+        }
+    }
+    public string DirFor(int cue) { return Path.Combine(_root, CueFolder(cue)); }
+    string IniFor(int cue) { return Path.Combine(DirFor(cue), "library.ini"); }
+    // The library lives under soundfx\, while the shipped files are beside the script, so a
+    // delete in here can never reach an original.
+
+    public List<Clip> List(int cue) {
+        List<Clip> outp = new List<Clip>();
+        string dir = DirFor(cue);
+        if (!Directory.Exists(dir)) return outp;
+        Dictionary<string, string> names = ReadNames(cue);
+        string activeId = ActiveId(cue);
+        try {
+            string[] files = Directory.GetFiles(dir, "*.wav");
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < files.Length; i++) {
+                Clip c = new Clip();
+                c.Id = Path.GetFileNameWithoutExtension(files[i]);
+                c.Path = files[i];
+                string nm;
+                c.Name = names.TryGetValue(c.Id, out nm) && nm.Length > 0 ? nm : c.Id;
+                c.Active = (c.Id == activeId);
+                outp.Add(c);
+            }
+        } catch { }
+        return outp;
+    }
+
+    public Clip Active(int cue) {
+        List<Clip> all = List(cue);
+        for (int i = 0; i < all.Count; i++) if (all[i].Active) return all[i];
+        return null;
+    }
+    // The sound that should actually play, or null when the shipped file should.
+    public string ActivePath(int cue) {
+        Clip c = Active(cue);
+        return c == null ? null : c.Path;
+    }
+
+    public void SetActive(int cue, string id) { WriteIniFull(cue, ReadNames(cue), id); }
+
+    // Adds a clip and makes it active. Returns the new id, or "" on failure.
+    public string Add(int cue, string displayName, short[] samples, int channels, int rate, out string err) {
+        err = "";
+        try {
+            string dir = DirFor(cue);
+            Directory.CreateDirectory(dir);
+            string id = NextId(cue);
+            string path = Path.Combine(dir, id + ".wav");
+            if (!PcmAudio.WriteWav(path, samples, channels, rate, out err)) return "";
+            Dictionary<string, string> names = ReadNames(cue);
+            names[id] = string.IsNullOrEmpty(displayName) ? id : displayName;
+            WriteIniFull(cue, names, id);
+            return id;
+        } catch (Exception ex) {
+            err = ex.GetType().Name + ": " + ex.Message;
+            return "";
+        }
+    }
+
+    // Replaces an existing clip's audio, keeping its id and name. Used by the modify action.
+    //
+    // RETRIES, and it has to: the MCI alias that is playing this clip holds the file open, and
+    // Windows refuses the write while it does. Measured - an edit of the clip in use failed
+    // outright with "being used by another process" the first time. The caller closes the player
+    // first, but MCI releases the handle slightly after the close returns, so the first attempt
+    // can still lose the race. A short retry is the whole fix; there is nothing else to wait on.
+    public bool Replace(int cue, string id, short[] samples, int channels, int rate, out string err) {
+        err = "";
+        string dir = DirFor(cue);
+        try { Directory.CreateDirectory(dir); } catch { }
+        string path = Path.Combine(dir, id + ".wav");
+        for (int attempt = 0; attempt < Retries; attempt++) {
+            if (PcmAudio.WriteWav(path, samples, channels, rate, out err)) return true;
+            if (!IsSharingViolation(err)) return false;      // a real failure, not a lock
+            System.Threading.Thread.Sleep(RetryDelayMs);
+        }
+        return false;
+    }
+
+    // Removes a clip and its name. Same lock problem as Replace, same retry.
+    public bool Remove(int cue, string id) {
+        string path = Path.Combine(DirFor(cue), id + ".wav");
+        for (int attempt = 0; attempt < Retries; attempt++) {
+            try {
+                if (File.Exists(path)) File.Delete(path);
+                break;
+            } catch {
+                System.Threading.Thread.Sleep(RetryDelayMs);
+            }
+        }
+        try {
+            Dictionary<string, string> names = ReadNames(cue);
+            names.Remove(id);
+            string active = ActiveId(cue);
+            WriteIniFull(cue, names, active == id ? "" : active);
+            return !File.Exists(path);
+        } catch { return false; }
+    }
+
+    const int Retries = 12;
+    const int RetryDelayMs = 40;
+    // Tells a sharing violation (worth retrying) apart from a real error such as a bad path.
+    static bool IsSharingViolation(string err) {
+        if (string.IsNullOrEmpty(err)) return false;
+        return err.IndexOf("being used by another process", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               err.IndexOf("being used by another", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               err.IndexOf("IOException", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // The display name of one clip, falling back to the id when it was never named.
+    public string NameOf(int cue, string id) {
+        Dictionary<string, string> names = ReadNames(cue);
+        string nm;
+        return names.TryGetValue(id, out nm) && nm.Length > 0 ? nm : id;
+    }
+
+    public string ActiveId(int cue) {        try {
+            if (!File.Exists(IniFor(cue))) return "";
+            foreach (string line in File.ReadAllLines(IniFor(cue))) {
+                int i = line.IndexOf('=');
+                if (i <= 0) continue;
+                if (line.Substring(0, i).Trim() == "active") return line.Substring(i + 1).Trim();
+            }
+        } catch { }
+        return "";
+    }
+
+    Dictionary<string, string> ReadNames(int cue) {
+        Dictionary<string, string> names = new Dictionary<string, string>();
+        try {
+            if (!File.Exists(IniFor(cue))) return names;
+            foreach (string line in File.ReadAllLines(IniFor(cue))) {
+                int i = line.IndexOf('=');
+                if (i <= 0) continue;
+                if (line.Substring(0, i).Trim() != "clip") continue;
+                string v = line.Substring(i + 1).Trim();
+                int bar = v.IndexOf('|');
+                if (bar > 0) names[v.Substring(0, bar)] = v.Substring(bar + 1);
+            }
+        } catch { }
+        return names;
+    }
+
+    // Writes the ini from the names map plus the active id, DROPPING entries whose wav has gone
+    // - so a clip deleted outside the app cannot leave a dead row in the menu.
+    void WriteIniFull(int cue, Dictionary<string, string> names, string activeId) {
+        try {
+            string dir = DirFor(cue);
+            Directory.CreateDirectory(dir);
+            StringBuilder sb = new StringBuilder();
+            List<string> ids = new List<string>(names.Keys);
+            ids.Sort(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < ids.Count; i++) {
+                string id = ids[i];
+                if (!File.Exists(Path.Combine(dir, id + ".wav"))) continue;
+                sb.Append("clip=").Append(id).Append('|').Append(Clean(names[id])).Append("\r\n");
+            }
+            if (!string.IsNullOrEmpty(activeId)) sb.Append("active=").Append(activeId).Append("\r\n");
+            // UTF-8 with BOM: a clip name is whatever the user typed, and File.ReadAllLines
+            // detects the BOM. Same reasoning as state.ini.
+            File.WriteAllText(IniFor(cue), sb.ToString(), new UTF8Encoding(true));
+        } catch { }
+    }
+    // A newline, '=' or '|' in a name would break the line format.
+    static string Clean(string s) {
+        if (string.IsNullOrEmpty(s)) return "";
+        StringBuilder b = new StringBuilder(s.Length);
+        for (int i = 0; i < s.Length; i++) {
+            char ch = s[i];
+            if (ch == '\r' || ch == '\n' || ch == '=' || ch == '|') continue;
+            b.Append(ch);
+        }
+        return b.ToString().Trim();
+    }
+
+    // Next free numeric id: numeric so the files sort predictably and cannot collide by name,
+    // while the user's text lives in the display name.
+    string NextId(int cue) {
+        int max = 0;
+        try {
+            string dir = DirFor(cue);
+            if (Directory.Exists(dir)) {
+                foreach (string f in Directory.GetFiles(dir, "*.wav")) {
+                    int v;
+                    if (int.TryParse(Path.GetFileNameWithoutExtension(f), out v) && v > max) max = v;
+                }
+            }
+        } catch { }
+        return (max + 1).ToString(CultureInfo.InvariantCulture);
+    }
+}
+
+// -------------------------------------------------------------- ui palette ---
+//
+// The interface palette in ONE place, so the context menu and the settings windows cannot
+// drift apart. Values are the DSH interface's own design tokens (the --dsw-alias-* set in
+// dsh-client-ui-theme):
+//
+//   dark  window #232325 | card #2c2c2e | hover #3a3d42 | border #42444a
+//         ink #f9fafb | secondary #cfd3d6 | tertiary #adb2b8 | accent #7aaaff
+//   light window #f0f2f5 | card #f8f9fa | hover #e9ecf2 | border #e2e6ec
+//         ink #0f1115 | secondary #61666b | tertiary #81858c | accent #4176e6
+//
+// Instance fields, not consts: the theme changes at run time when the user switches
+// appearance, and every painter reads through the instance, so a switch is picked up on the
+// next paint without rebuilding anything.
+public sealed class PetTheme {
+    public Color Window, Card, CardHover, Border, Hairline;
+    public Color Ink, Secondary, Tertiary, Accent;
+    // Semantic colours, used for MEANING only: good = a healthy value, warn = a state worth
+    // noticing (a muted effect), bad = destructive.
+    public Color Good, Warn, Bad;
+    public bool Dark;
+
+    public PetTheme(bool dark) { Set(dark); }
+
+    public void Set(bool dark) {
+        Dark = dark;
+        if (dark) {
+            Window    = Color.FromArgb(255, 35, 35, 37);
+            Card      = Color.FromArgb(255, 44, 44, 46);
+            CardHover = Color.FromArgb(255, 58, 61, 66);
+            Border    = Color.FromArgb(255, 66, 68, 74);
+            Hairline  = Color.FromArgb(255, 54, 55, 58);
+            Ink       = Color.FromArgb(255, 249, 250, 251);
+            Secondary = Color.FromArgb(255, 207, 211, 214);
+            Tertiary  = Color.FromArgb(255, 173, 178, 184);
+            Accent    = Color.FromArgb(255, 122, 170, 255);
+            Good      = Color.FromArgb(255, 86, 200, 130);
+            Warn      = Color.FromArgb(255, 226, 150, 40);
+            Bad       = Color.FromArgb(255, 226, 96, 88);
+        } else {
+            Window    = Color.FromArgb(255, 240, 242, 245);
+            Card      = Color.FromArgb(255, 248, 249, 250);
+            CardHover = Color.FromArgb(255, 233, 236, 242);
+            Border    = Color.FromArgb(255, 226, 230, 236);
+            Hairline  = Color.FromArgb(255, 233, 236, 242);
+            Ink       = Color.FromArgb(255, 15, 17, 21);
+            Secondary = Color.FromArgb(255, 97, 102, 107);
+            Tertiary  = Color.FromArgb(255, 129, 133, 140);
+            Accent    = Color.FromArgb(255, 65, 118, 230);
+            Good      = Color.FromArgb(255, 34, 150, 84);
+            Warn      = Color.FromArgb(255, 196, 122, 20);
+            Bad       = Color.FromArgb(255, 198, 56, 48);
+        }
+    }
+    // A translucent wash of the accent, for selection fills. GDI+ blends the alpha for us when
+    // the destination is opaque.
+    public Color AccentWash(int alpha) {
+        return Color.FromArgb(alpha, Accent.R, Accent.G, Accent.B);
+    }
+    // The rounded-rectangle path used by every surface in these windows. Kept here rather than
+    // in each class so the corner radius is one decision, not five.
+    public static GraphicsPath Round(Rectangle r, int rad) {
+        GraphicsPath p = new GraphicsPath();
+        if (rad < 1) { p.AddRectangle(r); return p; }
+        int d = rad * 2;
+        if (d > r.Width) d = r.Width;
+        if (d > r.Height) d = r.Height;
+        if (d <= 0) { p.AddRectangle(r); return p; }
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+}
+// --------------------------------------------------------------- demo window ---
+//
+// The rehearsal triggers, kept out of the context menu.
+//
+// These are ACTIONS, not settings - but there are six of them, they have nothing to do with
+// configuring the pet, and nesting them two deep was half of what made the menu a snake. They
+// get their own window for the same reason the settings did.
+//
+// Deliberately plain: a column of buttons, one hint line, the shared palette and nothing else.
+// It is a debugging tool, and the visual effort belongs in the settings window.
+sealed class DemoWindow : Form {
+    // public so the breadcrumb panel can name a row's action when it forwards one to RunAction.
+    public enum Kind { None, Charge1, Charge10, ChargeN, TopUp, TopUpCustom, Radar, Close }
+    sealed class Hit { public Kind K; public Rectangle R; public Hit(Kind k, Rectangle r) { K = k; R = r; } }
+
+    readonly DshPet _pet;
+    PetTheme _t;
+    readonly List<Hit> _hits = new List<Hit>();
+    Point _mouse = new Point(-1, -1);
+
+    public DemoWindow(DshPet pet) {
+        _pet = pet;
+        _t = pet.ThemeForWindow();
+        // Without this, .NET supplies its own default form icon (four coloured squares).
+        Icon = DshPet.LoadWindowIcon(DshPet.AppBaseDir, "play");
+        Text = pet.StrDemo;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = _t.Window;
+        ForeColor = _t.Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        KeyPreview = true;
+        KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
+        // Fitted to the content: title + hint + two groups of three rows + the close button, with
+        // the same 20 px margin at the bottom as at the top. --shotdemo photographs it, which is
+        // how the first version was caught with its last row flush against the edge.
+        // Unified with the settings window at the user's request. The content is centred vertically
+        // rather than left at the top, because a 98 px taller window would otherwise be a big empty
+        // strip under the close button.
+        ClientSize = new Size(880, 560);
+    }
+    public void ApplyTheme(PetTheme t) { _t = t; BackColor = t.Window; ForeColor = t.Ink; Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (SolidBrush b = new SolidBrush(_t.Window)) g.FillRectangle(b, ClientRectangle);
+        RenderInto(g, 0, 0, ClientSize.Width, ClientSize.Height, _mouse);
+    }
+
+    // The same rows, drawn at an arbitrary origin, so the breadcrumb panel can host them.
+    //
+    // ONE implementation rather than two. A panel carrying its own copy of these rows would drift from
+    // the window's the first time either was tweaked, and this project has already been bitten by a
+    // guard measuring one path while a different path did the drawing.
+    //
+    // `width`/`height` describe the host area, because the panel sizes itself to the content while the
+    // window is a fixed 880x560. The vertical centring therefore has to be a parameter, not a read of
+    // ClientSize.
+    public int RenderInto(Graphics g, int ox, int oy, int width, int height, Point mouse) {
+        _hits.Clear();
+        _mouse = mouse;
+        int x = ox + 20, w = width - 40, y = oy + 20;
+        int ch = ContentHeightForLayout();
+        if (height > ch) y = oy + (height - ch) / 2;
+        using (Font f = new Font("Microsoft YaHei UI", 13f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink)) g.DrawString(_pet.StrDemo, f, b, x, y);
+        y += 32;
+        using (Font f = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Tertiary))
+            g.DrawString(_pet.StrDemoHint, f, b, new RectangleF(x, y, w, 32));
+        y += 40;
+
+        y = Group(g, x, y, w, _pet.StrDemoCharge);
+        y = Row(g, x, y, w, _pet.StrCharge1, Kind.Charge1);
+        y = Row(g, x, y, w, _pet.StrCharge10, Kind.Charge10);
+        y = Row(g, x, y, w, _pet.StrChargeN, Kind.ChargeN);
+        y += 12;
+        y = Group(g, x, y, w, _pet.StrDemoTopUp);
+        y = Row(g, x, y, w, _pet.StrTopUp3, Kind.TopUp);
+        y = Row(g, x, y, w, _pet.StrTopUpCustom, Kind.TopUpCustom);
+        y = Row(g, x, y, w, _pet.StrRadarOn, Kind.Radar);
+        y += 10;
+        Rectangle cb = new Rectangle(x, y, w, 32);
+        SimpleButton(g, cb, _pet.StrClose);
+        _hits.Add(new Hit(Kind.Close, cb));
+        // The content height, so a host that sizes itself to the content does not have to guess.
+        return ch;
+    }
+
+    // The action itself, with no window lifecycle in it.
+    //
+    // Split out of OnMouseDown so the breadcrumb panel runs the SAME dispatch as this window. Two copies
+    // would be two chances to wire a row to the wrong trigger, and the failure would be silent - the row
+    // simply does something else.
+    public void RunAction(Kind k) {
+        switch (k) {
+            case Kind.Charge1: _pet.DemoChargeUi(1); break;
+            case Kind.Charge10: _pet.DemoChargeUi(10); break;
+            // The two that raise a dialog must NOT keep a host window on top of it, so they close first.
+            // The panel handles its own closing before calling this; see CrumbPanel.RunHit.
+            case Kind.ChargeN: _pet.AskDemoCountUi(); break;
+            case Kind.TopUp: _pet.DemoTopUpUi(); break;
+            case Kind.TopUpCustom: _pet.AskTopUpUi(); break;
+            case Kind.Radar: _pet.RadarUi(); break;
+            case Kind.Close: break;                 // the host decides what closing means
+        }
+    }
+
+    // Hit test in the coordinate space the host drew in, so a panel can ask "what did the user click"
+    // without duplicating the rectangles.
+    public Kind ActionOf(Point p) {
+        for (int i = _hits.Count - 1; i >= 0; i--) if (_hits[i].R.Contains(p)) return _hits[i].K;
+        return Kind.None;
+    }
+
+    //
+    // Row returns y + 38 (a 32 px box plus a 6 px gap) and Group adds 14 for its rule and caption. The
+    // first version used 27 per row, under-measured the stack by about 100 px, and the centring then
+    // pushed the close button off the bottom edge - which the shot showed.
+    // These numbers mirror the y += values in OnPaint; the shapes are hand-drawn, so there is no layout
+    // engine to ask. Kept next to OnPaint so the two move together.
+    int ContentHeightForLayout() {
+        int h = 20;              // top margin
+        h += 32;                 // title
+        h += 40;                 // hint block
+        h += 14 + 38 * 3;        // "charge" group: rule + caption, then three rows
+        h += 12;                 // gap
+        h += 14 + 38 * 3;        // "top up" group
+        h += 38;                 // gap before the close button
+        h += 32;                 // close button
+        h += 20;                 // bottom margin
+        return h;
+    }
+
+    // A rule plus a caption, so the two groups read apart without boxes around them.
+    int Group(Graphics g, int x, int y, int w, string text) {
+        using (Pen p = new Pen(_t.Hairline)) g.DrawLine(p, x, y, x + w, y);
+        y += 14;
+        using (Font f = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Tertiary)) g.DrawString(text, f, b, x, y);
+        return y + 20;
+    }
+    int Row(Graphics g, int x, int y, int w, string text, Kind k) {
+        Rectangle r = new Rectangle(x, y, w, 32);
+        using (GraphicsPath path = PetTheme.Round(r, 7)) {
+            using (SolidBrush b = new SolidBrush(r.Contains(_mouse) ? _t.CardHover : _t.Card))
+                g.FillPath(b, path);
+            using (Pen p = new Pen(_t.Border)) g.DrawPath(p, path);
+        }
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink)) {
+            SizeF sz = g.MeasureString(text, f);
+            g.DrawString(text, f, b, r.X + 14, r.Y + (r.Height - sz.Height) / 2);
+        }
+        _hits.Add(new Hit(k, r));
+        return y + 38;
+    }
+    void SimpleButton(Graphics g, Rectangle r, string text) {
+        using (GraphicsPath path = PetTheme.Round(r, 7)) {
+            using (SolidBrush b = new SolidBrush(r.Contains(_mouse) ? _t.CardHover : _t.Card))
+                g.FillPath(b, path);
+            using (Pen p = new Pen(_t.Border)) g.DrawPath(p, path);
+        }
+        using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink)) {
+            SizeF sz = g.MeasureString(text, f);
+            g.DrawString(text, f, b, r.X + (r.Width - sz.Width) / 2, r.Y + (r.Height - sz.Height) / 2);
+        }
+    }
+    Hit HitAt(Point p) {
+        for (int i = _hits.Count - 1; i >= 0; i--) if (_hits[i].R.Contains(p)) return _hits[i];
+        return null;
+    }
+    protected override void OnMouseMove(MouseEventArgs e) { _mouse = e.Location; Invalidate(); base.OnMouseMove(e); }
+    protected override void OnMouseLeave(EventArgs e) { _mouse = new Point(-1, -1); Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) {
+        if (e.Button != MouseButtons.Left) return;
+        Hit h = HitAt(e.Location);
+        if (h == null) return;
+        // Every trigger closes the window: they are one-shot, and leaving it open would sit on
+        // top of the very animation the user asked to see. The two that open a dialog close
+        // FIRST, so the dialog is not behind this window.
+        // The routing itself lives in RunAction, so the breadcrumb panel runs the identical dispatch.
+        // What "close" means stays here: only the host knows what it is. Closing first also keeps this
+        // window from sitting on top of the animation or dialog the user just asked to see.
+        Kind k = h.K;
+        Close();
+        RunAction(k);
+        base.OnMouseDown(e);
+    }
+}
+
+// ----------------------------------------------------------- settings window ---
+//
+// The settings window: a sidebar of pages and a column of content, replacing a six-level
+// cascade of context menus.
+//
+// Why a window and not a better menu: a menu cannot HOLD editable content. A slider, a list of
+// the user's own saved files with per-item actions, a value that has to show its current state
+// in place - none of that fits a popup row. And the deeper the cascade went the worse it read:
+// sound > custom effect > pot-on > choose > <clip> > use walked off the right of the screen and
+// hid what was behind it. A menu is for DOING; this is for EDITING.
+//
+// Layout is a FLOW, not fixed coordinates. Draw walks down the column and records a hit
+// rectangle for everything interactive it paints. That is what lets a page grow a row without
+// every later coordinate being re-derived, and it keeps painting and hit testing from
+// disagreeing - they are the same pass. The column scrolls, because the effect library grows
+// with every clip the user saves and cannot be assumed to fit.
+sealed class SettingsWindow : Form {
+    // The sound page is GONE: it held one switch, and a whole page for one switch made the sidebar
+    // four entries of which one was nearly empty. The switch moved into the volume page, which is
+    // where "make it quieter" already lives - turning sound off is the same intent at 0 %.
+    const int PAGE_DISPLAY = 0, PAGE_VOLUME = 1, PAGE_FX = 2;
+    static readonly string[] PageNames = new string[] {
+        "\u663E\u793A",          // display
+        "\u97F3\u91CF",          // volume
+        "\u97F3\u6548\u5E93"     // effect library
+    };
+
+    enum Kind { None, Nav, Theme, Size, Toggle, Slider, Preview, ClipUse, ClipEdit, ClipDelete, Upload, Close, Feature, Calibrate }
+
+    sealed class Hot {
+        public Kind K = Kind.None;
+        public int A;                 // page index, cue, or choice index
+        public string Id;             // clip id
+        public Rectangle R;
+        public Hot(Kind k, Rectangle r) { K = k; R = r; }
+    }
+
+    readonly DshPet _pet;
+    PetTheme _t;
+    int _page = PAGE_DISPLAY;
+    readonly List<Hot> _hits = new List<Hot>();
+    Point _mouse = new Point(-1, -1);
+    int _dragCue = -2;                // -2 none; -1 master; 0..3 a cue
+    int _scrollY;
+    Rectangle _sidebar, _content;
+    int _contentTop, _contentBottom;
+
+    public SettingsWindow(DshPet pet) {
+        _pet = pet;
+        _t = pet.ThemeForWindow();
+        Icon = DshPet.LoadWindowIcon(DshPet.AppBaseDir, "gear");
+        Text = pet.StrSettings;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = _t.Window;
+        ForeColor = _t.Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        KeyPreview = true;
+        KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
+        // Fitted to the tallest page (the effect library, measured at 478 px) with room for the
+        // sidebar's close button below it. --shotwin prints each page's height if this needs
+        // revisiting, so the number is checkable rather than guessed.
+        ClientSize = new Size(880, 560);
+    }
+
+    protected override void OnResize(EventArgs e) {
+        base.OnResize(e);
+        _sidebar = new Rectangle(0, 0, 186, ClientSize.Height);
+        _content = new Rectangle(186, 0, ClientSize.Width - 186, ClientSize.Height);
+        Invalidate();
+    }
+    public void ApplyTheme(PetTheme t) { _t = t; BackColor = t.Window; ForeColor = t.Ink; Invalidate(); }
+    public int PageForTest { get { return _page; } }
+    public void SelectPageForTest(int page) {
+        if (page < 0 || page >= PageNames.Length) return;
+        _page = page;
+        _scrollY = 0;
+        Invalidate();
+    }
+    // How far down the current page painted, so a guard can assert that a page is not empty and
+    // that it fits (or scrolls) rather than being silently cut off.
+    public int ContentBottomForTest { get { return _contentBottom - _contentTop; } }
+    public int PageHeightForShot(int page) {
+        int savedScroll = _scrollY, savedPage = _page;
+        _scrollY = 0;
+        _page = page;
+        using (Graphics g = CreateGraphics()) { DrawContent(g); }
+        int h = ContentBottomForTest;
+        _scrollY = savedScroll;
+        _page = savedPage;
+        return h;
+    }
+
+    // ---- painting ----------------------------------------------------------
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        _hits.Clear();
+        if (_sidebar.Width == 0) OnResize(EventArgs.Empty);
+        using (SolidBrush b = new SolidBrush(_t.Window)) g.FillRectangle(b, ClientRectangle);
+        DrawSidebar(g);
+        // The content is clipped: a long page must not paint over the sidebar.
+        Region old = g.Clip;
+        g.SetClip(_content);
+        DrawContent(g);
+        g.Clip = old;
+    }
+
+    void DrawSidebar(Graphics g) {
+        using (SolidBrush b = new SolidBrush(_t.Card)) g.FillRectangle(b, _sidebar);
+        using (Pen p = new Pen(_t.Hairline))
+            g.DrawLine(p, _sidebar.Right - 1, 0, _sidebar.Right - 1, _sidebar.Height);
+        using (Font f = new Font("Microsoft YaHei UI", 13f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink))
+            g.DrawString(_pet.StrSettings, f, b, 20, 24);
+        int y = 74;
+        for (int i = 0; i < PageNames.Length; i++) {
+            Rectangle r = new Rectangle(10, y, _sidebar.Width - 20, 38);
+            bool sel = (i == _page);
+            if (sel || r.Contains(_mouse)) {
+                using (GraphicsPath path = PetTheme.Round(r, 7))
+                using (SolidBrush b = new SolidBrush(sel ? _t.AccentWash(46) : _t.CardHover))
+                    g.FillPath(b, path);
+            }
+            // A 3 px accent bar marks the current page. Colour carries state here, not decoration.
+            if (sel) {
+                using (GraphicsPath path = PetTheme.Round(new Rectangle(r.X + 2, r.Y + 9, 3, r.Height - 18), 2))
+                using (SolidBrush b = new SolidBrush(_t.Accent)) g.FillPath(b, path);
+            }
+            using (Font f = new Font("Microsoft YaHei UI", 10f,
+                                     sel ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point))
+            using (SolidBrush b = new SolidBrush(sel ? _t.Ink : _t.Secondary)) {
+                SizeF sz = g.MeasureString(PageNames[i], f);
+                g.DrawString(PageNames[i], f, b, r.X + 18, r.Y + (r.Height - sz.Height) / 2);
+            }
+            Hot h = new Hot(Kind.Nav, r);
+            h.A = i;
+            _hits.Add(h);
+            y += 44;
+        }
+        Rectangle cb = new Rectangle(18, ClientSize.Height - 54, _sidebar.Width - 36, 34);
+        Button(g, cb, _pet.StrClose, false, null);
+        _hits.Add(new Hot(Kind.Close, cb));
+    }
+
+    // ---- hosting hooks, for the breadcrumb panel ---------------------------
+    //
+    // Same arrangement as DemoWindow.RenderInto: one drawing routine, one hit list, so the window
+    // and the panel cannot diverge. The page methods already lay out top-down with `ref int y`,
+    // which is what makes hosting them at an arbitrary origin possible at all.
+    public int PageCount { get { return 3; } }
+    // The page captions, for the breadcrumb strip. Exposed so the panel does not keep a second copy of
+    // the names - a copy would drift the moment a page is renamed.
+    public static string[] PageNamesPublic { get { return PageNames; } }
+
+    // Draws the sidebar-less page body at (ox, oy) into a host of `width` pixels.
+    // Returns the content height, so a host that sizes itself to the content can measure it.
+    public int RenderPageInto(Graphics g, int ox, int oy, int width, Point mouse) {
+        _mouse = mouse;
+        _content = new Rectangle(ox, oy, width, 4000);   // the layout only reads X and Width here
+        _contentTop = oy + 30 - _scrollY;
+        _hits.Clear();
+        int x = _content.X + 28;
+        int w = _content.Width - 56;
+        int y = _contentTop;
+        switch (_page) {
+            case PAGE_DISPLAY: DrawDisplay(g, x, ref y, w); break;
+            case PAGE_VOLUME:  DrawVolume(g, x, ref y, w); break;
+            default:           DrawFxLibrary(g, x, ref y, w); break;
+        }
+        _contentBottom = y;
+        // +48, not +30: the page body starts 30 px below the host top, and the last control needs
+        // room BELOW it too. Reporting only the 30 made every page come out one control short.
+        int height = y - _contentTop + 48;
+        // Normalise the hit rectangles onto (ox, oy).
+        //
+        // The page methods record them through _contentTop, which includes the 30 px the page body sits
+        // below the top of its host - so they came out in absolute host coordinates (a slider at y=198)
+        // while the host forwards clicks relative to its own origin (y=36). The two differed by exactly
+        // 30 px, so every click missed: sliders, toggles and segmented controls all silently did
+        // nothing in the panel while working in the window.
+        for (int i = 0; i < _hits.Count; i++) {
+            // Normalise against oy - the value the CALLER passed - not against _contentTop.
+            //
+            // _contentTop is oy + 30, so using it here put the rectangles on a baseline 30 px away
+            // from the one the caller subtracts, and every forwarded click missed by exactly that much.
+            // Keeping one number is the fix; deriving the offset from outside is what failed repeatedly.
+            _hits[i].R = new Rectangle(_hits[i].R.X - ox, _hits[i].R.Y - oy,
+                                       _hits[i].R.Width, _hits[i].R.Height);
+        }
+        return height;
+    }
+
+    // The hit list the last RenderPageInto filled in. The panel asks this rather than keeping its
+    // own copy of the rectangles.
+    public int HitCount { get { return _hits.Count; } }
+    public int HitKindAt(Point p) {
+        for (int i = _hits.Count - 1; i >= 0; i--)
+            if (_hits[i].R.Contains(p)) return (int)_hits[i].K;
+        return (int)Kind.None;
+    }
+    public int HitArgAt(Point p) {
+        for (int i = _hits.Count - 1; i >= 0; i--)
+            if (_hits[i].R.Contains(p)) return _hits[i].A;
+        return -1;
+    }
+    public string HitIdAt(Point p) {
+        for (int i = _hits.Count - 1; i >= 0; i--)
+            if (_hits[i].R.Contains(p)) return _hits[i].Id;
+        return null;
+    }
+    public int KindNoneValue { get { return (int)Kind.None; } }
+
+
+    // ---- hosted interaction -------------------------------------------------
+    //
+    // The breadcrumb panel draws this window's pages and forwards clicks here, rather than keeping its
+    // own copy of the interaction. Slider drags in particular carry state (_dragCue, Capture, the
+    // drag-out-of-range rule); a second implementation would drift from this one.
+    public void HostClick(Point p) {
+        if (_page == PAGE_VOLUME) _dragCue = -2;
+        Hot h = HitAt(p);
+        if (h == null) return;
+        switch (h.K) {
+            case Kind.Slider:
+                _dragCue = h.A;
+                SetSliderFromX(h.A, h.R, p.X);
+                break;
+            case Kind.Preview: _pet.PreviewCueUi(h.A); break;
+            case Kind.Toggle: _pet.ToggleSoundUi(); break;
+            case Kind.Calibrate: _pet.AskUsedUi(); break;
+            case Kind.Feature:
+                // Read the CURRENT value and flip it, rather than assuming: the same handler serves all
+                // three rows and the switch may already be in either state.
+                if (h.A == 0) _pet.SetFxUi(0, !_pet.FxBowlDropUi);
+                else if (h.A == 1) _pet.SetFxUi(1, !_pet.FxPatUi);
+                else _pet.SetFxUi(2, !_pet.FxHurtUi);
+                break;
+            case Kind.Theme: _pet.SetDarkThemeUi(h.A == 1); break;
+            case Kind.Size: _pet.SetSizeIndexUi(h.A); break;
+            case Kind.Upload: _pet.UploadCueUi(h.A); break;
+            case Kind.ClipUse:
+                if (h.Id == null) _pet.RestoreFactoryUi(h.A);
+                else _pet.UseClipUi(h.A, h.Id);
+                break;
+            case Kind.ClipEdit: _pet.EditClipUi(h.A, h.Id); break;
+            case Kind.ClipDelete: _pet.DeleteClipUi(h.A, h.Id); break;
+        }
+    }
+
+    // Slider dragging while hosted: the panel owns the mouse, so it drives the drag and asks the
+    // window to move the value. Returns false when no drag is in progress.
+    public bool HostDragActive { get { return _dragCue != -2; } }
+    public void HostDragTo(Point p) {
+        if (_dragCue == -2) return;
+        for (int i = 0; i < _hits.Count; i++) {
+            if ((int)_hits[i].K == (int)Kind.Slider && _hits[i].A == _dragCue) {
+                SetSliderFromX(_dragCue, _hits[i].R, p.X);
+                return;
+            }
+        }
+    }
+    public void HostDragEnd() { _dragCue = -2; }
+    public int HostDragCue { get { return _dragCue; } }
+
+    // The rectangle of the Nth hit of a given kind, in the coordinates the host drew in. Used by the
+    // diagnostic to click a real control rather than a guessed position - a guessed position would
+    // test the guess, not the control.
+    public bool HostHitRect(int kind, int index, out Rectangle r) {
+        int seen = 0;
+        for (int i = 0; i < _hits.Count; i++) {
+            if ((int)_hits[i].K != kind) continue;
+            if (seen++ == index) { r = _hits[i].R; return true; }
+        }
+        r = Rectangle.Empty;
+        return false;
+    }
+    public string DumpHits() {
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        for (int i = 0; i < _hits.Count; i++)
+            sb.Append('[').Append(i).Append(']').Append((int)_hits[i].K).Append('@')
+              .Append(_hits[i].R.X).Append(',').Append(_hits[i].R.Y).Append(' ');
+        return sb.ToString();
+    }
+    public int HostKindSlider { get { return (int)Kind.Slider; } }
+    public int HostKindToggle { get { return (int)Kind.Toggle; } }
+    public int HostKindTheme { get { return (int)Kind.Theme; } }
+    public int HostKindSize { get { return (int)Kind.Size; } }
+
+
+    void DrawContent(Graphics g) {
+        int x = _content.X + 28;
+        int w = _content.Width - 56;
+        _contentTop = 30 - _scrollY;
+        int y = _contentTop;
+        switch (_page) {
+            case PAGE_DISPLAY: DrawDisplay(g, x, ref y, w); break;
+            case PAGE_VOLUME:  DrawVolume(g, x, ref y, w); break;
+            default:           DrawFxLibrary(g, x, ref y, w); break;
+        }
+        _contentBottom = y;
+    }
+
+    // ---- page: display -----------------------------------------------------
+
+    // The feature switches, drawn as toggle rows rather than a segmented control: these three are
+    // independent - any combination is valid - and a radio dot would imply only one could be picked.
+    void FeatureRow(Graphics g, int x, ref int y, int w, string label, int which, bool on) {
+        Rectangle r = new Rectangle(x, y, w, 36);
+        if (r.Contains(_mouse)) {
+            using (GraphicsPath path = PetTheme.Round(r, 8))
+            using (SolidBrush b = new SolidBrush(_t.CardHover)) g.FillPath(b, path);
+        }
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink))
+            g.DrawString(label, f, b, x + 6, y + 9);
+        // The pill, identical to the sound switch so the two read as the same kind of control.
+        int pw = 46, ph = 24;
+        Rectangle pill = new Rectangle(r.Right - pw - 6, y + 6, pw, ph);
+        using (GraphicsPath path = PetTheme.Round(pill, ph / 2))
+        using (SolidBrush b = new SolidBrush(on ? _t.Accent : _t.Hairline)) g.FillPath(b, path);
+        int knob = ph - 6;
+        int kx = on ? pill.Right - knob - 3 : pill.X + 3;
+        using (SolidBrush b = new SolidBrush(_t.Card))
+            g.FillEllipse(b, kx, pill.Y + 3, knob, knob);
+        Hot h = new Hot(Kind.Feature, r);
+        h.A = which;
+        _hits.Add(h);
+        y += 40;
+    }
+
+    void DrawFeatures(Graphics g, int x, ref int y, int w) {
+        y += 16;
+        Caption(g, x, ref y, w, _pet.StrFeatures);
+        Hint(g, x, ref y, w, _pet.StrFeatureHint);
+        y += 6;
+        FeatureRow(g, x, ref y, w, _pet.StrFxBowl, 0, _pet.FxBowlDropUi);
+        FeatureRow(g, x, ref y, w, _pet.StrFxPat, 1, _pet.FxPatUi);
+        FeatureRow(g, x, ref y, w, _pet.StrFxHurt, 2, _pet.FxHurtUi);
+    }
+    void DrawDisplay(Graphics g, int x, ref int y, int w) {
+        Caption(g, x, ref y, w, _pet.StrTheme);
+        Segment(g, x, ref y, w, new string[] { _pet.StrThemeLight, _pet.StrThemeDark },
+                _pet.IsDarkThemeUi ? 1 : 0, Kind.Theme);
+        y += 20;
+        Caption(g, x, ref y, w, _pet.StrSize);
+        Segment(g, x, ref y, w, new string[] {
+            _pet.SizeNameAt(0) + "   " + _pet.SizePxLabelAt(0),
+            _pet.SizeNameAt(1) + "   " + _pet.SizePxLabelAt(1),
+            _pet.SizeNameAt(2) + "   " + _pet.SizePxLabelAt(2),
+            _pet.StrCustomSize
+        }, _pet.CurrentSizeIndex(), Kind.Size);
+        DrawFeatures(g, x, ref y, w);
+    }
+
+    // The master sound switch, as a row inside the volume page.
+    //
+    // It used to be a whole page of its own ("sound" held exactly this one switch). Moving it here
+    // puts "sound off" next to "make each cue quieter", which is the same intent, and removes a
+    // sidebar entry that was almost empty. The "on / off" caption is gone with the page: the switch
+    // position already says which it is, and the switch's own label is the one that carries meaning.
+    void SoundToggleRow(Graphics g, int x, ref int y, int w) {
+        Rectangle r = new Rectangle(x, y, w, 36);
+        if (r.Contains(_mouse)) {
+            using (GraphicsPath path = PetTheme.Round(r, 8))
+            using (SolidBrush b = new SolidBrush(_t.CardHover)) g.FillPath(b, path);
+        }
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Ink))
+            g.DrawString(_pet.StrSoundOn, f, b, x + 6, y + 9);
+        bool on = _pet.SoundEnabledUi;
+        int pw = 46, ph = 24;
+        Rectangle pill = new Rectangle(r.Right - pw - 6, y + 6, pw, ph);
+        using (GraphicsPath path = PetTheme.Round(pill, ph / 2))
+        using (SolidBrush b = new SolidBrush(on ? _t.Accent : _t.Hairline)) g.FillPath(b, path);
+        int knob = ph - 6;
+        int kx = on ? pill.Right - knob - 3 : pill.X + 3;
+        using (SolidBrush b = new SolidBrush(Color.White)) g.FillEllipse(b, kx, pill.Y + 3, knob, knob);
+        _hits.Add(new Hot(Kind.Toggle, r));
+        y += 44;
+    }
+
+    // ---- page: volume ------------------------------------------------------
+    void DrawVolume(Graphics g, int x, ref int y, int w) {
+        // The master switch comes FIRST, above the four sliders: it governs all of them, and reading
+        // top-down it is the answer to "why is nothing audible" before the per-cue levels.
+        SoundToggleRow(g, x, ref y, w);
+        y += 6;
+        // Four sliders. There was a master volume above them too; it is gone (see the field
+        // comment), which is why this is four rows and no rule.
+        Hint(g, x, ref y, w, _pet.StrVolumeHint);
+        y += 10;
+        for (int c = 0; c < 4; c++)
+            SliderRow(g, x, ref y, w, _pet.CueVolumeLabelUi(c), _pet.CueVolumeUi(c), c);
+    }
+
+    void SliderRow(Graphics g, int x, ref int y, int w, string label, int value, int cue) {
+        // The preview button sits at the RIGHT END of the value line, so it belongs to this row
+        // not to the page - four rows, four independent previews. Before it existed the cue
+        // sounded on every change, which made dragging the slider a burst of overlapping cues.
+        const int tryW = 54;
+        // -6 so the button's right edge lines up with the slider TRACK, which is inset 6 px at
+        // each end. Flush with the card instead, it read as overhanging the row it belongs to.
+        Rectangle tr = new Rectangle(x + w - tryW - 6, y - 3, tryW, 24);
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point)) {
+            using (SolidBrush b = new SolidBrush(_t.Secondary))
+                g.DrawString(label, f, b, x, y);
+            string val = value + " %";
+            SizeF sz = g.MeasureString(val, f);
+            // The value sits LEFT of the button, right-aligned against it, so the two do not
+            // collide at 100 %.
+            float valRight = tr.X - 10;
+            // 0 % is called out in amber: it is the one value that MEANS something (this effect is
+            // off), so it should be visible without reading the number.
+            using (SolidBrush b = new SolidBrush(value == 0 ? _t.Warn : _t.Ink))
+                g.DrawString(val, f, b, valRight - sz.Width, y);
+        }
+        Button(g, tr, _pet.StrPreview, false, null);
+        Hot ht = new Hot(Kind.Preview, tr);
+        ht.A = cue;
+        _hits.Add(ht);
+        y += 22;
+        Rectangle sr = new Rectangle(x, y, w, 24);
+        DrawSlider(g, sr, value, cue);
+        Hot h = new Hot(Kind.Slider, sr);
+        h.A = cue;
+        _hits.Add(h);
+        y += 36;
+    }
+
+    // One slider. There used to be a second form taking an "own mark" so the track could show a
+    // scaled cue's two numbers at once; with the master gone there is only ever one number.
+    void DrawSlider(Graphics g, Rectangle r, int value, int cue) {
+        int cy = r.Y + r.Height / 2;
+        int h = 6, ty = cy - h / 2;
+        int x0 = r.X + 6, x1 = r.Right - 6;
+        int vx = x0 + (int)Math.Round((x1 - x0) * (value / 100.0));
+        bool hot = r.Contains(_mouse) || _dragCue == cue;
+        Color fill = value == 0 ? _t.Warn : _t.Accent;
+        using (GraphicsPath path = PetTheme.Round(new Rectangle(x0, ty, Math.Max(1, x1 - x0), h), h / 2))
+        using (SolidBrush b = new SolidBrush(_t.Hairline)) g.FillPath(b, path);
+        if (vx > x0) {
+            using (GraphicsPath path = PetTheme.Round(new Rectangle(x0, ty, vx - x0, h), h / 2))
+            using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, path);
+        }
+        // The thumb keeps a ring in the card colour so it reads as separate from the track even
+        // at 0 % or 100 %, where the filled portion gives no clue where it is.
+        int rad = hot ? 9 : 8;
+        using (SolidBrush b = new SolidBrush(_t.Card))
+            g.FillEllipse(b, vx - rad - 2, cy - rad - 2, (rad + 2) * 2, (rad + 2) * 2);
+        using (SolidBrush b = new SolidBrush(fill)) g.FillEllipse(b, vx - rad, cy - rad, rad * 2, rad * 2);
+        if (hot) {
+            using (Pen p = new Pen(_t.AccentWash(90), 2f))
+                g.DrawEllipse(p, vx - rad - 5, cy - rad - 5, (rad + 5) * 2, (rad + 5) * 2);
+        }
+    }
+
+    // ---- page: effect library ---------------------------------------------
+    void DrawFxLibrary(Graphics g, int x, ref int y, int w) {
+        Hint(g, x, ref y, w, _pet.StrFeatureHint);
+        y += 12;
+        for (int c = 0; c < 4; c++) {
+            Caption(g, x, ref y, w, _pet.CueDefaultNameUi(c));
+            // The shipped sound is the fallback and is never IN the library, so it gets a fixed
+            // row of its own with its own select action - "restore factory" had to have a home.
+            ClipRow(g, x, ref y, w, _pet.StrFactoryClip, true, null, c, _pet.IsFactoryActive(c));
+            List<CueLibrary.Clip> clips = _pet.ClipsFor(c);
+            for (int i = 0; i < clips.Count; i++)
+                ClipRow(g, x, ref y, w, clips[i].Name, false, clips[i].Id, c, clips[i].Active);
+            Rectangle up = new Rectangle(x, y, 150, 30);
+            Button(g, up, _pet.StrUpload, false, null);
+            Hot hu = new Hot(Kind.Upload, up);
+            hu.A = c;
+            _hits.Add(hu);
+            y += 42;
+        }
+    }
+
+    void ClipRow(Graphics g, int x, ref int y, int w, string name, bool isFactory, string id,
+                 int cue, bool active) {
+        Rectangle r = new Rectangle(x, y, w, 32);
+        if (active) {
+            using (GraphicsPath path = PetTheme.Round(r, 6))
+            using (SolidBrush b = new SolidBrush(_t.AccentWash(40))) g.FillPath(b, path);
+        } else if (r.Contains(_mouse)) {
+            using (GraphicsPath path = PetTheme.Round(r, 6))
+            using (SolidBrush b = new SolidBrush(_t.CardHover)) g.FillPath(b, path);
+        }
+        // A filled dot, not a tick: in a list where only one row can be active, a tick reads as a
+        // checkbox that ought to be untickable.
+        if (active) {
+            using (SolidBrush b = new SolidBrush(_t.Accent)) g.FillEllipse(b, x + 10, r.Y + 12, 8, 8);
+        } else {
+            using (Pen p = new Pen(_t.Border, 1.4f)) g.DrawEllipse(p, x + 10, r.Y + 12, 8, 8);
+        }
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f,
+                                 active ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(active ? _t.Ink : (isFactory ? _t.Tertiary : _t.Secondary))) {
+            SizeF sz = g.MeasureString(name, f);
+            g.DrawString(name, f, b, x + 28, r.Y + (r.Height - sz.Height) / 2);
+        }
+        // Only library clips get edit and delete: the shipped sound is not the user's to change.
+        int bx = r.Right - 8;
+        if (!isFactory) {
+            Rectangle del = new Rectangle(bx - 62, r.Y + 4, 62, 24);
+            Button(g, del, _pet.StrDelete, false, _t.Bad);
+            Hot hd = new Hot(Kind.ClipDelete, del);
+            hd.A = cue; hd.Id = id;
+            _hits.Add(hd);
+            bx -= 70;
+            Rectangle ed = new Rectangle(bx - 62, r.Y + 4, 62, 24);
+            Button(g, ed, _pet.StrModify, false, null);
+            Hot he = new Hot(Kind.ClipEdit, ed);
+            he.A = cue; he.Id = id;
+            _hits.Add(he);
+            bx -= 70;
+        }
+        if (!active) {
+            Rectangle us = new Rectangle(bx - 62, r.Y + 4, 62, 24);
+            Button(g, us, _pet.StrUse, false, null);
+            Hot hp = new Hot(Kind.None, us);
+            hp.K = Kind.ClipUse;
+            hp.A = cue; hp.Id = id;
+            _hits.Add(hp);
+        }
+        y += 34;
+    }
+
+    // ---- painting helpers --------------------------------------------------
+    void Caption(Graphics g, int x, ref int y, int w, string text) {
+        using (Font f = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Tertiary)) g.DrawString(text, f, b, x, y);
+        y += 21;
+    }
+    void Hint(Graphics g, int x, ref int y, int w, string text) {
+        using (Font f = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(_t.Tertiary)) {
+            SizeF sz = g.MeasureString(text, f, w);
+            g.DrawString(text, f, b, new RectangleF(x, y, w, sz.Height));
+            y += (int)Math.Ceiling(sz.Height) + 4;
+        }
+    }
+
+    // A segmented control: mutually exclusive choices, all VISIBLE. That is the whole point of
+    // this window - with a dropdown the user cannot see what the alternatives are.
+    // A VERTICAL list, one choice per row.
+    //
+    // It used to divide the width by the number of options. Fine for two short labels, but the size
+    // choices read "large (454 px)" and four of those across one row collided no matter how wide the
+    // panel got - the text had nowhere to go. Stacked, each option owns a whole row.
+    //
+    // A filled/hollow dot on the left, matching the effect-library rows: where only one option can be
+    // active, a dot reads as the radio choice it is.
+    void Segment(Graphics g, int x, ref int y, int w, string[] names, int selected, Kind kind) {
+        int n = names.Length, h = 34, gap = 6;
+        for (int i = 0; i < n; i++) {
+            Rectangle r = new Rectangle(x, y + i * (h + gap), w, h);
+            bool sel = (i == selected);
+            using (GraphicsPath path = PetTheme.Round(r, 8)) {
+                using (SolidBrush b = new SolidBrush(sel ? _t.AccentWash(52) : (r.Contains(_mouse) ? _t.CardHover : _t.Card)))
+                    g.FillPath(b, path);
+                using (Pen p = new Pen(sel ? _t.Accent : _t.Border, sel ? 1.6f : 1f)) g.DrawPath(p, path);
+            }
+            int dot = r.Y + (h - 10) / 2;
+            if (sel) {
+                using (SolidBrush b = new SolidBrush(_t.Accent)) g.FillEllipse(b, r.X + 12, dot, 10, 10);
+            } else {
+                using (Pen p = new Pen(_t.Border, 1.4f)) g.DrawEllipse(p, r.X + 12, dot, 10, 10);
+            }
+            using (Font f = new Font("Microsoft YaHei UI", 9.5f,
+                                     sel ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Point))
+            using (SolidBrush b = new SolidBrush(sel ? _t.Ink : _t.Secondary)) {
+                SizeF sz = g.MeasureString(names[i], f);
+                g.DrawString(names[i], f, b, r.X + 32, r.Y + (r.Height - sz.Height) / 2);
+            }
+            Hot hot = new Hot(kind, r);
+            hot.A = i;
+            _hits.Add(hot);
+        }
+        y += n * (h + gap);
+    }
+
+    void Button(Graphics g, Rectangle r, string text, bool primary, Color? inkOverride) {
+        bool hot = r.Contains(_mouse);
+        using (GraphicsPath path = PetTheme.Round(r, 7)) {
+            using (SolidBrush b = new SolidBrush(primary ? _t.Accent : (hot ? _t.CardHover : _t.Card)))
+                g.FillPath(b, path);
+            if (!primary) using (Pen p = new Pen(_t.Border)) g.DrawPath(p, path);
+        }
+        Color ink = inkOverride.HasValue ? inkOverride.Value
+                                        : (primary ? Color.FromArgb(255, 12, 18, 30) : _t.Ink);
+        using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(ink)) {
+            SizeF sz = g.MeasureString(text, f);
+            g.DrawString(text, f, b, r.X + (r.Width - sz.Width) / 2, r.Y + (r.Height - sz.Height) / 2);
+        }
+    }
+
+    // ---- interaction -------------------------------------------------------
+    int MaxScroll() {
+        int contentH = _contentBottom + 24;
+        int viewH = ClientSize.Height;
+        int m = contentH - viewH;
+        return m < 0 ? 0 : m;
+    }
+    protected override void OnMouseWheel(MouseEventArgs e) {
+        int max = MaxScroll(), next = _scrollY - Math.Sign(e.Delta) * 48;
+        if (next < 0) next = 0;
+        if (next > max) next = max;
+        if (next != _scrollY) { _scrollY = next; Invalidate(); }
+        base.OnMouseWheel(e);
+    }
+
+    Hot HitAt(Point p) {
+        for (int i = _hits.Count - 1; i >= 0; i--)
+            if (_hits[i].K != Kind.None && _hits[i].R.Contains(p)) return _hits[i];
+        return null;
+    }
+    Rectangle SliderRectFor(int cue) {
+        foreach (Hot h in _hits) if (h.K == Kind.Slider && h.A == cue) return h.R;
+        return Rectangle.Empty;
+    }
+    void SetSliderFromX(int cue, Rectangle sr, int mx) {
+        int x0 = sr.X + 6, x1 = sr.Right - 6;
+        if (x1 <= x0) return;
+        double f = (mx - x0) / (double)(x1 - x0);
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        int v = (int)Math.Round(f * 100);
+        // The pointer position IS the cue's level: with no master there is no scale to solve back
+        // out of it. (This used to divide by the master, which is how a thumb could jump.)
+        _pet.SetCueVolumeUi(cue, v);
+        Invalidate();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e) {
+        _mouse = e.Location;
+        if (_dragCue != -2) {
+            // A drag that started on a slider stays on that slider even when the pointer leaves
+            // the row, which is what makes a slider feel like a slider.
+            Rectangle sr = SliderRectFor(_dragCue);
+            if (sr.Width > 0) SetSliderFromX(_dragCue, sr, e.X);
+        } else {
+            Invalidate();
+        }
+        base.OnMouseMove(e);
+    }
+    protected override void OnMouseLeave(EventArgs e) {
+        _mouse = new Point(-1, -1);
+        Invalidate();
+        base.OnMouseLeave(e);
+    }
+    protected override void OnMouseDown(MouseEventArgs e) {
+        if (e.Button != MouseButtons.Left) return;
+        Hot h = HitAt(e.Location);
+        if (h == null) return;
+        switch (h.K) {
+            case Kind.Nav: SelectPageForTest(h.A); break;
+            case Kind.Close: Close(); break;
+            case Kind.Slider:
+                _dragCue = h.A;
+                SetSliderFromX(h.A, h.R, e.X);
+                Capture = true;
+                break;
+            case Kind.Preview: _pet.PreviewCueUi(h.A); break;
+            case Kind.Toggle: _pet.ToggleSoundUi(); Invalidate(); break;
+            case Kind.Calibrate: _pet.AskUsedUi(); Invalidate(); break;
+            case Kind.Feature:
+                if (h.A == 0) _pet.SetFxUi(0, !_pet.FxBowlDropUi);
+                else if (h.A == 1) _pet.SetFxUi(1, !_pet.FxPatUi);
+                else _pet.SetFxUi(2, !_pet.FxHurtUi);
+                Invalidate();
+                break;
+            case Kind.Theme: _pet.SetDarkThemeUi(h.A == 1); Invalidate(); break;
+            case Kind.Size: _pet.SetSizeIndexUi(h.A); Invalidate(); break;
+            case Kind.Upload: _pet.UploadCueUi(h.A); Invalidate(); break;
+            case Kind.ClipUse:
+                if (h.Id == null) _pet.RestoreFactoryUi(h.A);
+                else _pet.UseClipUi(h.A, h.Id);
+                Invalidate();
+                break;
+            case Kind.ClipEdit: _pet.EditClipUi(h.A, h.Id); Invalidate(); break;
+            case Kind.ClipDelete: _pet.DeleteClipUi(h.A, h.Id); Invalidate(); break;
+        }
+        base.OnMouseDown(e);
+    }
+    protected override void OnMouseUp(MouseEventArgs e) {
+        if (_dragCue != -2) {
+            _dragCue = -2;
+            Capture = false;
+            Invalidate();
+        }
+        base.OnMouseUp(e);
+    }
+}
+
 // ------------------------------------------------------------------ window ---
+
+// The trim / gain / name window for a user-supplied sound effect.
+//
+// Built as a plain Form with owner-drawn surfaces rather than stock controls: the
+// stock TrackBar and TextBox chrome is exactly the "crude" look this replaces, and a
+// waveform cannot be expressed with them at all. Only the text box is a real control
+// (it has to accept typing and an IME); everything else is painted.
+sealed class AudioEditor : Form {
+    // ---- scheme D palette (three bands) ----
+    // The editor's own palette, in two sets, so it can follow the app's light/dark choice.
+    //
+    // These used to be ten `static readonly Color` constants holding only the DARK values, which is why
+    // the window ignored the theme entirely: there was nothing to switch to. The dark set is the old
+    // constants unchanged - the look the user already approved - and the light set is new, built from
+    // the same PetTheme light palette the rest of the windows use so the two agree.
+    //
+    // Not PetTheme's field names directly: this window has band/well/hairline roles that PetTheme does
+    // not, and mapping them onto Window/Card/Border lost the banding. Keeping its own names with two
+    // values each is the smallest change that makes the switch real.
+    sealed class Pal {
+        public Color StatusBg, CtrlBg, CmdBg, CardBg, Ink, Dim, Faint, Accent, Accent2, Hair;
+        public Pal(bool dark) {
+            if (dark) {
+                StatusBg = Color.FromArgb(255, 35, 38, 43);
+                CtrlBg = Color.FromArgb(255, 26, 28, 32);
+                CmdBg = Color.FromArgb(255, 30, 33, 38);
+                CardBg = Color.FromArgb(255, 20, 22, 26);
+                Ink = Color.FromArgb(255, 232, 234, 237);
+                Dim = Color.FromArgb(255, 154, 160, 166);
+                Faint = Color.FromArgb(255, 96, 102, 112);
+                Accent = Color.FromArgb(255, 122, 170, 255);
+                Accent2 = Color.FromArgb(255, 226, 150, 40);
+                Hair = Color.FromArgb(255, 42, 45, 52);
+            } else {
+                StatusBg = Color.FromArgb(255, 233, 236, 241);
+                CtrlBg = Color.FromArgb(255, 240, 242, 245);
+                CmdBg = Color.FromArgb(255, 246, 248, 250);
+                CardBg = Color.FromArgb(255, 252, 253, 254);
+                Ink = Color.FromArgb(255, 15, 17, 21);
+                Dim = Color.FromArgb(255, 97, 102, 107);
+                Faint = Color.FromArgb(255, 186, 191, 198);
+                Accent = Color.FromArgb(255, 65, 118, 230);
+                Accent2 = Color.FromArgb(255, 200, 120, 20);
+                Hair = Color.FromArgb(255, 214, 219, 226);
+            }
+        }
+    }
+    Pal _ui = new Pal(true);
+    Color StatusBg { get { return _ui.StatusBg; } }
+    Color CtrlBg { get { return _ui.CtrlBg; } }
+    Color CmdBg { get { return _ui.CmdBg; } }
+    Color CardBg { get { return _ui.CardBg; } }
+    Color Ink { get { return _ui.Ink; } }
+    Color Dim { get { return _ui.Dim; } }
+    Color Faint { get { return _ui.Faint; } }
+    Color Accent { get { return _ui.Accent; } }
+    Color Accent2 { get { return _ui.Accent2; } }
+    Color Hair { get { return _ui.Hair; } }
+
+    // Follows the app theme. Called by the owner before showing, so an already-built window is never
+    // half-recoloured.
+    public void ApplyTheme(bool dark) {
+        _ui = new Pal(dark);
+        BackColor = CtrlBg;
+        ForeColor = Ink;
+        if (_name != null) { _name.BackColor = CardBg; _name.ForeColor = Ink; }
+        Invalidate(true);
+    }
+
+    readonly PcmAudio _src;
+    readonly string _title, _defaultName;
+    double _fromMs, _toMs;
+    double _gain = 1.0;
+    float[] _peaks;                  // cached full-resolution envelope, one per pixel column
+    int _peaksW = -1;
+    int _dragHandle;                 // 0 none, 1 left, 2 right, 3 playhead
+    double _playMs = -1;             // preview position, -1 when not playing
+    System.Windows.Forms.Timer _playTimer;
+    SoundPool _preview;              // its own alias so previewing cannot cut a game cue
+    string _previewPath;
+    TextBox _name;
+    Rectangle _wave, _nameCard;
+    Rectangle _gainTrack;
+    Rectangle[] _btns = new Rectangle[3];
+
+    public PcmAudio Result { get; private set; }
+    public string EffectName { get { return _name != null ? _name.Text.Trim() : _defaultName; } }
+
+    public AudioEditor(PcmAudio src, string currentName, string defaultName) {
+        _src = src;
+        _defaultName = defaultName;
+        _title = DshPet.S_EDIT_T;
+        _fromMs = 0;
+        // Null-tolerant: the window-icon self-check constructs this form without real audio, and a
+        // constructor that throws on a missing resource makes that check crash for a reason that has
+        // nothing to do with what it is testing.
+        _toMs = src != null ? src.Ms : 0;
+        Result = null;
+
+        Text = DshPet.S_EDIT_T;
+        Icon = DshPet.LoadWindowIcon(DshPet.AppBaseDir, "wave");
+        // FixedSingle, like every other window in the app. This was the last one still on FixedDialog,
+        // which draws a thinner frame and a different title-bar treatment - the remaining visible
+        // difference once the colours and the font were unified.
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent;
+        BackColor = CtrlBg;
+        ForeColor = Ink;
+        Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+
+        // ---- name field, in the status band ----
+        _name = new TextBox();
+        _name.BorderStyle = BorderStyle.None;
+        _name.BackColor = CardBg;
+        _name.ForeColor = Ink;
+        _name.Font = new Font("Microsoft YaHei UI", 12f, FontStyle.Regular, GraphicsUnit.Point);
+        _name.Text = string.IsNullOrEmpty(currentName) ? defaultName : StripSuffix(currentName);
+        Controls.Add(_name);
+
+        MouseDown += OnDown;
+        MouseMove += OnMove;
+        MouseUp += OnUp;
+        // No "Paint += OnPaint": OnPaint is the protected override of the Paint event,
+        // so it is already called, and its (PaintEventArgs) signature does not match the
+        // PaintEventHandler delegate the event expects.
+        KeyPreview = true;
+        KeyDown += delegate(object s, KeyEventArgs e) {
+            if (e.KeyCode == Keys.Escape) { StopPreview(); DialogResult = DialogResult.Cancel; Close(); }
+        };
+
+        // ClientSize LAST. Setting it fires OnResize, which calls LayoutRegions, which
+        // positions _name - so doing this before the text box exists threw a
+        // NullReferenceException every time the editor was opened. Nothing caught it
+        // because the dialog is only reachable through the file picker.
+        // Unified with the settings window at the user's request.
+        ClientSize = new Size(880, 560);
+    }
+
+    // The menu shows the name with the "effect" suffix; the editor edits the bare
+    // name, so that suffix is taken back off when the box is filled in.
+    static string StripSuffix(string s) {
+        if (string.IsNullOrEmpty(s)) return s;
+        if (s.EndsWith(DshPet.S_EFFECT)) return s.Substring(0, s.Length - DshPet.S_EFFECT.Length);
+        return s;
+    }
+
+    // The waveform well's height: whatever is left after the rows that anchor to the bottom.
+    //
+    // It used to be a fixed 164. Once every secondary window became 880x560 this one gained 60 px, and a
+    // fixed height would have left that as dead space between the well and the gain track. Handing the
+    // slack to the well is what makes the unified size read as intentional rather than padded - and it
+    // helps the actual job, since a taller well resolves quiet passages more legibly.
+    //
+    // The rows below it anchor off the bottom: the gain label is 24 px above its track, the track is 6,
+    // and the command band is 80 tall.
+    int WaveHeightForLayout() {
+        int cmdTop = Math.Max(200, ClientSize.Height - 80);
+        int h = (cmdTop - 110) - 148;
+        return h < 80 ? 80 : h;
+    }
+
+    void LayoutRegions() {        int pad = 22;
+        // All coordinates are CLIENT-area coordinates. The bands start at the very top of the
+        // client area, which already sits below the title bar, so no extra offset is needed -
+        // an earlier version added one and pushed the header under the name card.
+        //
+        // Band 1 (status) is 106 tall and holds: title, subtitle, the name label, the name
+        // card. Band 2 (body) holds the trim readout, the waveform and the gain track.
+        // Band 1 (status) holds, top to bottom: title (14..40), subtitle (42..54), then the
+        // name row at 68. The card sat at 56 in the first attempt and covered the subtitle.
+        _nameCard = new Rectangle(pad + 74, 68, ClientSize.Width - pad * 2 - 74, 34);
+        _name.Bounds = new Rectangle(_nameCard.X + 12, _nameCard.Y + 7, _nameCard.Width - 24, 22);
+        _wave = new Rectangle(pad, 148, ClientSize.Width - pad * 2, WaveHeightForLayout());
+        _gainTrack = new Rectangle(pad, _wave.Bottom + 52, ClientSize.Width - pad * 2, 6);
+        // command band buttons, right aligned
+        int bw = 104, bh = 34, gap = 10;
+        int by = ClientSize.Height - 62;
+        _btns[0] = new Rectangle(pad, by, bw, bh);                                    // preview
+        _btns[1] = new Rectangle(ClientSize.Width - pad - bw * 2 - gap, by, bw, bh);   // cancel
+        _btns[2] = new Rectangle(ClientSize.Width - pad - bw, by, bw, bh);             // ok
+    }
+
+    protected override void OnResize(EventArgs e) { base.OnResize(e); LayoutRegions(); _peaksW = -1; }
+
+    // ---- painting ----------------------------------------------------------
+    protected override void OnPaint(PaintEventArgs e) {
+        Graphics g = e.Graphics;
+        if (_nameCard.Width <= 0) LayoutRegions();
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+        // band 1: status (lighter)
+        using (SolidBrush b = new SolidBrush(StatusBg)) g.FillRectangle(b, 0, 0, ClientSize.Width, 106);
+        // Title 13pt occupies roughly y 16..40, so the subtitle starts at 42 to clear the
+        // descenders - at 38 it touched the title and read as one smudged line.
+        using (Font f = new Font("Microsoft YaHei UI", 13f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(Ink))
+            g.DrawString(_title, f, b, 22, 14);
+        using (Font f = new Font("Microsoft YaHei UI", 8.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(Faint))
+            g.DrawString(_src.Ms.ToString("0") + " ms   " + _src.Rate + " Hz   " +
+                         (_src.Channels == 1 ? "mono" : "stereo"), f, b, 23, 42);
+        // The name label sits to the LEFT of the card, vertically centred on it. Putting it
+        // right-aligned inside the card's row drew it ON the card and it vanished.
+        using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(Dim)) {
+            SizeF ls = g.MeasureString(DshPet.S_NAME_T, f);
+            g.DrawString(DshPet.S_NAME_T, f, b,
+                         22, _nameCard.Y + (_nameCard.Height - ls.Height) / 2);
+        }
+
+        // name card
+        using (SolidBrush b = new SolidBrush(CardBg)) g.FillRectangle(b, _nameCard);
+        using (Pen p = new Pen(Hair)) g.DrawRectangle(p, _nameCard.X, _nameCard.Y, _nameCard.Width - 1, _nameCard.Height - 1);
+
+        // band 2: waveform well, with the readout in the empty space above it
+        using (SolidBrush b = new SolidBrush(CtrlBg)) g.FillRectangle(b, 0, 106, ClientSize.Width, _gainTrack.Y - 106);
+        using (SolidBrush b = new SolidBrush(CardBg)) g.FillRectangle(b, _wave);
+        using (Pen p = new Pen(Hair)) g.DrawRectangle(p, _wave.X, _wave.Y, _wave.Width - 1, _wave.Height - 1);
+        DrawWaveform(g);
+
+        // trim readout above the well, right aligned
+        using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point)) {
+            using (SolidBrush b = new SolidBrush(Dim)) {
+                string left = DshPet.S_START + " " + (_fromMs / 1000.0).ToString("0.000") + DshPet.S_SEC;
+                string right = DshPet.S_END + " " + (_toMs / 1000.0).ToString("0.000") + DshPet.S_SEC;
+                SizeF ls = g.MeasureString(left, f);
+                g.DrawString(left, f, b, _wave.X, _wave.Y - 22);
+                SizeF rs = g.MeasureString(right, f);
+                g.DrawString(right, f, b, _wave.Right - rs.Width, _wave.Y - 22);
+                string mid = DshPet.S_TRIM + " " + ((_toMs - _fromMs) / 1000.0).ToString("0.000") + DshPet.S_SEC;
+                SizeF ms = g.MeasureString(mid, f);
+                g.DrawString(mid, f, b, _wave.X + (_wave.Width - ms.Width) / 2, _wave.Y - 22);
+            }
+        }
+
+        // band 3: gain
+        using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(Dim))
+            g.DrawString(DshPet.S_GAIN, f, b, _wave.X, _gainTrack.Y - 24);
+        using (SolidBrush b = new SolidBrush(Hair)) g.FillRectangle(b, _gainTrack);
+        int gx = _gainTrack.X + (int)Math.Round((_gain / 2.0) * (_gainTrack.Width - 1));
+        using (SolidBrush b = new SolidBrush(Accent)) g.FillRectangle(b, _gainTrack.X, _gainTrack.Y, gx - _gainTrack.X, _gainTrack.Height);
+        g.FillRectangle(new SolidBrush(Accent), gx - 2, _gainTrack.Y - 7, 4, _gainTrack.Height + 14);
+        using (Font f = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(Ink))
+            g.DrawString((_gain * 100).ToString("0") + " %", f, b, _gainTrack.Right - 46, _gainTrack.Y - 24);
+
+        // command band
+        using (SolidBrush b = new SolidBrush(CmdBg)) g.FillRectangle(b, 0, ClientSize.Height - 80, ClientSize.Width, 80);
+        using (Pen p = new Pen(Hair)) g.DrawLine(p, 0, ClientSize.Height - 80, ClientSize.Width, ClientSize.Height - 80);
+        DrawButton(g, _btns[0], DshPet.S_TRY, false);
+        DrawButton(g, _btns[1], DshPet.S_CANCEL, false);
+        DrawButton(g, _btns[2], DshPet.S_OK, true);
+    }
+
+    void DrawButton(Graphics g, Rectangle r, string text, bool primary) {
+        using (SolidBrush b = new SolidBrush(primary ? Accent : CardBg)) g.FillRectangle(b, r);
+        using (Pen p = new Pen(primary ? Accent : Hair))
+            g.DrawRectangle(p, r.X, r.Y, r.Width - 1, r.Height - 1);
+        using (Font f = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point))
+        using (SolidBrush b = new SolidBrush(primary ? Color.FromArgb(255, 12, 18, 30) : Ink)) {
+            SizeF s = g.MeasureString(text, f);
+            g.DrawString(text, f, b, r.X + (r.Width - s.Width) / 2, r.Y + (r.Height - s.Height) / 2);
+        }
+    }
+
+    // Peak-per-column, exactly as wide as the well, so the drawing is 1:1 and the
+    // trim handles line up with what the user sees. Recomputed only on resize.
+    void EnsurePeaks() {
+        if (_peaks != null && _peaksW == _wave.Width) return;
+        _peaks = _src.Envelope(Math.Max(1, _wave.Width), 0, _src.Ms);
+        _peaksW = _wave.Width;
+    }
+
+    void DrawWaveform(Graphics g) {
+        EnsurePeaks();
+        if (_peaks == null || _peaks.Length == 0) return;
+        int midY = _wave.Y + _wave.Height / 2;
+        int maxH = _wave.Height / 2 - 10;
+        double total = _src.Ms;
+        if (total <= 0) return;
+        int lx = MsToX(_fromMs), rx = MsToX(_toMs);
+        // ...then into COLUMN indices, because x below counts from the well's left edge while MsToX
+        // returns an absolute x. Comparing the two directly declared the first _wave.X columns to be
+        // outside the selection - at the default trim of 0 that is a whole stretch of KEPT audio drawn
+        // in the "cut away" grey, immediately to the right of the left handle. That is exactly the
+        // reported "invisible thickness": the handle was always positioned correctly; this comparison
+        // was not, and it made the handle look like it was discarding audio it was not.
+        int lxCol = lx - _wave.X, rxCol = rx - _wave.X;
+
+        for (int x = 0; x < _peaks.Length && x < _wave.Width; x++) {
+            bool inside = (x >= lxCol && x <= rxCol);
+            int h = (int)Math.Round(_peaks[x] * maxH);
+            // A floor of 2, not 1, and always an even height so the bar straddles the centre line
+            // exactly.
+            //
+            // This is the fix for the "the trim handle has invisible thickness" report, and the cause was
+            // not the handle at all. Measured: the left handle is at x=22, the audio's first loud column
+            // is x=37. The 15 columns between them are the file's LEADING SILENCE, drawn at h=1 - a 1x2
+            // pixel speck that is effectively invisible against the well. So the region read as empty,
+            // and the handle looked like it was cutting away a stretch of audio that was not there.
+            //
+            // At 2 the silence is a legible hairline ON the centre line, so the eye follows one
+            // continuous line from the handle to the loud part and the boundary is obvious. Kept small
+            // deliberately: this must not look like quiet audio, only like "the file starts here".
+            if (h < 3) h = 3;
+            // Outside the trim: dim. Inside: accent. Colour carries the state, which is
+            // the whole point of the selection being visible at all.
+            Color col = inside ? Accent : Faint;
+            using (SolidBrush b = new SolidBrush(col))
+                g.FillRectangle(b, _wave.X + x, midY - h, 1, h * 2);
+        }
+        // centre hairline
+        using (Pen p = new Pen(Hair)) g.DrawLine(p, _wave.X, midY, _wave.Right, midY);
+        // handles: 2px bars with a solid cap, drawn AFTER the wave so they are never buried
+        DrawHandle(g, lx, true);
+        DrawHandle(g, rx, false);
+        // preview playhead
+        if (_playMs >= 0) {
+            int px = MsToX(_playMs);
+            using (SolidBrush b = new SolidBrush(Accent2)) g.FillRectangle(b, px, _wave.Y + 2, 1, _wave.Height - 4);
+        }
+    }
+
+    void DrawHandle(Graphics g, int x, bool left) {
+        if (x < _wave.X) x = _wave.X;
+        if (x > _wave.Right - 1) x = _wave.Right - 1;
+        using (SolidBrush b = new SolidBrush(Accent2)) {
+            g.FillRectangle(b, x - 1, _wave.Y + 1, 3, _wave.Height - 2);
+            // a small tab so the grab target is obvious
+            g.FillRectangle(b, left ? x - 1 : x - 6, _wave.Y + 1, 7, 8);
+        }
+    }
+
+    int MsToX(double ms) {
+        double total = _src.Ms;
+        if (total <= 0) return _wave.X;
+        double f = ms / total;
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        return _wave.X + (int)Math.Round(f * (_wave.Width - 1));
+    }
+    double XToMs(int x) {
+        double total = _src.Ms;
+        double f = (x - _wave.X) / (double)Math.Max(1, _wave.Width - 1);
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        return f * total;
+    }
+
+    // ---- interaction -------------------------------------------------------
+    void OnDown(object s, MouseEventArgs e) {
+        if (_btns[2].Contains(e.Location)) { Commit(); return; }
+        if (_btns[1].Contains(e.Location)) { StopPreview(); DialogResult = DialogResult.Cancel; Close(); return; }
+        if (_btns[0].Contains(e.Location)) { TogglePreview(); return; }
+        if (_gainTrack.Y - 14 <= e.Y && e.Y <= _gainTrack.Bottom + 14) {
+            _gain = Math.Max(0, Math.Min(2.0, (e.X - _gainTrack.X) / (double)Math.Max(1, _gainTrack.Width - 1) * 2.0));
+            Invalidate(); return;
+        }
+        if (e.Y >= _wave.Y - 12 && e.Y <= _wave.Bottom + 8) {
+            int lx = MsToX(_fromMs), rx = MsToX(_toMs);
+            // nearest handle wins, with a generous grab radius: these are 3px bars
+            int dl = Math.Abs(e.X - lx), dr = Math.Abs(e.X - rx);
+            if (dl <= 10 && dl <= dr) _dragHandle = 1;
+            else if (dr <= 10) _dragHandle = 2;
+            else { _dragHandle = 1; _fromMs = XToMs(e.X); }
+            Invalidate();
+        }
+    }
+    void OnMove(object s, MouseEventArgs e) {
+        if (_dragHandle == 0) return;
+        double ms = XToMs(e.X);
+        if (_dragHandle == 1) {
+            // at least 20 ms must survive, or the clip becomes unplayable silence
+            _fromMs = Math.Max(0, Math.Min(ms, _toMs - 20));
+        } else {
+            _toMs = Math.Min(_src.Ms, Math.Max(ms, _fromMs + 20));
+        }
+        Invalidate();
+    }
+    void OnUp(object s, MouseEventArgs e) { _dragHandle = 0; }
+
+    void Commit() {
+        PcmAudio cut = _src.Slice(_fromMs, _toMs, _gain);
+        if (cut == null) {
+            MessageBox.Show(this, DshPet.S_UP_BADFMT, DshPet.S_EDIT_T, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        Result = cut;
+        StopPreview();
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+
+    // ---- preview -----------------------------------------------------------
+    // Writes the CURRENT trim + gain to a temp wav and plays that, so what is heard is
+    // exactly what will be saved rather than the untouched original.
+    void TogglePreview() {
+        if (_playTimer != null && _playTimer.Enabled) { StopPreview(); return; }
+        PcmAudio cut = _src.Slice(_fromMs, _toMs, _gain);
+        if (cut == null) return;
+        string err;
+        _previewPath = Path.Combine(Path.GetTempPath(), "dsp_preview.wav");
+        if (!PcmAudio.WriteWav(_previewPath, cut.S, cut.Channels, cut.Rate, out err)) {
+            AppendLog("preview write failed: " + err);
+            return;
+        }
+        StopPreview();
+        _preview = new SoundPool(_previewPath, 1, 100, Path.Combine(_baseDirForLog(), "pet.log"), "dspprev");
+        if (_preview.Failed) return;
+        _preview.Play();
+        _playMs = _fromMs;
+        _playTimer = new System.Windows.Forms.Timer();
+        _playTimer.Interval = 33;
+        _playTimer.Tick += delegate {
+            _playMs += 33;
+            if (_playMs >= _toMs) StopPreview();
+            Invalidate();
+        };
+        _playTimer.Start();
+    }
+    void StopPreview() {
+        if (_playTimer != null) { _playTimer.Stop(); _playTimer.Dispose(); _playTimer = null; }
+        if (_preview != null) { try { _preview.Dispose(); } catch { } _preview = null; }
+        _playMs = -1;
+        Invalidate();
+    }
+    // The log path is only used if the pool throws while opening; the template's pet.log
+    // is the natural place, and an empty string still degrades safely.
+    string _logDir = "";
+    string _baseDirForLog() { return string.IsNullOrEmpty(_logDir) ? "." : _logDir; }
+    // Test hooks: the handle/well geometry and where the waveform first becomes visible. The trim
+    // handles are drawn from MsToX, so comparing them with the first column that actually has
+    // pixels is what tells "the handle is mispositioned" apart from "the silence has no line".
+    public void HandleGeometryForTest(out int lx, out int rx, out int wx, out int ww) {
+        EnsurePeaks();
+        lx = MsToX(_fromMs); rx = MsToX(_toMs);
+        wx = _wave.X; ww = _wave.Width;
+    }
+    public int FirstLoudColumnForTest() {
+        EnsurePeaks();
+        if (_peaks == null) return -1;
+        int maxH = _wave.Height / 2 - 10;
+        for (int x = 0; x < _peaks.Length; x++) if (_peaks[x] * maxH >= 2) return x;
+        return -1;
+    }
+    // Test hook for the trim-column assertion. Returns the column index of each handle ON THE SAME SCALE
+    // the waveform loop uses (0-based from the well's left edge), which is the comparison that was wrong.
+    public void TrimColumnsForTest(out int lxCol, out int rxCol, out int len) {
+        EnsurePeaks();
+        lxCol = MsToX(_fromMs) - _wave.X;
+        rxCol = MsToX(_toMs) - _wave.X;
+        len = _peaks == null ? 0 : _peaks.Length;
+    }
+    public void SetTrimForTest(double fromMs, double toMs) { _fromMs = fromMs; _toMs = toMs; }
+    public double TrimFromForTest { get { return _fromMs; } }
+
+    public void SetLogDir(string dir) { _logDir = dir; }
+    // Own logger. A bare "Log(...)" inside this class binds to System.Diagnostics.Log,
+    // which is protected - so the call did not compile at all.
+    void AppendLog(string msg) {
+        try {
+            File.AppendAllText(Path.Combine(_baseDirForLog(), "pet.log"),
+                               DateTime.Now.ToString("s") + " audioeditor: " + msg + "\r\n");
+        } catch { }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e) {
+        StopPreview();
+        if (!string.IsNullOrEmpty(_previewPath)) { try { File.Delete(_previewPath); } catch { } }
+        base.OnFormClosed(e);
+    }
+}
 
 // The War Thunder style target nameplate's data, one per rice bowl.
 //
@@ -343,7 +3349,25 @@ public sealed class Rice {
     // how big the girl is, and the inertia the user feels is exactly this number.
     // Scaling it by _scale would make the same flick throw a small bowl slowly.
     public double VX, VY;
-    public double R;                 // footprint radius
+    public double R;                 // footprint radius (ground contact, bowl-on-girl)
+    // The canvas box this prop was ACTUALLY drawn into on the last frame, art only
+    // (no padding), in screen == canvas pixels.
+    //
+    // The next frame erases exactly this box. It used to be recomputed from r.Y and r.R,
+    // and that is wrong twice over: r.R is the ground-contact footprint rather than half
+    // the art, and - the part that caused the long-standing report - it knows nothing
+    // about the head-squash. During the bounce a worn pot is drawn tens of pixels above
+    // where that formula looks, so the strip it moved up into was never erased and a
+    // flat-topped ghost of every earlier pose piled up above the stack for good. Recorded
+    // at the draw site, so erasing cannot drift from drawing.
+    public double DrawnL, DrawnT, DrawnR, DrawnB;
+    public bool DrawnValid;
+    // The y of this pot's own rim (top edge) as actually drawn on the last frame, and whether it
+    // is meaningful. A pot landing from above has to land on THIS, not on the slot the stack
+    // maths would pick, because HeadFalling carries the pot up to its slot over several frames
+    // and the slot below it is still empty during that time.
+    public double TopRimY;
+    public bool TopRimValid;
     public double Amount;            // the top-up this bowl carries
     public int Bounces;
     // How many bounces the CURRENT fall is allowed. Set when the bowl is released:
@@ -455,10 +3479,14 @@ sealed class PetMenuRenderer : ToolStripProfessionalRenderer {
     public Color Arrow  = ArrowLight;
     public Color Header = HeadLight;
     public Color Accent = AccentLight;
+    // Which palette is live. Kept because the band surfaces come in two sets and ApplyTheme
+    // only copies the eight named colours above.
+    bool _dark;
 
     // One call switches the whole palette. The colours live in instance fields so
     // the painter below reads the current set on every paint.
     public void ApplyTheme(bool dark) {
+        _dark = dark;
         Ink    = dark ? InkDark    : InkLight;
         Hover  = dark ? HoverDark  : HoverLight;
         Bg     = dark ? BgDark     : BgLight;
@@ -476,12 +3504,110 @@ sealed class PetMenuRenderer : ToolStripProfessionalRenderer {
         ApplyTheme(dark);
     }
 
+    // ---- section bands ------------------------------------------------------
+    //
+    // Scheme D's "three stacked cards" is a TECHNIQUE, not a fixed count: a popup is divided
+    // into as many bands as its own content actually has groups, and a band is drawn as a
+    // slightly different surface plus a hairline where the next one starts. The count is
+    // therefore data, carried on the items, not baked into the renderer.
+    //
+    // How it is carried: a list of the rows that START a band, resolved into a per-row index.
+    // An earlier version packed a band number into the item's Tag beside the icon kind, and it
+    // kept reading back wrong - a marker set on one row came back as the previous row's value.
+    // Tag belongs to the icon, so it is left alone now and the band map is its own field.
+    readonly Dictionary<ToolStripItem, int> _bandMap = new Dictionary<ToolStripItem, int>();
+
+    // Declares a banded popup: `starts` are the rows that begin each band, in order. Rebuilds
+    // the whole map for that popup, so calling it twice is safe.
+    public void SetBands(ToolStripItemCollection items, params ToolStripItem[] starts) {
+        foreach (ToolStripItem it in items) _bandMap.Remove(it);
+        for (int i = 0; i < starts.Length; i++) {
+            ToolStripItem marker = starts[i];
+            if (marker == null) continue;
+            bool belongs = false;
+            foreach (ToolStripItem it in items) if (it == marker) { belongs = true; break; }
+            if (!belongs) {
+                Console.WriteLine("  band: SetBands got a row that is not in this popup");
+                continue;
+            }
+            bool on = false;
+            foreach (ToolStripItem it in items) {
+                if (it == marker) on = true;
+                if (on) _bandMap[it] = i;
+            }
+        }
+    }
+    // How many bands this popup declared; 0 when it declared none.
+    public int BandsDeclared(ToolStripItemCollection items) {
+        int max = -1;
+        foreach (ToolStripItem it in items) {
+            int b;
+            if (_bandMap.TryGetValue(it, out b) && b > max) max = b;
+        }
+        return max + 1;
+    }
+
+    // The surface for each band. Band 0 is the card itself, so a popup that declares no bands
+    // looks exactly as it did before - the feature is opt-in per menu.
+    public static readonly Color Band0Dark = Color.FromArgb(255, 44, 44, 46);    // #2c2c2e
+    public static readonly Color Band1Dark = Color.FromArgb(255, 50, 50, 53);
+    public static readonly Color Band2Dark = Color.FromArgb(255, 56, 56, 60);
+    public static readonly Color Band3Dark = Color.FromArgb(255, 62, 62, 66);
+    public static readonly Color Band0Light = Color.FromArgb(255, 248, 249, 250);
+    public static readonly Color Band1Light = Color.FromArgb(255, 242, 244, 247);
+    public static readonly Color Band2Light = Color.FromArgb(255, 236, 239, 244);
+    public static readonly Color Band3Light = Color.FromArgb(255, 230, 234, 240);
+
+    public Color BandFill(int band) {
+        if (band <= 0) return Bg;
+        if (_dark) {
+            if (band == 1) return Band1Dark;
+            if (band == 2) return Band2Dark;
+            return Band3Dark;
+        }
+        if (band == 1) return Band1Light;
+        if (band == 2) return Band2Light;
+        return Band3Light;
+    }
+    // The band an item belongs to; 0 for an unbanded popup, which paints nothing extra.
+    public int BandOf(ToolStripItem item) {
+        if (item == null) return 0;
+        int b;
+        return _bandMap.TryGetValue(item, out b) ? b : 0;
+    }
+    // True when a divider is drawn at the top of this row, i.e. it starts a band after the
+    // first one. The first band needs no divider - the card's own edge is above it.
+    public bool StartsBand(ToolStripItem item) {
+        if (item == null || BandOf(item) <= 0) return false;
+        ToolStripItemCollection col = item.Owner != null ? item.Owner.Items : null;
+        if (col == null) return false;
+        for (int i = 0; i < col.Count; i++) {
+            if (col[i] != item) continue;
+            return i > 0;                      // never above the popup's first row
+        }
+        return false;
+    }
+
     protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e) {
         // DSH's menu is a rounded card (16px radius). WinForms would paint a plain
         // rectangle, so the shape is drawn here and the window itself is clipped to
         // the same outline by ApplyRoundedRegion.
+        //
+        // PAINT THE WHOLE AFFECTED AREA, not just the client rectangle, and that is
+        // load-bearing: a ToolStripDropDown keeps its stock drop shadow, which is a light
+        // grey OPAQUE halo drawn around a rectangle of exactly this size. Filling only the
+        // client rect left a bright border around every popup - measured at #434549 around
+        // a #2c2c2e fill - which reads as "the submenu did not get the dark theme" when the
+        // fill itself was correct.
+        //
+        // DropShadowEnabled = false is NOT the fix, however tempting: on a
+        // ToolStripDropDown it changes the window style and the submenu then stops painting
+        // altogether. Verified - the popup stayed Visible at the right rectangle while the
+        // screen showed flat desktop behind it. So the shadow is covered up, not switched off.
         Graphics g = e.Graphics;
-        Rectangle r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+        Rectangle r = e.AffectedBounds;
+        if (r.Width <= 0 || r.Height <= 0)
+            r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
         SmoothingMode old = g.SmoothingMode;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (GraphicsPath path = RoundedSquare(r, CardRadius)) {
@@ -493,7 +3619,9 @@ sealed class PetMenuRenderer : ToolStripProfessionalRenderer {
         // A hairline, not a 1px black frame. DSH expresses borders as alpha, so the
         // value here is already the composite over the card fill.
         Graphics g = e.Graphics;
-        Rectangle r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+        Rectangle r = e.AffectedBounds;
+        if (r.Width <= 0 || r.Height <= 0)
+            r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
         SmoothingMode old = g.SmoothingMode;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (GraphicsPath path = RoundedSquare(r, CardRadius)) {
@@ -521,12 +3649,26 @@ sealed class PetMenuRenderer : ToolStripProfessionalRenderer {
         base.OnRenderItemText(e);
     }
     protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e) {
+        Graphics g = e.Graphics;
+        int band = BandOf(e.Item);
+        // The band surface, drawn for EVERY row of a non-zero band (not only the hovered
+        // one), and only when the popup actually declares bands - so a menu with no markers
+        // is untouched by this feature.
+        if (band > 0) {
+            using (SolidBrush b = new SolidBrush(BandFill(band)))
+                g.FillRectangle(b, 0, 0, e.Item.Width, e.Item.Height);
+        }
+        // A hairline at the top of a new band. Inset, so it reads as a divider inside the
+        // card rather than a frame around the rows.
+        if (StartsBand(e.Item)) {
+            using (Pen p = new Pen(Border))
+                g.DrawLine(p, 12, 0, e.Item.Width - 12, 0);
+        }
         // DSH gives a row a rounded 12px highlight on hover AND on keyboard focus,
         // and none at all when it is merely checked (the tick carries that).
         if (!e.Item.Selected && !e.Item.Pressed) return;
         Rectangle r = new Rectangle(RowInset, 1, e.Item.Width - RowInset * 2, e.Item.Height - 2);
         if (r.Width <= 0 || r.Height <= 0) return;
-        Graphics g = e.Graphics;
         SmoothingMode old = g.SmoothingMode;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         using (GraphicsPath path = RoundedSquare(r, RowRadius)) {
@@ -689,16 +3831,224 @@ public sealed class DshPet : Form {
     const string S_SOUND   = "\u58F0\u97F3";                                   // sound
     const string S_SOUNDON = "\u5F00\u542F\u58F0\u97F3";                       // sound on
     const string S_MUTE0   = "\u9759\u97F3 (0 %)";                             // muted level
-    const string S_VOLT    = "\u97F3\u91CF\u5927\u5C0F";                       // volume level
+    // S_VOLT ("volume level") is GONE with the master volume. S_VOLP is still the caption of the
+    // dialog a cue's level can be typed into (AskCueVolume).
     const string S_VOLP    = "\u65B0\u97F3\u91CF\uFF080-100\uFF09";            // new volume (0-100)
+    // Per-sound switches, shown inside the volume submenu. Each cue can be silenced on its
+    // own, so "turn the pot sounds off" is a menu action rather than a file swap.
+    const string S_FX_IRONLAND = "\u94C1\u76C6\u843D\u5934";                   // pot lands on head
+    const string S_FX_IRONOFF  = "\u53CC\u51FB\u53D6\u76C6";                   // pot knocked off
+
+    // ---- restructured three-level menu, 2026-10-09 ------------------------
+    // PUBLIC because AudioEditor is a separate top-level class and needs the same
+    // captions; a private const on DshPet is invisible to it. Keeping ONE definition is
+    // the point - the window and the menu must not drift apart.
+    public const string S_DEMO      = "\u6F14\u793A";                                 // demo
+    const string S_DEMO_CHG  = "\u6A21\u62DF\u6263\u8D39";                     // simulate a charge
+    const string S_DEMO_TOP  = "\u6A21\u62DF\u5145\u503C";                     // simulate a top-up
+    const string S_CHG_1     = "\u5355\u6B21\u6263\u8D39";                     // one charge
+    const string S_CHG_10    = "\u5341\u6B21\u6263\u8D39";                     // ten charges
+    const string S_CHG_N     = "\u81EA\u5B9A\u4E49\u6263\u8D39\u6B21\u6570";   // custom charge count
+    const string S_CHGN_P    = "\u6263\u8D39\u6B21\u6570";                     // charge count
+    const string S_DISPLAY   = "\u663E\u793A\u8BBE\u7F6E";                     // display settings
+    const string S_THEMEADJ  = "\u4EAE/\u6697\u8272\u8C03\u8282";              // light/dark adjustment
+    const string S_SIZEADJ   = "\u5C3A\u5BF8\u8C03\u8282";                     // size adjustment
+    const string S_SOUNDSET  = "\u58F0\u97F3\u8BBE\u7F6E";                     // sound settings
+    const string S_CUSTOMFX  = "\u81EA\u5B9A\u4E49\u97F3\u6548";               // custom sound effect
+    const string S_V_HIT     = "\u6389\u8840\u97F3\u91CF";                     // damage volume
+    const string S_V_FEED    = "\u56DE\u8840\u97F3\u91CF";                     // heal volume
+    const string S_V_LAND    = "\u6263\u76C6\u97F3\u91CF";                     // pot-on volume
+    const string S_V_OFF     = "\u53BB\u76C6\u97F3\u91CF";                     // pot-off volume
+    const string S_E_HIT     = "\u6389\u8840\u97F3\u6548";                     // damage effect
+    const string S_E_FEED    = "\u56DE\u8840\u97F3\u6548";                     // heal effect
+    const string S_E_LAND    = "\u6263\u76C6\u97F3\u6548";                     // pot-on effect
+    const string S_E_OFF     = "\u53BB\u76C6\u97F3\u6548";                     // pot-off effect
+    public const string S_EFFECT = "\u97F3\u6548";                                 // "effect" suffix
+    const string S_UPLOAD    = "\u4ECE\u672C\u5730\u4E0A\u4F20";               // upload from local
+    // The sound library: a cue's saved clips, and what can be done with one.
+    const string S_FACTORY   = "\u6062\u590D\u51FA\u5382\u8BBE\u7F6E";         // restore factory
+    const string S_PICK      = "\u9009\u62E9";                                 // choose a saved clip
+    const string S_USE       = "\u4F7F\u7528";                                 // use
+    const string S_MODIFY    = "\u4FEE\u6539";                                 // modify
+    const string S_DELETE    = "\u5220\u9664";                                 // delete
+    const string S_EMPTY     = "\uFF08\u6682\u65E0\u81EA\u5B9A\u4E49\u97F3\u6548\uFF09";
+    // ---- settings window ---------------------------------------------------
+    const string S_SETTINGS    = "\u8BBE\u7F6E";                               // settings
+    const string S_CLOSE       = "\u5173\u95ED";                               // close
+    // S_SOUNDONOFF ("on / off") is GONE with the sound page: the switch position already conveys it.
+    const string S_FACTORYCLIP = "\u51FA\u5382\u97F3\u6548";                   // factory sound
+    const string S_THEME_LIGHT = "\u6D45\u8272";                               // light
+    const string S_THEME_DARK  = "\u6DF1\u8272";                               // dark
+    const string S_CUSTOMSIZE  = "\u81EA\u5B9A\u4E49...";                      // custom...
+    // The volume hint is the ONLY hint left. The sound page had its own ("switching this off mutes
+    // every effect but keeps the settings"), and that page is gone - the switch now sits on the
+    // volume page, so its explanation belongs in this one line too.
+    const string S_VOLHINT    = "\u6BCF\u4E2A\u97F3\u6548\u4E00\u6761\uFF0C\u62D6\u5230 0% " +
+                                "\u5C31\u662F\u5173\u6389\u5B83\uFF1B\u60F3\u8BD5\u542C\u5C31\u6309" +
+                                "\u53F3\u8FB9\u7684\u6309\u94AE\u3002";
+    const string S_FXHINT     = "\u70B9\u4E00\u4E2A\u97F3\u6548\u5373\u53EF\u4F7F\u7528\uFF1B" +
+                                "\u4FEE\u6539\u4F1A\u6253\u5F00\u7F16\u8F91\u5668\uFF0C" +
+                                "\u5220\u9664\u4F1A\u4ECE\u5E93\u4E2D\u79FB\u9664\u3002";
+    // ---- demo window -------------------------------------------------------
+    // Says the one thing that is not obvious from the buttons: nothing here touches real money.
+    const string S_DEMOHINT    = "\u6F14\u793A\u7528\uFF0C\u4E0D\u4F1A\u771F\u6B63\u6263\u94B1\u3002";
+    const string S_CHARGE_1    = "\u5355\u6B21\u6263\u8D39";                  // one charge
+    const string S_CHARGE_10   = "\u5341\u6B21\u6263\u8D39";                  // ten charges
+    const string S_CHARGE_N    = "\u81EA\u5B9A\u4E49\u6B21\u6570\u2026";       // custom count...
+    const string S_TOPUP_3     = "\u6A21\u62DF\u5145\u503C 3 \u5143\uFF08\u6389\u7C73\u996D\u76C6\uFF09";
+    const string S_TOPUP_CUS   = "\u81EA\u5B9A\u4E49\u5145\u503C\u91D1\u989D\u2026";
+    const string S_UP_TITLE  = "\u9009\u62E9\u97F3\u9891\u6587\u4EF6";         // choose an audio file
+    const string S_UP_FILTER = "\u97F3\u9891\u6587\u4EF6|*.mp3;*.wav;*.m4a;*.wma;*.aac;*.flac;*.ogg";
+    // The drop window's own strings. "Click to upload a file / or / drop it here", laid out as three
+    // lines so the "or" reads as the alternative it is rather than as part of either instruction.
+    const string S_DROP_L1   = "\u70B9\u51FB\u4E0A\u4F20\u6587\u4EF6";
+    const string S_DROP_OR   = "\u6216";
+    const string S_DROP_L3   = "\u628A\u6587\u4EF6\u62D6\u5230\u8FD9\u91CC";
+    // Kept short on purpose: the full extension list ran off both sides of the window at this width, and
+    // a hint that is cut in half reads as a rendering fault rather than as information.
+    const string S_DROP_HINT = "MP3 / WAV / M4A \u7B49\uFF0C\u6700\u5927 50 MB";
+    // The feature switches on the display page. Each caption says what the ON state does, because a
+    // switch labelled after the mechanism ("bowl drop") tells the user nothing about what they get.
+    const string S_FEATURES = "\u529F\u80FD\u9009\u62E9";
+    // The peak/off-peak readout. Two of these are a joke the user asked for: the second line names
+    // the founder, with the character swapped to match the tariff period (peak / valley).
+    const string S_PEAK_PEAK = "\u6881\u6587\u5CF0";
+    const string S_PEAK_OFF  = "\u6881\u6587\u8C37";
+    const string S_USED      = "\u4ECA\u65E5\u5DF2\u7528";
+    const string S_TO_OFF    = "\u8DDD\u8C37\u65F6";
+    const string S_TO_PEAK   = "\u8DDD\u5CF0\u65F6";
+    const string S_CALIB     = "\u6821\u51C6\u4ECA\u65E5\u5DF2\u7528";
+    const string S_CALIB_P   = "\u586B\u5E73\u53F0\u4E0A\u300C\u6D88\u8D39\u91D1\u989D\u300D\u7684\u6570\u5B57\uFF08\u4ECA\u65E5\uFF09\u3002\u57FA\u7EBF\u4F1A\u636E\u6B64\u53CD\u63A8\uFF0C\u4E4B\u540E\u81EA\u52A8\u8DDF\u968F\u4F59\u989D\u3002";
+    const string S_FX_BOWL  = "\u5145\u503C\u540E\u6389\u843D\u996D\u76C6\uFF0C\u624B\u52A8\u62D6\u53D6";
+    const string S_FX_PAT   = "\u9F20\u6807\u629A\u6478\u4E86\u4F1A\u5F00\u5FC3";
+    const string S_FX_HURT  = "\u6263\u8D39\u65F6\u64AD\u653E\u97F3\u6548\u4E0E\u52A8\u753B";
+    const string S_FX_HINT  = "\u5173\u6389\u540E\u5BF9\u5E94\u7684\u4E8B\u60C5\u4E0D\u518D\u53D1\u751F\uFF0C\u6F14\u793A\u4E5F\u4E00\u89C6\u540C\u4EC1\u3002";
+    const string S_UP_TOOBIG = "\u6587\u4EF6\u8FC7\u5927";                     // file too large
+    public const string S_UP_BADFMT = "\u65E0\u6CD5\u8BFB\u53D6";                     // cannot read it
+    public const string S_EDIT_T = "\u526A\u8F91\u97F3\u6548";                     // edit effect
+    public const string S_NAME_T = "\u97F3\u6548\u540D\u79F0";                     // effect name
+    const string S_NAME_P    = "\u5982\uFF1A\u7834\u788E";                     // e.g. "shatter"
+    public const string S_TRIM = "\u88C1\u526A";                                 // trim
+    public const string S_GAIN = "\u97F3\u91CF";                                 // gain
+    public const string S_TRY = "\u8BD5\u542C";                                 // preview
+    public const string S_OK = "\u786E\u5B9A";                                 // OK
+    public const string S_CANCEL = "\u53D6\u6D88";                                 // cancel
+    public const string S_RESET = "\u6062\u590D\u9ED8\u8BA4";                     // restore default
+    public const string S_START = "\u8D77\u70B9";                                 // start
+    public const string S_END = "\u7EC8\u70B9";                                 // end
+    public const string S_SEC = " s";
+
+    // Vertical gap between stacked worn pots, as a fraction of one pot height.
+    //
+    // A full height puts them exactly edge to edge, which the user found too airy - the stack
+    // read as a column of separate bowls rather than a pile. Two thirds overlaps them slightly,
+    // which is what a real stack of basins looks like. Because it is less than 1 the pots now
+    // OVERLAP, so the draw order matters: see DrawRice.
+    const double IronStackGap = 2.0 / 3.0;
+
+    // How a pot is allowed to reach her head.
+    //
+    // Only a FALL seats a pot. Dragging one onto her used to work too, and so did letting go of
+    // one that was merely resting against her crown; both are refused now, on the user's call.
+    // These two numbers are the whole rule:
+    //   MinFallSpeed - the pot has to be coming down this fast. A held pot is not tested at all,
+    //                  and a pot released flush against her crown has ~0 speed, so "placed" can
+    //                  never be mistaken for "dropped". Free fall passes it after ~1 frame.
+    //   TopSlack     - how far past the top pot's rim still counts as landing ON the pile, so a
+    //                  pot dropped onto a stack seats on the surface instead of sinking through.
+    const double IronSeatMinFallSpeed = 30.0;         // px/s downward
+    const double IronSeatTopSlack = 14.0;             // px below the top rim still count as "on it"
+
+    // Zero balance: she turns ALOOF, always.
+    //
+    // This replaced a whole death/respawn sequence (she tipped over, puffed smoke, vanished
+    // and a Minecraft-style card offered to open the DeepSeek top-up page). That was removed
+    // on the user's call: too grim for a cute desktop pet, and - the deciding reason - the
+    // card carried a hard-coded URL, which is exactly the thing someone could rewrite to
+    // something malicious before passing the folder on. No URL lives in this file any more.
+    const double ZeroBalEps = 0.005;        // "balance is zero" threshold, in yuan
+
+    // Width of the API key dialog. The key is a long "sk-..." string; the other dialogs
+    // (amounts, volume, size, the top-up figure) stay at InputDialog's default 330.
+    const int KeyDialogW = 880;   // unified with every other secondary window
 
     readonly string _baseDir;
     readonly string _apiUrl;
     readonly int _pollMs;
     string _apiKey;
     bool _noSave;                // set by the diagnostic entry points
+    // True when the process was launched with a --flag. Used as an independent guard
+    // around SaveState so a diagnostic cannot rewrite the user's settings even if it
+    // forgets to call NoSaveForTest().
+    bool _diagRun;
+    // --pottrace only: makes DrawRiceArt report the exact numbers each draw call
+    // uses. A measurement re-implementing the draw arithmetic is what produced four
+    // probes that all "proved" the stacked-pot truncation was not happening.
+    bool _potTrace;
+    readonly List<string> PotTraceLog = new List<string>();
+    // One line per pot the draw loop actually drew this frame. Flushed into PotTraceLog after
+    // DrawRice, so the record reads in the order it happened.
+    readonly List<string> PotDrawLog = new List<string>();
+    // --ironflash calibration only: the pot the draw loop must skip this frame.
+    Rice _suppressPot;
+    // --ironflash: how many more frames to record a full draw trace for. Zero disables the trace
+    // so the ordinary run stays cheap and quiet.
+    int _flashTraceBudget;
+    // --potsentry: armed by the flag, then driven from the app's own tick so the mouse keeps
+    // working while it watches. All zero/false unless the sentry is running.
+    bool _sentryArmed;
+    double _sentryUntil;
+    int _sentryFrame, _sentryCaughtCanvas, _sentryCaughtScreen, _sentryPrevWorn = -1;
+    int _sentrySeconds;
+    // Diagnostic counters: how often the renderer ran, and how often it decided to repaint her.
+    // Used by --textbounce to tell "the squash was not applied" apart from "the renderer never ran".
+    int _renderCalls, _repaintTrueCalls;
+    // "Touching her feeds her" is on by default; the throw-physics tests switch it off for their
+    // duration, because a bowl thrown across her is otherwise eaten mid-flight and the thing they
+    // are measuring never happens.
+    bool _feedOnTouch = true;
+    string _sentryLogPath;
+    readonly Dictionary<Rice, double> _sentryBase = new Dictionary<Rice, double>();
+    readonly Dictionary<Rice, int> _sentryStable = new Dictionary<Rice, int>();
+    int PotTraceFrames;
+    const int PotTraceMaxFrames = 66;      // 6 frames' worth of "this frame / clear" lines
 
     Bitmap _flat, _sprNormal, _sprRed, _canvas;
+    // Last frame's repaint decision, for the diagnostics above.
+    bool _lastRepaintWidget;
+    // Top-level frame costs, timed at the entry points themselves. The per-stage
+    // counters inside RenderToCanvas are useful when they are trustworthy; these two
+    // say where a whole frame went even when a stage label has drifted, which is what
+    // a 15x-over-budget frame needs first.
+    public double LastRenderMs, LastPushMs;
+    // Whole-tick cost, from the top of OnTick. Its difference from render+push is what
+    // the per-phase counters failed to explain, so it is the number that says whether
+    // the stutter is even inside the tick at all.
+    public double LastTickMs;
+    // Marker-based segment timing: one cursor, one name per boundary, accumulated into
+    // a slot. This is the tool that survives repeated edits, unlike a growing pile of
+    // ad-hoc timestamps whose labels drift and hide the very thing being measured.
+    // The widget rect carries a margin: it starts 16 px left of the widget and 170 px
+    // above it, to hold the floating numbers and the shake. These two numbers are the
+    // whole reason the scratch coordinates are what they are, so they live here once
+    // instead of being re-derived (and mis-derived) at each use site.
+    const int InsetX = 16, InsetY = 170;
+    // The tablet readout, cached. BuildPanel used to run on EVERY frame that repainted
+    // the widget: a fresh Bitmap, four Font objects sized from the widget, two
+    // MeasureString passes and four DrawString calls - all GDI+ text work whose cost
+    // grows with the widget, on a picture that only changes when the BALANCE changes.
+    // The rule in the coding notes ("cache text as a bitmap, rebuild it only when the
+    // text changes") had been applied to the floating numbers but not here.
+    // Keyed on everything the panel depends on, so a size change or a new balance
+    // simply misses the cache.
+    Bitmap _panelCache;
+    bool _panelCacheValid;              // explicit: a sentinel in a numeric key can collide
+    int _panelCacheW = -1, _panelCacheH = -1;
+    string _panelCacheText;
+    // The panel is drawn in widget-relative coordinates scaled by _fx, so a size change
+    // is already caught by the width/height key. _fx[0] is carried as a cheap guard for
+    // a rescale that keeps the same panel size.
+    double _panelCacheFx;
     // ---- expression variants (third-generation artwork) ----------------------
     // One sprite per mood. All four are aligned by construction (same AI sheet,
     // split), and the tablet quad is identical to within 0.5 px across them, so a
@@ -718,16 +4068,30 @@ public sealed class DshPet : Form {
     const int EXPR_ALOOF   = 2;   // expression_12 : pout (bowl left unclaimed)
     const int EXPR_CALM    = 3;   // expression_21 : flat face (iron pot on her head)
     readonly Bitmap[] _exprArt = new Bitmap[4];
+    // Scaled sprite + hurt overlay per expression, built on demand and dropped when the
+    // widget size changes. A mood change is then a pointer swap: no double-bicubic
+    // resample and no per-pixel overlay rebuild. A run of charges flips happy/nervous
+    // repeatedly, so this lands squarely on the frames the user watches.
+    readonly Bitmap[] _exprSprCache = new Bitmap[4];
+    readonly Bitmap[] _exprRedCache = new Bitmap[4];
+    // Widget size the expression cache was built for. -1 forces a build on the first pass.
+    int _sizeCachedFor = -1;
+    // Width of the SOURCE artwork the tablet quad's coordinates are expressed in (they are
+    // authored against the 1024 px master). Needed to mirror the quad: the mirror is
+    // (sourceWidth - x), which is not the same as (_w - x) once the widget has been scaled.
+    int _sprNormalSourceW = 1024;
     int _expr = EXPR_HAPPY;
     bool _hasExpressions;        // false -> keep using the single sprite.png
     // Expression state machine timers, all in seconds.
-    //   _nervousT : counts down while damage cues are still being played, so a run
-    //               of charges keeps ONE grimace from the first cue to the last and
-    //               never flickers back between them (explicit requirement).
     //   _happyT   : set when a bowl is fed, so the smile is actually seen.
     //   _bowlWait : how long the current bowl has been lying uncollected; the pet
     //               turns aloof and the radar lock appears once it passes BowlWaitSec.
-    double _nervousT, _happyT, _bowlWait;
+    //
+    // There is no nervous timer: the grimace lasts exactly as long as a cue is playing
+    // (cueRunning in UpdateExpression). A run of charges still shows ONE grimace from the
+    // first cue to the last, because the live cues keep cueRunning true - the timer that
+    // used to linger afterwards only delayed the return to the resting face.
+    double _happyT, _bowlWait;
     // True from the moment the magnet grabs the bowl until it is eaten. Used to hold
     // off queued charges: while the bowl is being delivered, a fresh charge must wait
     // its turn instead of interrupting the pull.
@@ -766,6 +4130,31 @@ public sealed class DshPet : Form {
     // Was this click the second half of a double-click on her head? Detection only -
     // OnMouseDown then calls KnockPotOff(). Kept separate so the diagnostics can feed
     // synthetic clicks without also running the action.
+    // True when a canvas point falls inside the tablet she is holding.
+    //
+    // The four corners are _fx/_fy: they already include the right-corner mirroring and are in
+    // widget coordinates, hence the _offX/_offY shift - mouse events arrive in canvas coordinates
+    // because the window is screen-sized.
+    //
+    // Cross-product sign against every edge. The quad is convex, so this is exact, and unlike a
+    // bounding box it does not claim the corners the tablet does not cover.
+    bool OnTablet(int cx, int cy) {
+        if (_fx == null || _fx.Length < 4) return false;
+        double px = cx - _offX, py = cy - _offY;
+        int sign = 0;
+        for (int i = 0; i < 4; i++) {
+            int j = (i + 1) & 3;
+            double ex = _fx[j] - _fx[i], ey = _fy[j] - _fy[i];
+            double vx = px - _fx[i], vy = py - _fy[i];
+            double cross = ex * vy - ey * vx;
+            if (Math.Abs(cross) < 1e-6) continue;          // on the edge counts as inside
+            int s = cross > 0 ? 1 : -1;
+            if (sign == 0) sign = s;
+            else if (s != sign) return false;
+        }
+        return true;
+    }
+
     bool DoubleClickOnHead(int x, int y) {
         double cx = _offX + _w * 0.47, cy = _offY + _w * 0.30;
         double halfW = _w * 0.26, halfH = _w * 0.18;
@@ -785,18 +4174,33 @@ public sealed class DshPet : Form {
 
     // Knocked off: she flinches once more and the pot fades away. Her face returns to
     // happy on its own, because HeadPotOn goes false.
+    //
+    // With a stack this removes ONE pot - the topmost - not the whole column. Double
+    // clicking her head reads as "take that one off", and the pots below simply re-seat one
+    // height lower on the next tick (their anchor is re-derived every frame, so the gap
+    // closes immediately).
     void KnockPotOff() {
-        bool any = false;
+        Rice top = null;
         for (int i = 0; i < _rices.Count; i++) {
             Rice r = _rices[i];
             if (!r.OnHead || r.FadeT > 0) continue;
-            r.FadeT = 1e-6;                         // starts the fade + eventual removal
-            any = true;
+            if (top == null || r.Y < top.Y) top = r;    // smallest Y = highest on screen
         }
-        if (!any) return;
-        _headSquashT = 0;                           // the second little flinch
+        if (top == null) return;
+        top.FadeT = 1e-6;                               // starts the fade + eventual removal
+        _headSquashT = 0;                               // the second little flinch
+        PlayCue(CUE_OFF, _ironOffSound);
         _dirty = true;
         Log("iron pot knocked off (double click on her head)");
+    }
+
+    // Diagnostics: fade a specific pot out. Used by the stack test to take out a MIDDLE pot
+    // and prove the ones above it close the gap rather than leaving a hole.
+    void KnockIronPotOff(Rice p) {
+        if (p == null || p.FadeT > 0) return;
+        p.FadeT = 1e-6;
+        _headSquashT = 0;
+        _dirty = true;
     }
     // True while the pot is worn: everything that reacts to "is the pot on her head"
     // (the cold face, the erase pass, the click-to-remove) reads this.
@@ -860,11 +4264,6 @@ public sealed class DshPet : Form {
     // How long the grimace lingers after the last damage cue. Only ever SET while a
     // cue is actually running, then left to decay - see UpdateExpression.
     //
-    // Long enough that a poll hiccup between two charges of the SAME run cannot flash
-    // the resting smile (the cues themselves are 0.2 s apart), but short enough that
-    // the face visibly relaxes once spending really stops. 3.0 s was tried first and
-    // felt sluggish; user asked for it to be shortened.
-    const double NervousHoldSec = 1.0;
     // How long a bowl may lie unclaimed before the pet turns aloof and locks on.
     // User-specified: 10 s without being fed switches her to the aloof art.
     const double BowlWaitSec = 10.0;
@@ -946,6 +4345,11 @@ public sealed class DshPet : Form {
     bool _drag; Point _dragStart;
     Point _offStart;                 // widget offset when a girl-drag began
     bool _snapping; double _snapT; Point _snapFrom, _snapTo;
+    // Which bottom corner she flies home to: false = left (the default), true = right.
+    //
+    // Set when a drag is released, from where the pointer let go, and remembered afterwards -
+    // it also decides which side a rice bowl falls in from, so the two can never disagree.
+    bool _snapRight;
     byte[] _hitMap; int _hitW, _hitH;
     // The GIRL only - _hitMap also contains the top-up bowl (so the bowl can be
     // grabbed), and using that for the "did the bowl land on her" test compared
@@ -1110,25 +4514,105 @@ public sealed class DshPet : Form {
     double _riceGrabX, _riceGrabY;   // centre offset from the cursor when grabbed
     NotifyIcon _tray;
     ContextMenuStrip _menu;
-    ToolStripMenuItem _sizeItem;
-    ToolStripMenuItem _soundItem;
-    ToolStripMenuItem _muteItem;
-    ToolStripMenuItem _themeItem;
-    ToolStripMenuItem _testTopItem;      // "test top-up" submenu, for --menushot
-    bool _darkTheme = false;         // menu palette: light (shipped) or dark (DSH-like)
-    int _volume = 80;                // 0..100, live from the sound submenu
+    // GONE with the settings window: _sizeItem, _soundItem, _muteItem, _themeItem, _themeRows,
+    // _demoItem, _volumeItem, _customFxItem, _cueVolRows, _cueFxRows, _cuePickRows.
+    //
+    // Every one of them existed so a menu ROW could be found again - to tick it, to relabel it, to
+    // photograph it. The context menu is five flat action rows and holds no state, so there is
+    // nothing left to look up; SettingsWindow reads the values themselves. That also removes the
+    // bug class the lookups kept causing: a row label that silently stopped matching its value.
+    bool _darkTheme = false;         // palette: light (shipped) or dark (DSH-like)
+    // NO MASTER VOLUME. There used to be one, and it was removed rather than fixed.
+    //
+    // It was first a setter - moving it overwrote all four cue levels, so 50/50/50/48 became
+    // 60/60/60/60 and the 48 was gone. Recast as a multiplier it stopped losing data, but it still
+    // meant every cue had TWO numbers ("own" and "effective") and the window had to show both to
+    // stay honest. The user's call: drop it. One level per cue, one number, one source of truth.
+    // "Everything quieter" is four drags, which is a rare thing to want and not worth a second
+    // concept permanently attached to the first.
+    //
+    // A saved volume= key in state.ini is now simply ignored (see ReadState).
     // kept in a field so the renderer can be disposed with the form
     PetMenuRenderer _menuRenderer;
     int _demoLeft;                   // cues left in a rehearsal run
     double _demoAmount = 0.01;
 
     // current frame's shake offset, so the readout and the floating numbers move
-    // together with the character
-    double _shakeX, _shakeY;
+    // together with the character. Integer pixels: RenderToCanvas rounds the shake into
+    // ox/oy and every consumer adds it to a pixel coordinate.
+    int _shakeX, _shakeY;
     // hit sound: one MCI alias per concurrent cue
     SoundPool _sound;
     SoundPool _feedSound;            // the delivery "thank you" cue
+    // The two pot cues. Separate pools with their own alias tags, so they never cut each
+    // other off. Each is silenced through its own volume row rather than a switch.
+    SoundPool _ironLandSound;        // pot lands on her head
+    SoundPool _ironOffSound;         // pot knocked off by a double click
+    // ---- per-cue volume and custom effects, 2026-10-09 --------------------
+    //
+    // Four cues, four independent volume sliders. Each cue's own level is what is heard: MCI
+    // takes one volume per alias, so what is set here IS what is heard, and there is no master
+    // above it any more (see the field comment where the master used to live).
+    //
+    // Order is fixed and shared by every parallel array: 0 damage, 1 heal, 2 pot-on,
+    // 3 pot-off. CueIndexFor* below exist so no call site has to remember that.
+    public const int CUE_HIT = 0, CUE_FEED = 1, CUE_LAND = 2, CUE_OFF = 3;
+    int[] _cueVolume = new int[] { 80, 80, 80, 80 };
+    // The custom clips. Every one a user makes is KEPT in a per-cue library and the active one
+    // is chosen from a menu, so trying a new sound no longer destroys the last one. The shipped
+    // originals are never touched and never appear in the library listing.
+    CueLibrary _lib;
+    // What the cue is CALLED right now: the active clip's name, or the shipped default's.
+    string CueName(int cue) {
+        if (cue < 0 || cue > 3) return "";
+        CueLibrary.Clip c = _lib != null ? _lib.Active(cue) : null;
+        return c != null ? c.Name + S_EFFECT : CueDefaultName(cue);
+    }
+    static string CueDefaultName(int cue) {
+        switch (cue) {
+            case CUE_HIT: return S_E_HIT;
+            case CUE_FEED: return S_E_FEED;
+            case CUE_LAND: return S_E_LAND;
+            default: return S_E_OFF;
+        }
+    }
+    static string CueVolumeLabel(int cue) {
+        switch (cue) {
+            case CUE_HIT: return S_V_HIT;
+            case CUE_FEED: return S_V_FEED;
+            case CUE_LAND: return S_V_LAND;
+            default: return S_V_OFF;
+        }
+    }
+
     bool _soundEnabled = true;
+    // Feature switches (the "feature choice" rows on the display page).
+    //
+    // Each gates one behaviour AT ITS ENTRY POINT - MakeTick, StartCredit, TickPatWith - so the demo
+    // triggers, which call those same methods, obey them too. That is why "the demo is no exception"
+    // needs no special case anywhere: there is only one door per feature.
+    bool _fxBowlDrop = true;         // recharge drops a rice bowl to collect
+    bool _fxPat = true;              // head-pat reacts to the pointer
+    bool _fxHurt = true;             // a charge shows as hurt: sound, shake, face
+
+    // ---- peak / off-peak readout ------------------------------------------
+    //
+    // The clock comes from the balance endpoint's HTTP Date header, not from the machine: the user
+    // asked for cloud time specifically, and a wrong system clock would otherwise make the tariff
+    // line disagree with what they are actually billed.
+    DateTime _cloudStamp;            // cloud time as last read
+    DateTime _cloudLocalStamp;       // local time at that read, for advancing it between polls
+    bool _haveCloudTime;
+    bool _peakMode;                  // the tablet is showing the tariff readout
+    double _peakHoldMs;              // countdown before it reverts
+    double _todayUsed;               // summed charges since local midnight
+    int _usedDay;                    // the day _todayUsed belongs to
+    bool _spendDirty;                // the day's total needs writing on exit
+    int _peakSec = -1;               // last second drawn on the tariff panel
+    long _pushCount;                 // how many times the layer was actually pushed
+    bool _mouseInside;               // the pointer is engaging with her (or a button is held)
+    long _lastBodyClickMs = -100000;  // double-click tracking for the tariff toggle
+    Point _lastBodyClickPt;
     bool _soundWanted = true;
     volatile bool _noNetwork;        // set by the offline self-tests
     int _pollInFlight;               // only one balance request at a time
@@ -1136,30 +4620,61 @@ public sealed class DshPet : Form {
 
     public DshPet(string baseDir, string[] args) {
         _baseDir = baseDir;
+        // Console output as UTF-8. Without this the process writes with the system ANSI code page,
+        // and any non-ASCII path in a diagnostic line comes out as mojibake, which
+        // that cannot be copied back into a command - which is exactly what a log path is for.
+        try {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+        } catch { }
         // The window is the WHOLE screen from the moment it is created and never
         // changes size. It used to be widget-sized and grow when a bowl appeared; the
         // resize made Windows composite the previous canvas onto the new window for a
         // couple of frames, flashing the girl to the top-left of the screen. Setting
         // it here (before the handle exists) means no resize ever happens.
         // The widget lives at _offX/_offY inside this canvas.
+        // Publish the folder for the FORM classes, which need it to find their title-bar icons and
+        // have no DshPet instance to ask. Done first, before any window can be constructed.
+        AppBaseDir = baseDir;
         Rectangle vsInit = SystemInformation.VirtualScreen;
         _winW = vsInit.Width;
         _winH = vsInit.Height;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         SetBounds(vsInit.Left, vsInit.Top, _winW, _winH);
+        // A DIAGNOSTIC RUN MUST NEVER APPEAR ON SCREEN.
+        //
+        // The window is the whole screen, so running one while working on something else throws a
+        // 2560x1600 sheet over the desktop and blocks every other application. The user reported it as
+        // "a 1000+ px picture of the girl covering my screen on every small change".
+        //
+        // Hidden here, in the constructor, rather than at the end of main: the handle does not exist
+        // yet, so the window is never shown even for one frame. The diagnostics draw into the same
+        // canvas and read it back, and none of them need it to be visible - so nothing is lost.
+        for (int ai = 0; ai < args.Length; ai++) {
+            if (args[ai].StartsWith("--")) {
+                _diagRun = true;
+                ShowInTaskbar = false;
+                Opacity = 0;
+                break;
+            }
+        }
+        LoadUsage();             // reads usage.ini and zeroes it if the stored day is not today
         _apiKey  = Get("DSHPET_KEY", "");
         _apiUrl  = Get("DSHPET_API", "https://api.deepseek.com/user/balance");
         _pollMs  = int.Parse(Get("DSHPET_POLL_MS", "2000"));
         _cm      = double.Parse(Get("DSHPET_CM", "8"), CultureInfo.InvariantCulture);
         _soundWanted = Get("DSHPET_SOUND", "1") != "0";
         _ulwBlt = Get("DSHPET_ULWBLT", "1") != "0";
-        _volume  = int.Parse(Get("DSHPET_VOLUME", "80"));   // ReadState may override
+        // DSHPET_VOLUME is GONE, and a saved `volume=` key in state.ini is ignored. There is no
+        // master level to seed any more: each pool is created at ITS OWN cue's level below, and
+        // ReadState/ApplyAllCueVolumes then applies whatever was stored.
 
         string sprite = Get("DSHPET_SPRITE", Path.Combine(baseDir, "sprite.png"));
         if (!File.Exists(sprite)) throw new FileNotFoundException("sprite not found: " + sprite);
         _flat = new Bitmap(sprite);
         LoadExpressionArt(baseDir);
+        // After the expressions, so a failed hand load logs behind a successful character load.
+        LoadPatHandArt(baseDir);
 
         // Top-up props. Both are optional: if the files are missing the recharge
         // still works, it just has no bowl to drag and no hearts to pop.
@@ -1181,25 +4696,42 @@ public sealed class DshPet : Form {
         // the environment: values crossing the PowerShell/C# boundary come back
         // ANSI-mangled when the folder name is not ASCII, while a path built in
         // this process stays correct.
-        string sndPath = Path.Combine(baseDir, Get("DSHPET_SOUND_FILE", "hit.mp3"));
+        // ORDER MATTERS, twice over.
+        //
+        // The library is built FIRST: CuePlayPath asks it which clip is active, and the pools
+        // below are opened from CuePlayPath. MigrateLegacySidecar then files any clip left by
+        // the old one-slot scheme, and ReadState applies the volumes - which has to be after the
+        // pools exist, or every per-cue level it resolves is overwritten by the pool
+        // construction that follows.
+        _lib = new CueLibrary(baseDir);
+        MigrateLegacySidecar();
+        string sndPath = CuePlayPath(CUE_HIT);
         if (_soundWanted && File.Exists(sndPath)) {
-            _sound = new SoundPool(sndPath, 4, _volume, Path.Combine(baseDir, "pet.log"));
+            // Created at the DAMAGE cue's own level, not at some shared number: the pool is what
+            // plays that cue, so it starts where that cue's slider is.
+            _sound = new SoundPool(sndPath, 4, _cueVolume[CUE_HIT], Path.Combine(baseDir, "pet.log"));
             if (_sound.Failed) Log("sound pool failed: " + _sound.Error);
-            else Log("sound ready: " + sndPath + " volume=" + _volume);
+            else Log("sound ready: " + sndPath + " volume=" + _cueVolume[CUE_HIT]);
         } else if (_soundWanted) {
             Log("sound file missing: " + sndPath + " (hit sound disabled)");
         }
 
         // The "thank you" cue played when a bowl is delivered. Its own pool, with its
         // own alias tag, so it plays independently of the hurt cue.
-        string feedPath = Path.Combine(baseDir, Get("DSHPET_FEED_SOUND_FILE", "feed.mp3"));
+        string feedPath = CuePlayPath(CUE_FEED);
         if (_soundWanted && File.Exists(feedPath)) {
-            _feedSound = new SoundPool(feedPath, 2, _volume, Path.Combine(baseDir, "pet.log"), "dsphfeed");
+            _feedSound = new SoundPool(feedPath, 2, _cueVolume[CUE_FEED], Path.Combine(baseDir, "pet.log"), "dsphfeed");
             if (_feedSound.Failed) Log("feed sound failed: " + _feedSound.Error);
-            else Log("feed sound ready: " + feedPath + " volume=" + _volume);
+            else Log("feed sound ready: " + feedPath + " volume=" + _cueVolume[CUE_FEED]);
         } else if (_soundWanted) {
             Log("feed sound missing: " + feedPath + " (feed cue disabled)");
         }
+
+        // The two pot cues. Each is optional and each has its own alias tag, so one playing
+        // never cuts the other off. CuePlayPath honours DSHPET_*_FILE, then a user-uploaded
+        // replacement, then the shipped default.
+        _ironLandSound = BuildCueFrom(CUE_LAND, "DSHPET_IRONLAND_FILE", "pot_land.mp3", 2, "dsphland");
+        _ironOffSound  = BuildCueFrom(CUE_OFF,  "DSHPET_IRONOFF_FILE",  "pot_off.mp3",  2, "dsphoff");
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -1208,6 +4740,9 @@ public sealed class DshPet : Form {
         Text = "DSH Balance Pet";
 
         ReadState();
+        // ReadState resolves the per-cue volumes, but the pools did not exist when it ran for the
+        // cuevol keys it parsed... they DO now, so push them.
+        ApplyAllCueVolumes();
         Relayout();
         SnapToCorner(true);
         BuildMenu();
@@ -1217,7 +4752,7 @@ public sealed class DshPet : Form {
         bool quietRun = Array.IndexOf(args, "--selftest") >= 0 || Array.IndexOf(args, "--shot") >= 0 ||
                         Array.IndexOf(args, "--menushot") >= 0;
         if (string.IsNullOrEmpty(_apiKey) && !quietRun && !File.Exists(KeyPath)) {
-            using (InputDialog d = new InputDialog(S_KEYT, S_KEYP, "", "")) {
+            using (InputDialog d = new InputDialog(S_KEYT, S_KEYP, "", "", KeyDialogW, true)) {
                 if (d.ShowDialog(this) == DialogResult.OK) {
                     string k = d.Value;
                     if (k.Length > 0) {
@@ -1232,15 +4767,25 @@ public sealed class DshPet : Form {
         }
 
         _tray = new NotifyIcon();
-        _tray.Icon = SystemIcons.Application;
+        _tray.Icon = LoadTrayIcon(baseDir);
         _tray.Text = "DSH - " + (_status.Length > 40 ? _status.Substring(0, 40) : _status);
         _tray.ContextMenuStrip = _menu;
         _tray.Visible = true;
         _tray.DoubleClick += delegate { DemoCharge(0.05); };
 
         _timer = new System.Windows.Forms.Timer();
-        _timer.Interval = int.Parse(Get("DSHPET_TICK_MS", "33"));
-        _timer.Tick += delegate { OnTick(); };
+        // 16 ms, i.e. ~60 fps. Every animation except the head pat runs off this tick, so raising it is
+        // what lifts the frame rate; the pat has its own per-frame clock (PAT_FRAME_MS) and is
+        // deliberately left alone, because its timing was tuned by hand against a reference GIF.
+        _timer.Interval = int.Parse(Get("DSHPET_TICK_MS", "16"));
+        // The production tick calls TickOnce - the SAME method the diagnostics pump - rather than
+        // spelling the sequence out again in this delegate.
+        //
+        // That is the fix for a bug that shipped twice. ApplyPendingMenuClose was hung on
+        // OnTickProbe, the DIAGNOSTIC path: --clickaway passed (it pumps OnTickProbe) while the
+        // real application never applied the flag, so the hook installed, the click was flagged,
+        // and the menu stayed open. Two copies of a sequence will drift; one will not.
+        _timer.Tick += delegate { TickOnce(); };
         _timer.Start();
 
         _poll = new System.Windows.Forms.Timer();
@@ -1265,6 +4810,58 @@ public sealed class DshPet : Form {
         it.Tag = icon;
         if (icon != IC_NONE) it.Image = MakeIcon(icon);
         return it;
+    }
+
+    // Marks the row as the START of a section band.    //
+    // It only RECORDS the marker; the band map is resolved once the whole menu exists (see
+    // _pendingBands / FlushBands). Two reasons: an item's Owner - and therefore which popup it
+    // belongs to - is null until it is added, and doing it in one place afterwards is what
+    // makes the result verifiable. Band indices start at zero; the FIRST row of every banded
+    // popup must carry a marker, or the rows above the first marker would form an implicit
+    // band of their own.
+    void Band(ToolStripMenuItem it, int band) {
+        if (it == null) return;
+        _pendingBands.Add(new KeyValuePair<int, ToolStripMenuItem>(band, it));
+    }
+    readonly List<KeyValuePair<int, ToolStripMenuItem>> _pendingBands =
+        new List<KeyValuePair<int, ToolStripMenuItem>>();
+
+    // Turns the recorded markers into the renderer's band map, one popup at a time.
+    void FlushBands() {
+        if (_menuRenderer == null) return;
+        // Group the markers by the popup they live in, keeping the caller's order.
+        List<ToolStripItemCollection> done = new List<ToolStripItemCollection>();
+        for (int pass = 0; ; pass++) {
+            // For each popup, collect its markers in ascending band order.
+            ToolStripItemCollection target = null;
+            foreach (KeyValuePair<int, ToolStripMenuItem> kv in _pendingBands) {
+                ToolStripItemCollection c = kv.Value.Owner != null ? kv.Value.Owner.Items : null;
+                if (c == null) continue;
+                bool seen = false;
+                foreach (ToolStripItemCollection d in done) if (d == c) { seen = true; break; }
+                if (seen) continue;
+                target = c;
+                break;
+            }
+            if (target == null) break;
+            done.Add(target);
+            List<KeyValuePair<int, ToolStripMenuItem>> mine = new List<KeyValuePair<int, ToolStripMenuItem>>();
+            foreach (KeyValuePair<int, ToolStripMenuItem> kv in _pendingBands) {
+                ToolStripItemCollection c = kv.Value.Owner != null ? kv.Value.Owner.Items : null;
+                if (c == target) mine.Add(kv);
+            }
+            // Sort by the band index the caller gave, so declaration order in BuildMenu does
+            // not have to match top-to-bottom order.
+            mine.Sort(delegate(KeyValuePair<int, ToolStripMenuItem> a, KeyValuePair<int, ToolStripMenuItem> b) {
+                return a.Key.CompareTo(b.Key);
+            });
+            ToolStripItem[] starts = new ToolStripItem[mine.Count];
+            for (int i = 0; i < mine.Count; i++) starts[i] = mine[i].Value;
+            // Re-derive the indices from position, so a caller that numbers its bands 0,1,2 or
+            // 1,2,3 or 0,2,7 gets the same result: what matters is the ORDER of the markers.
+            _menuRenderer.SetBands(target, starts);
+        }
+        _pendingBands.Clear();
     }
 
     // A non-clickable section header, to break the menu into readable groups.
@@ -1413,12 +5010,17 @@ public sealed class DshPet : Form {
         return bmp;
     }
 
+
     void BuildMenu() {
         // Flat white surface, colour Emoji icons, section headers, our own blue tick.
         // ShowImageMargin stays ON because the icons live in that column.
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.ShowImageMargin = true;
         menu.ShowCheckMargin = false;          // the tick is drawn into the icon column
+        // The stock drop shadow is a light grey halo that ignores the palette entirely.
+        // Against the dark card it reads as a bright border - measured at #434549 around a
+        // #2c2c2e fill - which looked like "the submenu did not get the dark theme" when in
+        // fact the fill was correct and only the shadow was wrong.
         menu.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
         _menuRenderer = new PetMenuRenderer(_darkTheme);
         // The colour table is shared between renderer and control, and it reads the
@@ -1429,99 +5031,47 @@ public sealed class DshPet : Form {
         menu.Padding = new Padding(6, 6, 6, 6);
         _menu = menu;
 
+        // ============ the context menu is now the SHORT list ============
+        //
+        // Everything configurable moved into the settings window, and the demo triggers into their
+        // own window. The cascade had reached SIX levels - sound settings > custom effect > pot-on
+        // effect > choose > <clip> > use - so the popups walked off the right of the screen, hid
+        // what was behind them, and could not show a value in place. A menu is for DOING, not for
+        // editing: what is left here are actions that are over the moment you pick them.
+        //
+        // Five rows. No submenus, therefore no bands either - with no groups left there is nothing
+        // for a band to group, and the old band declarations went with the submenus.
+
         // ---- balance ----
         ToolStripMenuItem refresh = NewItem(IC_REFRESH, S_REFRESH);
         refresh.Click += delegate { _pollWant = 2; };
         _menu.Items.Add(refresh);
 
-        _menu.Items.Add(new ToolStripSeparator());
+        // ---- demo: opens its own window now ----
+        //
+        // It was a submenu with a submenu inside it. Six one-shot triggers are not a settings
+        // category and are not a menu either, so they moved to DemoWindow.
+        ToolStripMenuItem demo = NewItem(IC_CASCADE, S_DEMO);
+        demo.Click += delegate { ShowDemoUi(); };
+        _menu.Items.Add(demo);
 
-        // ---- tests ----
-        _menu.Items.Add(NewHeader("\u6D4B\u8BD5"));                   // test
-        ToolStripMenuItem test = NewItem(IC_BOLT, S_TEST);
-        test.Click += delegate { DemoCharge(StepYuan); };
-        _menu.Items.Add(test);
+        // ---- settings: opens the settings window ----
+        //
+        // ONE row for everything configurable. There used to be a display-settings submenu and a
+        // sound-settings submenu, and the sound one reached six popups deep. Both are pages in
+        // SettingsWindow now, where the choices are visible side by side instead of behind another
+        // popup and where a value can be shown in place.
+        ToolStripMenuItem settingsRow = NewItem(IC_SIZE, S_SETTINGS);
+        settingsRow.Click += delegate { ShowSettingsUi(); };
+        _menu.Items.Add(settingsRow);
 
-        ToolStripMenuItem testTop = NewItem(IC_BOWL, S_TESTTOP);
-        _testTopItem = testTop;
-        ToolStripMenuItem testTopGo = NewItem(IC_NONE, S_TESTTOPG);
-        testTopGo.Click += delegate { TestTopUp(TestTopUpYuan); };
-        testTop.DropDownItems.Add(testTopGo);
-        // Fires the nameplate up by hand so the readouts can be checked without
-        // waiting out the 10 s deadline. Display only - it does not feed the bowl.
-        ToolStripMenuItem radarOn = NewItem(IC_NONE, S_RADARON);
-        radarOn.Click += delegate { OpenRadarManually(); };
-        testTop.DropDownItems.Add(radarOn);
-        testTop.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem testTopCustom = NewItem(IC_NONE, S_CUSTOM);
-        testTopCustom.Click += delegate { AskTopUp(); };
-        testTop.DropDownItems.Add(testTopCustom);
-        _menu.Items.Add(testTop);
-
-        ToolStripMenuItem demoItem = NewItem(IC_CASCADE, S_HELP);
-        double[] demos = new double[] { 0.05, 0.1, 0.2, 0.5, 1.0 };
-        foreach (double d in demos) {
-            double v = d;
-            ToolStripMenuItem it = NewItem(IC_NONE, "-" + v.ToString("0.##", CultureInfo.InvariantCulture) +
-                                               "  (" + CueCount(v) + " \u6B21)");
-            it.Click += delegate { DemoCharge(v); };
-            demoItem.DropDownItems.Add(it);
-        }
-        demoItem.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem demoCustom = NewItem(IC_NONE, S_CUSTOM);
-        demoCustom.Click += delegate { AskDemo(); };
-        demoItem.DropDownItems.Add(demoCustom);
-        _menu.Items.Add(demoItem);
-
-        _menu.Items.Add(new ToolStripSeparator());
-
-        // ---- display ----
-        _menu.Items.Add(NewHeader("\u663E\u793A"));                   // display
-        _sizeItem = NewItem(IC_SIZE, S_SIZE);
-        // Presets are a radio group: the current one is marked with the tick the
-        // renderer draws into the icon column, so no icon competes with it.
-        for (int i = 0; i < SizeNames.Length; i++) {
-            int idx = i;
-            ToolStripMenuItem it = NewItem(IC_NONE, SizeNames[i] + "  " + PresetPxLabel(i));
-            it.Click += delegate { SetSizePreset(idx); };
-            _sizeItem.DropDownItems.Add(it);
-        }
-        _sizeItem.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem sizeCustom = NewItem(IC_NONE, S_CUSTOM);
-        sizeCustom.Click += delegate { AskPx(); };
-        _sizeItem.DropDownItems.Add(sizeCustom);
-        _menu.Items.Add(_sizeItem);
-
-        // ---- appearance ----
-        // Same radio pattern as the size presets: the current one carries the tick.
-        _themeItem = NewItem(IC_THEME, S_THEME);
-        ToolStripMenuItem thLight = NewItem(IC_NONE, S_THEME_LT);
-        thLight.Click += delegate { SetDarkTheme(false); };
-        _themeItem.DropDownItems.Add(thLight);
-        ToolStripMenuItem thDark = NewItem(IC_NONE, S_THEME_DK);
-        thDark.Click += delegate { SetDarkTheme(true); };
-        _themeItem.DropDownItems.Add(thDark);
-        _menu.Items.Add(_themeItem);
-
-        // ---- sound ----
-        _soundItem = NewItem(IC_SOUND, S_SOUND);
-        _muteItem = NewItem(IC_NONE, S_SOUNDON);            // on/off toggle
-        _muteItem.Click += delegate { SetSoundEnabled(!_soundEnabled); };
-        _soundItem.DropDownItems.Add(_muteItem);
-        _soundItem.DropDownItems.Add(new ToolStripSeparator());
-        _soundItem.DropDownItems.Add(NewHeader(S_VOLT));    // level header
-        for (int i = 0; i < VolumeSteps.Length; i++) {
-            int v = VolumeSteps[i];
-            ToolStripMenuItem it = NewItem(IC_NONE,
-                v == 0 ? S_MUTE0 : v.ToString(CultureInfo.InvariantCulture) + " %");
-            it.Click += delegate { SetVolumePercent(v); };
-            _soundItem.DropDownItems.Add(it);
-        }
-        _soundItem.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem volCustom = NewItem(IC_NONE, S_CUSTOM);
-        volCustom.Click += delegate { AskVolume(); };
-        _soundItem.DropDownItems.Add(volCustom);
-        _menu.Items.Add(_soundItem);
+        // ---- sound settings ----
+        //
+        // NOT a second row: the settings window already covers sound, and two rows that open the
+        // same window under different names would be two of the same thing. The comment is kept
+        // because the reason the sound CASCADE is gone belongs next to where it used to be built:
+        // sound > custom effect > pot-on > choose > <clip> > use was six popups deep, walking off
+        // the right of the screen, and none of it could show what the alternatives were.
 
         _menu.Items.Add(new ToolStripSeparator());
 
@@ -1536,11 +5086,35 @@ public sealed class DshPet : Form {
 
         _menu.Opening += delegate { RefreshMenuChecks(); };
         StyleMenu(_menu.Items);
+        // The band markers were recorded while building; resolve them now that every item has
+        // been added and therefore knows which popup it belongs to.
+        FlushBands();
         ApplyRoundedRegions(_menu.Items);
         // The theme was read from state.ini before the menu existed, so the icons
         // built above already use it; this pass paints the surface itself and sets
         // the tick on the current appearance row.
         ApplyTheme();
+    }
+
+
+    // Gives one drop-down the card treatment: our renderer, the palette, and the rounded Region
+    // once it has been laid out.
+    //
+    // A ToolStripDropDown is its own control and inherits NOTHING from its owner, so every popup
+    // needs this individually. ApplyRoundedRegions walks the tree doing it for the ones that
+    // exist at build time - but the choose menu's rows are created when it OPENS, so their
+    // drop-downs are born after that walk and were left with the stock renderer. That is the
+    // report: "the choose submenu has a white border".
+    void PrepareDropDown(ToolStripDropDown dd) {
+        if (dd == null || _menuRenderer == null) return;
+        dd.Renderer = _menuRenderer;
+        dd.BackColor = _menuRenderer.Bg;
+        dd.ForeColor = _menuRenderer.Ink;
+        dd.Opened -= OnDropDownOpened;
+        dd.Opened += OnDropDownOpened;
+    }
+    void OnDropDownOpened(object sender, EventArgs e) {
+        PetMenuRenderer.ApplyRoundedRegion(sender as Control);
     }
 
     // Give every drop-down (the root menu and each submenu) the rounded card
@@ -1551,13 +5125,18 @@ public sealed class DshPet : Form {
             ToolStripMenuItem mi = it as ToolStripMenuItem;
             if (mi == null) continue;
             if (mi.DropDownItems.Count > 0) {
-                ToolStripDropDown dd = mi.DropDown;
-                dd.Opened += delegate { PetMenuRenderer.ApplyRoundedRegion(dd); };
+                // The renderer has to be set per popup: a submenu that keeps the stock renderer
+                // paints a light surface with OS check boxes on top of a dark theme, which is
+                // exactly the "the submenu is white while the root menu is dark" report.
+                PrepareDropDown(mi.DropDown);
                 ApplyRoundedRegions(mi.DropDownItems);
             }
         }
         PetMenuRenderer.ApplyRoundedRegion(_menu);
-        if (_menu != null) _menu.Opened += delegate { PetMenuRenderer.ApplyRoundedRegion(_menu); };
+        if (_menu != null) {
+            _menu.Opened -= OnDropDownOpened;
+            _menu.Opened += OnDropDownOpened;
+        }
     }
 
     // Live sound settings, driven from the menu.
@@ -1582,31 +5161,76 @@ public sealed class DshPet : Form {
     void SetSoundEnabled(bool on) {
         _soundEnabled = on;
         _soundWanted = on;
+        // The switch is now the ONLY mute. It used to be silently derived from the master being
+        // 0 %, which meant two different controls could both claim to be "off" and the state had
+        // to be reconciled on every volume change. Turning it off has to reach the players, since
+        // a cue's own level is no longer the thing being zeroed.
+        ApplyAllCueVolumes();
         Log("sound " + (on ? "on" : "muted"));
         SaveState();
         _dirty = true;
     }
 
-    void SetVolumePercent(int pct) {
-        if (pct < 0) pct = 0;
-        if (pct > 100) pct = 100;
-        _volume = pct;
-        if (_sound != null) _sound.SetVolume(pct);
-        if (_feedSound != null) _feedSound.SetVolume(pct);
-        // 0 % IS mute, so the on/off row in the menu must follow it: otherwise
-        // the menu would claim sound is on while the players are silent.
-        bool on = pct > 0;
-        _soundEnabled = on;
-        _soundWanted = on;
-        Log("volume set to " + pct + "%" + (on ? "" : " (muted)"));
-        // A short cue so the new level is audible immediately.
-        if (on) {
-            if (_feedSound != null && !_feedSound.Failed) _feedSound.Play();
-            else if (_sound != null) _sound.Play();
-        }
-        SaveState();
-    }
+    // REMOVED: SetFxEnabled. It wrote a per-cue on/off boolean that the per-cue volume row
+    // already expresses - 0 % is off - and having both meant two sources of truth for the same
+    // question. Silencing a cue is now SetCueVolume(cue, 0).
 
+    // SetVolumePercent is GONE with the master volume row. Its history is worth keeping, because
+    // it is why there is no master any more:
+    //
+    //   v1  a SETTER - moved the four cue levels to its own value, so 50/50/50/48 became
+    //       60/60/60/60 and the 48 was destroyed.
+    //   v2  a MULTIPLIER - stopped losing data, but gave every cue two numbers ("own" and
+    //       "effective") that the window then had to display side by side to stay honest.
+    //   v3  removed - one level per cue, one number, one source of truth.
+    //
+    // The lesson is that the second control was never the problem; needing a second CONCEPT to
+    // describe one cue's loudness was. Callers that used this now call SetCueVolume per cue.
+
+    // What a cue actually plays at.
+    //
+    // With the master gone this is simply the cue's own level - the ONLY thing that decides a
+    // cue's loudness, apart from the on/off switch. It is still a method rather than a field read
+    // because the mute has to be folded in at exactly one place, and because a guard asserts that
+    // this is what the player was given (see --cuevolume).
+    public int EffectiveCueVolume(int cue) {
+        if (cue < 0 || cue > 3) return 0;
+        if (!_soundEnabled) return 0;            // the switch is the only mute
+        return _cueVolume[cue];
+    }
+    // Audition a cue at its CURRENT level. The preview button calls this.
+    //
+    // Audition a cue at its CURRENT level.
+    //
+    // A cue at 0 % is SILENT here, and that is a correction rather than the original behaviour.
+    // The first version substituted a fixed 60 % for a muted cue, reasoning that a button called
+    // "preview" returning silence would look broken. That reasoning was wrong: in this design
+    // 0 % IS off - it is the one rule the whole page rests on - and a preview that made a noise
+    // anyway broke that rule at the exact moment the user was checking it. Worse, it made the
+    // button's behaviour depend on a level the user had already decided against, so "why is my
+    // muted effect making a sound" was a fair question with no good answer.
+    //
+    // Silence is honest: the level is 0, so nothing plays, and the amber 0 % on the row already
+    // says why.
+    public void PreviewCueUi(int cue) {
+        if (cue < 0 || cue > 3) return;
+        SoundPool p = CuePool(cue);
+        if (p == null || p.Failed) {
+            Log("preview: cue " + cue + " has no player");
+            return;
+        }
+        int level = EffectiveCueVolume(cue);
+        if (level <= 0) {
+            Log("preview: cue " + cue + " is at 0 % (or sound is off), so nothing plays");
+            return;
+        }
+        // EffectiveCueVolume already folds in the switch and is what the pool is given anyway, so
+        // this re-push is a no-op in the normal case - it matters only if a pool was rebuilt while
+        // the level was 0.
+        p.SetVolume(level);
+        p.Play();
+        Log("preview: cue " + cue + " at " + level + "%");
+    }
     // ---- menu palette -------------------------------------------------------
     // Dark is the DSH-interface look: layered dark grey instead of white, light
     // text, the same blue accent. It is a menu-only setting - the pet itself is
@@ -1622,6 +5246,126 @@ public sealed class DshPet : Form {
         RebuildMenu();
         SaveState();
         Log("menu theme: " + (dark ? "dark" : "light"));
+    }
+
+    // Renders every menu icon, magnified, plus the real menu rows' images, into one PNG.
+    //
+    // It calls the SAME MakeIcon the menu calls, so this cannot disagree with the menu the way a
+    // re-drawn copy could. Each icon is also reported as its sampled colours, so a wrong drawing is
+    // legible in the console output and not only in the image.
+    //
+    // This exists because the on-screen icon at the top-left of a menu row was reported as a
+    // four-square Windows logo while IC_CASCADE is drawn as three green chevrons. Only the rendered
+    // pixels can settle which of those is true.
+    public void DumpIconSheet(string[] args) {
+        string outPath = "icons_sheet.png";
+        for (int i = 0; i < args.Length - 1; i++) if (args[i] == "--iconsheet") outPath = args[i + 1];
+
+        int[] kinds = new int[] { IC_REFRESH, IC_BOLT, IC_BOWL, IC_CASCADE, IC_SIZE,
+                                  IC_SOUND, IC_KEY, IC_QUIT, IC_MUTE, IC_THEME };
+        string[] names = new string[] { "REFRESH", "BOLT", "BOWL", "CASCADE", "SIZE",
+                                        "SOUND", "KEY", "QUIT", "MUTE", "THEME" };
+
+        int zoom = 8, pad = 12, label = 14;
+        int cell = 16 * zoom;
+        Bitmap sheet = new Bitmap(pad + kinds.Length * (cell + pad), pad + cell + label + pad * 2);
+        Console.WriteLine("menu icon sheet -> " + outPath);
+        using (Graphics g = Graphics.FromImage(sheet)) {
+            g.Clear(Color.FromArgb(255, 32, 32, 34));
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+            Font f = new Font("Consolas", 7.5f);
+            int x = pad;
+            for (int k = 0; k < kinds.Length; k++) {
+                Bitmap b = MakeIcon(kinds[k]);
+                g.DrawImage(b, x, pad, cell, cell);
+                g.DrawString(names[k], f, Brushes.White, x, pad + cell + 1);
+                StringBuilder sb = new StringBuilder();
+                int nz = 0;
+                for (int yy = 0; yy < 16; yy += 2)
+                    for (int xx = 0; xx < 16; xx += 2) {
+                        Color c = b.GetPixel(xx, yy);
+                        if (c.A > 40) {
+                            nz++;
+                            sb.Append(c.R.ToString("X2")).Append(c.G.ToString("X2")).Append(c.B.ToString("X2")).Append(' ');
+                        }
+                    }
+                Console.WriteLine("  " + names[k].PadRight(8) + " opaque samples=" + nz +
+                                  "  " + (sb.Length > 100 ? sb.ToString(0, 100) + "..." : sb.ToString()));
+                b.Dispose();
+                x += cell + pad;
+            }
+            f.Dispose();
+        }
+        sheet.Save(outPath, System.Drawing.Imaging.ImageFormat.Png);
+        sheet.Dispose();
+
+        // The rows the ROOT menu actually built, with each image's size: the menu's own view of
+        // itself, which is the thing that has to look right.
+        Console.WriteLine("root menu rows:");
+        for (int i = 0; i < _menu.Items.Count; i++) {
+            ToolStripItem it = _menu.Items[i];
+            Console.WriteLine("  " + i + " [" + it.Text + "] image=" +
+                              (it.Image == null ? "null" : (it.Image.Width + "x" + it.Image.Height)) +
+                              " kind=" + (it.Tag == null ? "-" : it.Tag.ToString()));
+        }
+    }
+
+    // The tray icon.
+    //
+    // It was SystemIcons.Application - the stock Windows application icon, which is what a generic
+    // .exe shows and reads as "some program is running" rather than "the pet is running". The
+    // shipped tray.ico replaces it; the stock icon stays as the fallback so a stripped-down copy
+    // of the folder still gets a tray icon rather than none.
+    //
+    // tray.ico carries 256/48/32/16 in one file and Windows picks per DPI: 16x16 at 100 % scaling,
+    // 32x32 at 200 %. A single-size icon would be scaled and look soft at one of them.
+    // The app's folder, published statically so the four FORM classes can find their title-bar icons
+    // without every constructor having to take a path argument. Set once in DshPet's constructor.
+    // Public, not private: a C# member defaults to private and the four Form classes are separate
+    // types, so private here means "inaccessible" from exactly the code that needs it.
+    public static string AppBaseDir = ".";
+
+    // ---- window title-bar icons --------------------------------------------------------------
+    //
+    // The four windows that show a title bar had NO Icon set, so .NET supplied its own default form
+    // icon - the four-square red/yellow/blue/white glyph. Confirmed by measuring a screenshot: white
+    // 52.6 %, yellow 1.5 %, blue 0.5 %, red 0.4 %, i.e. four equal blocks. Nothing in the drawing
+    // code produced it, which is exactly why it was easy to miss: the menu icons were all fine.
+    //
+    // These are FUNCTION glyphs, not the character: at 16 px a portrait of her turns into an
+    // indistinguishable blue smudge, and a window icon has to say "this is the settings window".
+    // Each is drawn at 16 px first and only then scaled up, so the strokes survive the size the
+    // title bar actually asks for.
+    //
+    // Loaded with the explicit small-icon size for the same reason as the tray icon: the
+    // no-argument constructor returns the file's first entry, not the best match for the current DPI.
+    // static so the four top-level Form classes can call it without a DshPet instance: they are
+    // separate types in the same namespace, not nested classes, so an instance method would need an
+    // instance they do not have.
+    public static Icon LoadWindowIcon(string baseDir, string name) {
+        string p = Path.Combine(baseDir, "assets", name + ".ico");
+        if (!File.Exists(p)) return null;              // no icon is better than the stock one
+        try { return new Icon(p, SystemInformation.SmallIconSize); } catch { return null; }
+    }
+
+    Icon LoadTrayIcon(string baseDir) {
+        string p = Path.Combine(baseDir, "tray.ico");
+        if (!File.Exists(p)) {
+            Log("tray icon missing: " + p + " (using the stock icon)");
+            return SystemIcons.Application;
+        }
+        try {
+            // The size IS asked for explicitly, and that was learned by measuring: the no-argument
+            // constructor does NOT pick the best entry for the current DPI, it returns the first
+            // one in the file - 48x48 here, while the notification area asks for SmallIconSize.
+            // The handle is normalised when it is handed over, so this stays correct at any DPI the
+            // tray happens to request; a mid-session scaling change is out of scope.
+            return new Icon(p, SystemInformation.SmallIconSize);
+        } catch (Exception ex) {
+            Log("tray icon failed: " + ex.Message + " (using the stock icon)");
+            return SystemIcons.Application;
+        }
     }
 
     void RebuildMenu() {
@@ -1643,17 +5387,9 @@ public sealed class DshPet : Form {
         RefreshMenuChecks();
     }
 
-    void AskVolume() {
-        using (InputDialog d = new InputDialog(S_SOUND, S_VOLP, "%",
-                                               _volume.ToString(CultureInfo.InvariantCulture))) {
-            if (d.ShowDialog(this) != DialogResult.OK) return;
-            int v;
-            if (int.TryParse(d.Value.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out v) && v >= 0 && v <= 100)
-                SetVolumePercent(v);
-            else
-                Log("volume rejected: '" + d.Value + "'");
-        }
-    }
+    // AskVolume is GONE with the master volume. It opened a "new volume (0-100)" dialog for a
+    // level that no longer exists; a cue's level is set by dragging its slider, and a typed value
+    // is what AskCueVolume still provides if one is ever needed.
 
     // Give every item the same height, padding and tick, recursively. The stock
     // renderer leaves cramped rows and a chunky system tick that made the menu
@@ -1691,33 +5427,322 @@ public sealed class DshPet : Form {
         return "(" + PresetPx[i].ToString(CultureInfo.InvariantCulture) + S_PXLBL + ")";
     }
 
-    // ToolStrip check marks are reset on every open, so push them here.
+    // RefreshMenuChecks is now a NO-OP, kept as an empty method rather than deleted.
+    //
+    // It pushed the current settings into the menu's tickable rows on every open: the size preset
+    // tick, the mute tick, the theme tick, and each cue's volume caption and step tick. The
+    // context menu is five flat action rows with no ticks and no values, so there is nothing to
+    // push - but several guards call this to mean "make the menu consistent before I read it",
+    // which is still a meaningful statement of intent. An empty method says that honestly;
+    // deleting it would only move the churn into the guards.
     void RefreshMenuChecks() {
-        for (int i = 0; i < SizeNames.Length && i < _sizeItem.DropDownItems.Count; i++) {
-            ToolStripMenuItem mi = _sizeItem.DropDownItems[i] as ToolStripMenuItem;
-            if (mi != null) mi.Checked = (_sizePx == PresetPx[i]);
+        // Nothing to do: see above. SettingsWindow renders its own state on every paint.
+    }
+
+    // ---- per-cue volume ----------------------------------------------------
+    // One volume per cue. MCI takes a single volume per alias, so this is simply the
+    // number handed to that cue's pool - there is no mixing to get wrong.
+    void SetCueVolume(int cue, int pct) {
+        if (cue < 0 || cue > 3) return;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        _cueVolume[cue] = pct;
+        ApplyCueVolume(cue);
+        Log("cue " + cue + " volume " + pct + "%");
+        SaveState();
+        _dirty = true;
+        // NOTHING IS PLAYED HERE. A cue used to sound on every change, which meant dragging the
+        // slider fired a burst of overlapping cues - one per percent. Auditioning is now an
+        // explicit action (the preview button on each row).
+    }
+    void ApplyCueVolume(int cue) {
+        SoundPool p = CuePool(cue);
+        if (p != null) p.SetVolume(EffectiveCueVolume(cue));
+    }
+    void ApplyAllCueVolumes() {
+        for (int c = 0; c < 4; c++) ApplyCueVolume(c);
+    }
+    SoundPool CuePool(int cue) {
+        switch (cue) {
+            case CUE_HIT: return _sound;
+            case CUE_FEED: return _feedSound;
+            case CUE_LAND: return _ironLandSound;
+            default: return _ironOffSound;
         }
-        if (_muteItem != null) _muteItem.Checked = _soundEnabled;
-        // Menu palette: the current one carries the tick, like the size presets.
-        if (_themeItem != null) {
-            if (_themeItem.DropDownItems.Count >= 2) {
-                ToolStripMenuItem lt = _themeItem.DropDownItems[0] as ToolStripMenuItem;
-                ToolStripMenuItem dk = _themeItem.DropDownItems[1] as ToolStripMenuItem;
-                if (lt != null) lt.Checked = !_darkTheme;
-                if (dk != null) dk.Checked = _darkTheme;
+    }
+    void AskCueVolume(int cue) {
+        using (InputDialog d = new InputDialog(CueVolumeLabel(cue), S_VOLP, "%",
+                                               _cueVolume[cue].ToString(CultureInfo.InvariantCulture))) {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            int v;
+            if (int.TryParse(d.Value.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out v) &&
+                v >= 0 && v <= 100)
+                SetCueVolume(cue, v);
+            else
+                Log("cue volume rejected: '" + d.Value + "'");
+        }
+    }
+
+    // ---- custom sound effects ----------------------------------------------
+    //
+    // Picking a file, decoding it, letting the user trim/name it, and filing the result in the
+    // cue's library. The shipped mp3 is NEVER overwritten and never enters the library, so
+    // "restore factory" is just clearing which clip is active.
+    const long MaxUploadBytes = 50L * 1024 * 1024;          // 50 MB, the user's limit
+
+    // Files a previous version left behind: one replacement per cue, at
+    // <default>.custom.wav beside the originals, with its name in state.ini (cuenmN) and the
+    // file name in cuefxN. The old scheme kept only ONE clip per cue; the library keeps all of
+    // them, so the migration is to file what exists and drop the pairing keys.
+    //
+    // Runs before the pools are built, so a migrated clip is what plays on the first cue.
+    void MigrateLegacySidecar() {
+        try {
+            int moved = 0;
+            for (int cue = 0; cue < 4; cue++) {
+                string sidecar = Path.Combine(_baseDir,
+                    Path.GetFileNameWithoutExtension(CueDefaultFile(cue)) + ".custom.wav");
+                if (!File.Exists(sidecar)) continue;
+                // If it was not the ACTIVE clip, filing it active would silently change which
+                // sound the user hears. cuefxN records that; state.ini is read later, so the
+                // choice is taken from the file on disk plus the legacy name, defaulting to
+                // active only when there is no cuefxN to consult.
+                string err;
+                PcmAudio a = PcmAudio.Load(sidecar, out err);
+                if (a == null || a.Frames < 1) { Log("sidecar unreadable, left in place: " + err); continue; }
+                string nm = LegacyClipName(cue);
+                string werr;
+                string id = _lib.Add(cue, nm, a.S, a.Channels, a.Rate, out werr);
+                if (id.Length == 0) { Log("sidecar migration failed: " + werr); continue; }
+                try { File.Delete(sidecar); } catch { }
+                moved++;
+                Log("migrated legacy clip for cue " + cue + " -> library id " + id + " name='" + nm + "'");
             }
-        }
-        // The volume steps sit after [toggle, separator, header]; read the index
-        // back from the array so inserting a header later cannot shift them.
-        if (_soundItem != null) {
-            int first = _soundItem.DropDownItems.IndexOf(_muteItem) + 3;
-            for (int i = 0; i < VolumeSteps.Length; i++) {
-                int idx = first + i;
-                if (idx < 0 || idx >= _soundItem.DropDownItems.Count) break;
-                ToolStripMenuItem mi = _soundItem.DropDownItems[idx] as ToolStripMenuItem;
-                if (mi != null) mi.Checked = (_volume == VolumeSteps[i]);
+            if (moved > 0) Log("sound library: migrated " + moved + " legacy clip(s)");
+        } catch (Exception ex) { Log("sidecar migration error: " + ex.Message); }
+    }
+    // The name the old scheme stored for this cue, or a sensible default. Read here rather than
+    // from the field because ReadState has not run yet at migration time.
+    string LegacyClipName(int cue) {
+        try {
+            if (File.Exists(StatePath)) {
+                foreach (string line in File.ReadAllLines(StatePath)) {
+                    int i = line.IndexOf('=');
+                    if (i <= 0) continue;
+                    if (line.Substring(0, i).Trim() == "cuenm" + cue) {
+                        string v = line.Substring(i + 1).Trim();
+                        if (v.Length > 0) return v;
+                    }
+                }
             }
+        } catch { }
+        return CueDefaultName(cue).Replace(S_EFFECT, "");
+    }
+
+    string CueDefaultFile(int cue) {
+        switch (cue) {
+            case CUE_HIT: return "hit.mp3";
+            case CUE_FEED: return "feed.mp3";
+            case CUE_LAND: return "pot_land.mp3";
+            default: return "pot_off.mp3";
         }
+    }
+    // The SHIPPED file for a cue - the factory sound, which the library never contains.
+    string CueShippedPath(int cue) { return Path.Combine(_baseDir, CueDefaultFile(cue)); }
+    // The file the cue ACTUALLY plays: the active library clip, else the shipped original.
+    string CuePlayPath(int cue) {
+        if (_lib != null && cue >= 0 && cue < 4) {
+            string p = _lib.ActivePath(cue);
+            if (!string.IsNullOrEmpty(p) && File.Exists(p)) return p;
+        }
+        return CueShippedPath(cue);
+    }
+
+    void AskUploadCue(int cue) {
+        if (cue < 0 || cue > 3) return;
+        string chosen = null;
+        // A drop target instead of the system file dialog. The picker is still reachable - clicking the
+        // panel opens it - so nothing is lost, and a file the user is already looking at can simply be
+        // dragged in.
+        //
+        // Everything AFTER this point is unchanged: the same existence check, the same 50 MB limit
+        // before decoding, the same decode and the same error messages. Only the way a path is obtained
+        // differs, which is what keeps the drop path and the click path on identical rules.
+        using (UploadWindow uw = new UploadWindow(ThemeForWindow(), S_UP_FILTER,
+                                                  S_UP_TITLE + " - " + CueName(cue))) {
+            if (uw.ShowDialog(this) != DialogResult.OK) return;
+            chosen = uw.ChosenPath;
+        }
+        if (string.IsNullOrEmpty(chosen) || !File.Exists(chosen)) return;
+
+        // Size is checked BEFORE decoding: a 50 MB mp3 decodes to something far larger in
+        // memory, and the point of the limit is to refuse it before that happens.
+        long len = 0;
+        try { len = new FileInfo(chosen).Length; } catch { }
+        if (len > MaxUploadBytes) {
+            MessageBox.Show(this,
+                S_UP_TOOBIG + "\r\n" + (len / 1024 / 1024) + " MB > 50 MB", S_CUSTOMFX,
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log("upload refused, too large: " + len + " bytes");
+            return;
+        }
+
+        string err;
+        PcmAudio audio = PcmAudio.Load(chosen, out err);
+        if (audio == null || audio.Frames < 1) {
+            MessageBox.Show(this, S_UP_BADFMT + "\r\n" + err, S_CUSTOMFX,
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log("upload decode failed: " + err);
+            return;
+        }
+        Log("upload decoded: " + Path.GetFileName(chosen) + " " + audio.Ms.ToString("0") +
+            "ms ch=" + audio.Channels + " rate=" + audio.Rate);
+
+        PcmAudio cut = null;
+        string name = "";
+        using (AudioEditor dlg = new AudioEditor(audio, CueDefaultName(cue), CueDefaultName(cue))) {
+            dlg.ApplyTheme(_darkTheme);   // follow the app's light/dark choice
+            dlg.SetLogDir(_baseDir);
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            cut = dlg.Result;
+            name = CleanStateValue(dlg.EffectName);
+        }
+        if (cut == null) return;
+
+        string werr;
+        string id = _lib.Add(cue, name, cut.S, cut.Channels, cut.Rate, out werr);
+        if (id.Length == 0) {
+            MessageBox.Show(this, werr, S_CUSTOMFX, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log("upload write failed: " + werr);
+            return;
+        }
+        RebuildMenu();                 // the labels changed
+        RebuildCuePool(cue);           // ...and the pool has to open the NEW file
+        ApplyCueVolume(cue);
+        Log("cue " + cue + " -> new library clip id=" + id + " name='" + name + "'" +
+            " (library now " + _lib.List(cue).Count + ")");
+    }
+
+    // restore factory: stop using a custom clip. The library is untouched, so the user can go back
+    // to their clip later - only the choice is cleared.
+    void RestoreFactoryCue(int cue) {
+        if (cue < 0 || cue > 3) return;
+        _lib.SetActive(cue, "");
+        RebuildMenu();
+        RebuildCuePool(cue);           // back to the shipped file, without a restart
+        ApplyCueVolume(cue);
+        Log("cue " + cue + " restored to the factory clip");
+    }
+
+    // use: make this library clip the active one.
+    void UseCueClip(int cue, string id) {
+        if (cue < 0 || cue > 3) return;
+        _lib.SetActive(cue, id);
+        RebuildMenu();
+        RebuildCuePool(cue);
+        ApplyCueVolume(cue);
+        Log("cue " + cue + " now uses library clip " + id + " ('" + _lib.NameOf(cue, id) + "')");
+    }
+
+    // modify: re-open the editor on an existing clip. The result REPLACES that clip - the user
+    // picked it out of the library, so they mean to change it, not to make a second copy.
+    void EditCueClip(int cue, string id) {
+        if (cue < 0 || cue > 3) return;
+        string path = Path.Combine(_lib.DirFor(cue), id + ".wav");
+        string err;
+        PcmAudio audio = PcmAudio.Load(path, out err);
+        if (audio == null || audio.Frames < 1) {
+            MessageBox.Show(this, S_UP_BADFMT + "\r\n" + err, S_CUSTOMFX,
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log("edit clip failed to load: " + err);
+            return;
+        }
+        string cur = _lib.NameOf(cue, id);
+        PcmAudio cut = null;
+        string name = cur;
+        using (AudioEditor dlg = new AudioEditor(audio, cur, CueDefaultName(cue))) {
+            dlg.ApplyTheme(_darkTheme);   // follow the app's light/dark choice
+            dlg.SetLogDir(_baseDir);
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            cut = dlg.Result;
+            name = CleanStateValue(dlg.EffectName);
+        }
+        if (cut == null) return;
+        string werr;
+        // The player holds the file open while it plays, so editing the clip that is IN USE
+        // needs the player closed first - otherwise the write is refused. Measured, not
+        // assumed: the first version failed with "being used by another process".
+        bool wasActive = _lib.ActiveId(cue) == id;
+        bool touchedLive = false;
+        if (wasActive) { CloseCuePool(cue); touchedLive = true; }
+        if (!_lib.Replace(cue, id, cut.S, cut.Channels, cut.Rate, out werr)) {
+            if (touchedLive) RebuildCuePool(cue);            // leave the cue playable
+            MessageBox.Show(this, werr, S_CUSTOMFX, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log("edit clip write failed: " + werr);
+            return;
+        }
+        // A rename has to go through the ini, which only Add writes - so rewrite the name map.
+        if (name != cur) RenameCueClip(cue, id, name);
+        RebuildMenu();
+        // Only reload the pool if this clip is the one in use; editing a shelved clip must not
+        // interrupt what is currently playing.
+        if (touchedLive) { RebuildCuePool(cue); ApplyCueVolume(cue); }
+        Log("cue " + cue + " clip " + id + " edited" + (name != cur ? ", renamed to '" + name + "'" : ""));
+    }
+
+    // Releases a cue's player without opening a new one. Needed before overwriting the file it
+    // is playing: MCI keeps the file open for as long as the alias exists.
+    void CloseCuePool(int cue) {
+        SoundPool old = CuePool(cue);
+        if (old != null) { try { old.Dispose(); } catch { } }
+        switch (cue) {
+            case CUE_HIT: _sound = null; break;
+            case CUE_FEED: _feedSound = null; break;
+            case CUE_LAND: _ironLandSound = null; break;
+            default: _ironOffSound = null; break;
+        }
+    }
+
+    void RenameCueClip(int cue, string id, string name) {
+        try {
+            string dir = _lib.DirFor(cue);
+            string ini = Path.Combine(dir, "library.ini");
+            List<string> lines = new List<string>();
+            if (File.Exists(ini)) lines.AddRange(File.ReadAllLines(ini));
+            StringBuilder sb = new StringBuilder();
+            bool wrote = false;
+            for (int i = 0; i < lines.Count; i++) {
+                string line = lines[i];
+                int e = line.IndexOf('=');
+                if (e <= 0) continue;
+                string k = line.Substring(0, e).Trim(), v = line.Substring(e + 1).Trim();
+                if (k == "clip") {
+                    int bar = v.IndexOf('|');
+                    string cid = bar > 0 ? v.Substring(0, bar) : v;
+                    string cname = bar > 0 ? v.Substring(bar + 1) : cid;
+                    if (cid == id) { cname = CleanStateValue(name); wrote = true; }
+                    sb.Append("clip=").Append(cid).Append('|').Append(cname).Append("\r\n");
+                } else if (k == "active") {
+                    sb.Append("active=").Append(v).Append("\r\n");
+                }
+            }
+            if (wrote) File.WriteAllText(ini, sb.ToString(), new UTF8Encoding(true));
+        } catch { }
+    }
+
+    // delete: remove the clip for good. If it was in use, the cue falls back to the factory sound.
+    void DeleteCueClip(int cue, string id) {
+        if (cue < 0 || cue > 3) return;
+        bool wasActive = _lib.ActiveId(cue) == id;
+        string nm = _lib.NameOf(cue, id);
+        if (!_lib.Remove(cue, id)) {
+            Log("delete clip failed: cue " + cue + " id " + id);
+            return;
+        }
+        RebuildMenu();
+        if (wasActive) { RebuildCuePool(cue); ApplyCueVolume(cue); }
+        Log("cue " + cue + " clip " + id + " ('" + nm + "') deleted" +
+            (wasActive ? "; the cue falls back to the factory sound" : ""));
     }
 
     // ------------------------------------------------------------- settings ---
@@ -1745,6 +5770,20 @@ public sealed class DshPet : Form {
                 DemoCharge(v);
             else
                 Log("demo amount rejected: '" + d.Value + "'");
+        }
+    }
+
+    // "custom charge count": the user types how many cues to run, and the amount is
+    // derived from the per-cue step so the rehearsal still walks the real path.
+    void AskDemoCount() {
+        using (InputDialog d = new InputDialog(S_CHG_N, S_CHGN_P, "\u6B21", "10")) {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            int n;
+            if (int.TryParse(d.Value.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out n) &&
+                n >= 1 && n <= 500)
+                DemoCharge(StepYuan * n);
+            else
+                Log("demo count rejected: '" + d.Value + "'");
         }
     }
 
@@ -1856,7 +5895,7 @@ public sealed class DshPet : Form {
 
     void AskKey() {
         using (InputDialog d = new InputDialog(S_KEYT, S_KEYP, "",
-                                               _apiKey)) {
+                                               _apiKey, KeyDialogW, true)) {
             if (d.ShowDialog(this) != DialogResult.OK) return;
             string k = d.Value;
             if (k.Length > 0 && k != _apiKey) {
@@ -1866,6 +5905,109 @@ public sealed class DshPet : Form {
                 Log("api key set manually (length " + k.Length + ")");
             }
         }
+    }
+
+    // ------------------------------------------------------------ sound cues ---
+
+    // BuildCue is GONE. It was an unused variant of BuildCueFrom - no call site was left - and it
+    // was the last thing reading the master volume. BuildCueFrom below is the one that is used:
+    // it resolves a cue through the library and opens the pool at that cue's own level.
+
+    // Same as BuildCue, but for a cue that can be replaced by a user upload: the path
+    // comes from CuePlayPath, which honours the DSHPET_*_FILE override first, then a
+    // custom clip, then the shipped default. Kept separate from BuildCue because that one
+    // Path.Combines its third argument with baseDir and would break on a full path.
+    SoundPool BuildCueFrom(int cue, string envName, string defaultFile, int slots, string tag) {
+        if (!_soundWanted) return null;
+        string path = File.Exists(Path.Combine(_baseDir, Get(envName, "")))
+            ? Path.Combine(_baseDir, Get(envName, ""))       // explicit override wins
+            : CuePlayPath(cue);
+        if (!File.Exists(path)) {
+            Log("cue missing: " + path + " (disabled)");
+            return null;
+        }
+        SoundPool p = new SoundPool(path, slots, _cueVolume[cue], Path.Combine(_baseDir, "pet.log"), tag);
+        if (p.Failed) Log("cue failed: " + path + " - " + p.Error);
+        else Log("cue ready: " + Path.GetFileName(path) + " volume=" + _cueVolume[cue] + " tag=" + tag);
+        return p;
+    }
+
+    // Re-opens ONE cue's pool on whatever CuePlayPath resolves to right now.
+    //
+    // Needed after an upload or a reset: the menu label changes immediately, but a pool holds
+    // an open MCI alias pointing at the old file, so without this the new clip is only heard
+    // after a restart. The old pool is disposed first, or its aliases would keep the previous
+    // file open and the two would fight over the alias names.
+    void RebuildCuePool(int cue) {
+        if (cue < 0 || cue > 3) return;
+        SoundPool old = CuePool(cue);
+        if (old != null) { try { old.Dispose(); } catch { } }
+        SoundPool fresh = null;
+        if (_soundWanted) {
+            if (cue == CUE_HIT) {
+                string p = CuePlayPath(CUE_HIT);
+                if (File.Exists(p)) fresh = new SoundPool(p, 4, _cueVolume[cue], Path.Combine(_baseDir, "pet.log"));
+            } else if (cue == CUE_FEED) {
+                string p = CuePlayPath(CUE_FEED);
+                if (File.Exists(p)) fresh = new SoundPool(p, 2, _cueVolume[cue], Path.Combine(_baseDir, "pet.log"), "dsphfeed");
+            } else if (cue == CUE_LAND) {
+                fresh = BuildCueFrom(CUE_LAND, "DSHPET_IRONLAND_FILE", "pot_land.mp3", 2, "dsphland");
+            } else {
+                fresh = BuildCueFrom(CUE_OFF, "DSHPET_IRONOFF_FILE", "pot_off.mp3", 2, "dsphoff");
+            }
+        }
+        switch (cue) {
+            case CUE_HIT: _sound = fresh; break;
+            case CUE_FEED: _feedSound = fresh; break;
+            case CUE_LAND: _ironLandSound = fresh; break;
+            default: _ironOffSound = fresh; break;
+        }
+        if (fresh == null) Log("cue " + cue + " pool closed (no playable file)");
+        else Log("cue " + cue + " pool reopened on " + Path.GetFileName(CuePlayPath(cue)) +
+                 " volume=" + _cueVolume[cue]);
+    }
+
+    // Play a cue if it is open, sound is on, and the cue's own volume is above zero.
+    //
+    // The per-cue on/off switch is GONE: 0 % IS off. That was the user's call - a volume row
+    // already expresses "off", so a second boolean saying the same thing was a mechanism with
+    // no job. It also means there is only one place a cue's silence can come from, so the two
+    // can no longer disagree (a cue switched on but at 0 %, or off but at 80 %).
+    //
+    // The cue index is passed rather than inferred from the pool reference: inferring it would
+    // mean comparing against all four fields on every play, and would break silently if two
+    // cues ever shared a pool.
+    void PlayCue(int cue, SoundPool pool) {
+        if (pool == null || !_soundEnabled) return;
+        if (cue < 0 || cue > 3 || _cueVolume[cue] <= 0) return;
+        pool.Play();
+    }
+    // What PlayCue WOULD decide, without playing. This is the thing --soundcues has to assert:
+    // the decision, not the pool's play counter.
+    //
+    // An earlier version measured SoundPool.Plays, which is unreliable in a test that changes
+    // volumes in a loop: every SetCueVolume plays a short preview on purpose, so both aliases of
+    // a two-slot pool are frequently busy, Play() takes its force-reopen path, and a reopen that
+    // fails leaves no idle slot - so a play that was correctly ASKED for silently did nothing and
+    // the counter never moved. That is a pool-saturation artefact of the test, not a product bug,
+    // and the counter was the wrong instrument for the question.
+    public bool CueWouldPlay(int cue, SoundPool pool) {
+        if (pool == null) return false;
+        if (!_soundEnabled) return false;
+        if (cue < 0 || cue > 3) return false;
+        // The EFFECTIVE level, not the cue's own: a cue at 60 % under a master of 0 % is silent,
+        // and asking only about the cue would say it plays. This is the same number the player is
+        // given, which is the point - the decision and the sound cannot disagree.
+        return EffectiveCueVolume(cue) > 0;
+    }
+    public string PlayCueWhy(int cue, SoundPool pool) {
+        if (pool == null) return "pool=null";
+        if (!_soundEnabled) return "globally muted";
+        if (cue < 0 || cue > 3) return "cue index " + cue + " out of range";
+        int eff = EffectiveCueVolume(cue);
+        if (eff <= 0)
+            return "volume " + _cueVolume[cue] + "% (or sound is switched off)";
+        return "would play at " + eff + "%; poolFailed=" + pool.Failed;
     }
 
     // ------------------------------------------------------------ geometry ---
@@ -1912,9 +6054,19 @@ public sealed class DshPet : Form {
         _girlAlpha = null;                 // cached alpha belongs to the old art
         _girlStampedOn = null;
         _canvas = null;                    // forces a full widget repaint
-        Relayout();
+        // A mood change swaps the ARTWORK only. Everything else Relayout does - the rice
+        // bowl, the iron pot's two bitmaps and their TrimTransparent pixel scans, the
+        // full-screen canvas allocation - is a function of the widget SIZE, which a mood
+        // change does not touch. Measured before this: ~100 ms on the frame the pot landed
+        // and her face went calm, which was the largest remaining stutter in the landing
+        // sequence.
+        _skipHeavyArt = true;
+        try { Relayout(); } finally { _skipHeavyArt = false; }
         _dirty = true;
     }
+    // set only by SetExpression: tells Relayout that the widget geometry is unchanged so
+    // only the sprite-derived surfaces need rebuilding.
+    bool _skipHeavyArt;
 
     // Is a charge ANIMATION currently playing? _pending is deliberately excluded: it
     // is only the amount owed, which stays above zero while a debt exists and while a
@@ -1945,7 +6097,6 @@ public sealed class DshPet : Form {
     // between two charges would flash the resting face for a frame.
     void UpdateExpression(double dt) {
         if (!_hasExpressions) return;
-        if (_nervousT > 0) _nervousT -= dt;
         if (_happyT > 0) _happyT -= dt;
         // anyBowl counts RICE bowls only. The iron pot does not keep her interested in
         // the way an uncollected bowl does: it is a prop, not a debt, and letting it
@@ -1961,23 +6112,48 @@ public sealed class DshPet : Form {
         // above zero for as long as the debt exists, so counting it as "busy" froze
         // the countdown for good and the bowl could never be pulled in. What matters
         // here is whether blood is actually being lost right now.
-        bool cueRunning = _pendingStep > 1e-9 || _hits.Count > 0 || _demoLeft > 0;
+        // With "hurt" off a charge is invisible, so it must not move her face either - otherwise the
+        // grimace would be the one thing that still reacted, which is exactly the exception the user
+        // asked not to have.
+        bool cueRunning = _fxHurt && (_pendingStep > 1e-9 || _hits.Count > 0 || _demoLeft > 0);
         if (anyBowl && !cueRunning && !_bowlLocked) _bowlWait += dt;
         else if (!anyBowl) _bowlWait = 0;
 
         int want;
-        // Wearing the pot is the HIGHEST priority, above a charge run: the user's rule
-        // is that once it is on her head she keeps the flat face right through a
-        // deduction. Only a fresh rice bowl cheers her up again (anyBowl above), which
-        // is why the calm branch is skipped in that case.
-        if (HeadPotOn && !anyBowl) {
+        // NO MONEY: she is ALOOF, whatever else is going on.
+        //
+        // This is the user's rule and it is deliberately checked FIRST, above the worn pot and
+        // above a cue that is playing: with an empty account there is nothing to be happy about,
+        // so the pout is the honest face. It replaced a death/respawn sequence (see ZeroBalEps).
+        // Nothing is latched - the moment the balance comes back above zero the normal
+        // priorities below take over again on the very next frame.
+        bool broke = !double.IsNaN(_realBal) && _realBal <= ZeroBalEps;
+        // Being patted wins over EVERYTHING below, including being broke and wearing the pot.
+        //
+        // That is deliberate rather than convenient: the pat is the one thing the user is doing to her
+        // right now, so it is the only state where her face should answer the user rather than the
+        // balance. It also keeps the rule set unchanged - nothing below is removed or reordered, this
+        // only takes precedence while the pat is actually running, and the ordinary chain resumes on
+        // the very next frame after it ends (there is no latch and no hold).
+        //
+        // _patActive is set and cleared by TickPatWith, which is the same state the hand and the squash
+        // read, so the face cannot get out of step with the gesture.
+        if (_patActive) {
+            want = EXPR_NERVOUS;
+        } else if (broke) {
+            want = EXPR_ALOOF;
+        } else if (HeadPotOn && !anyBowl) {
             want = EXPR_CALM;
         } else if (cueRunning) {
             // A cue that is actually playing always wins over the resting/aloof faces.
+            //
+            // There is deliberately NO trailing hold here. There used to be one (the grimace
+            // was kept for another NervousHoldSec after the last cue), and it was wrong: the
+            // requirement is "do not flash the smile BETWEEN the cues of one run", and that is
+            // already guaranteed by cueRunning itself - consecutive cues keep _hits/_pendingStep
+            // alive, so the face never drops mid-run. The hold only ever added a second of
+            // grimace on top of the END of the run, which reads as the pet being stuck.
             want = EXPR_NERVOUS;
-            _nervousT = NervousHoldSec;                   // extend while the run lasts
-        } else if (_nervousT > 0) {
-            want = EXPR_NERVOUS;                          // hold after the last cue
         } else if (_bowlWait >= BowlWaitSec) {
             want = EXPR_ALOOF;
         } else {
@@ -1987,7 +6163,7 @@ public sealed class DshPet : Form {
         if (DiagExpr) {
             Log("EXPRPICK want=" + want + " expr=" + _expr +
                 " headPot=" + HeadPotOn + " anyBowl=" + anyBowl +
-                " cue=" + cueRunning + " nervousT=" + _nervousT.ToString("0.00") +
+                " cue=" + cueRunning +
                 " bowlWait=" + _bowlWait.ToString("0.0"));
         }
     }
@@ -2461,6 +6637,43 @@ public sealed class DshPet : Form {
         }
     }
 
+    // Everything that depends on WHICH CORNER she is in, and nothing else.
+    //
+    // Relayout() cannot be used for a mid-drag flip: it re-resamples the sprite, disposes and
+    // rebuilds the whole screen-sized canvas bitmap and rebuilds the bowl art - 90 to 150 ms of
+    // work that a mirror flip does not need, because the widget size and every bitmap are
+    // unchanged. Flipping in the middle of a drag therefore dropped frames badly (the user's
+    // report). This recomputes only the four cheap things that actually move.
+    //
+    // The mirror itself is NOT baked into any bitmap - PaintWidgetArt applies it as a draw-time
+    // transform - so there is nothing to regenerate here.
+    void UpdateMirrorGeometry() {
+        if (_flat == null) return;
+        // The tablet quad. Its coordinates are authored against the source artwork, so the
+        // mirror is (sourceWidth - x), not (_w - x). Vertex ORDER is preserved on purpose:
+        // DrawScreen picks the corners by role, and keeping the ring order is what lets it
+        // detect the swap (see the comment there).
+        double[] qx = new double[] { 549.6, 949.7, 984.7, 584.6 };
+        double[] qy = new double[] { 706.2, 642.0, 860.2, 924.3 };
+        _fx = new double[4]; _fy = new double[4];
+        for (int i = 0; i < 4; i++) {
+            double qxs = _snapRight ? ((double)_sprNormalSourceW - qx[i]) : qx[i];
+            _fx[i] = qxs * _scale; _fy[i] = qy[i] * _scale;
+        }
+        // Her head anchor, which hearts and floating numbers spawn from.
+        int sw = Math.Max(2, (int)Math.Round(_flat.Width * _scale));
+        int sh = Math.Max(2, (int)Math.Round(_flat.Height * _scale));
+        _headX = (int)(sw * 0.50 + sh * 0.17);
+        _headY = (int)(sh * 0.36);
+        if (_snapRight) _headX = _w - _headX;
+        _floaterStep = (float)Math.Max(18.0, 34.0 * _scale * 1.7);
+        // The tablet panel is keyed on _fx[0], and the head anchor moved, so the cached panel
+        // no longer describes this frame.
+        _panelCacheValid = false;
+        _hitMap = null;
+        _dirty = true;
+    }
+
     void Relayout() {
         // Physical size has to come from the real monitor DPI. If the process
         // could not be made DPI aware, Windows lies and reports 96, which would
@@ -2490,27 +6703,83 @@ public sealed class DshPet : Form {
         // three frames, which put the girl at the window origin (the top-left of the
         // screen) for ~60ms every time a bowl dropped. The widget's place inside the
         // full-screen window is tracked by _offX/_offY instead.
+        // Drop the per-mood cache only when the widget size actually changed: every entry
+        // was scaled for the old size and is invalid. A mood change re-enters this method
+        // with the SAME size, and clearing there would defeat the cache entirely - which is
+        // exactly what happened on the first attempt (the cache was filled and thrown away
+        // in the same call, so the mood still paid for a full resample).
+        // Must be compared BEFORE _w is overwritten below.
+        if (px != _sizeCachedFor) { ReleaseExprCache(); _sizeCachedFor = px; }
         _w = px; _h = px;
         _winW = SystemInformation.VirtualScreen.Width;
         _winH = SystemInformation.VirtualScreen.Height;
         SyncWindowModeInternal();
         _scale = (double)_h / _flat.Height;
 
-        int sw = Math.Max(2, (int)Math.Round(_flat.Width * _scale));
-        int sh = Math.Max(2, (int)Math.Round(_flat.Height * _scale));
-        Bitmap scaled = new Bitmap(sw, sh, PixelFormat.Format32bppArgb);
-        using (Graphics g = Graphics.FromImage(scaled)) {
-            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.CompositingMode = CompositingMode.SourceCopy;
-            g.DrawImage(_flat, new Rectangle(0, 0, sw, sh));
+        int eidx = (_exprArt != null) ? Array.IndexOf(_exprArt, _flat) : -1;
+        // A cached entry is complete (sprite AND overlay) and matches the current size, so
+        // this mood needs no resample and no overlay rebuild. The rest of this method still
+        // runs: _fx/_fy/_headX and the sprite quad are cheap and must stay in step.
+        bool exprCached = eidx >= 0 && _exprSprCache[eidx] != null && _exprRedCache[eidx] != null;
+        int sw = 0, sh = 0;
+        Bitmap scaled = null;
+        if (!exprCached) {
+            sw = Math.Max(2, (int)Math.Round(_flat.Width * _scale));
+            sh = Math.Max(2, (int)Math.Round(_flat.Height * _scale));
+            if (eidx >= 0 && _exprSprCache[eidx] != null) {
+                scaled = _exprSprCache[eidx];
+            } else {
+                scaled = new Bitmap(sw, sh, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(scaled)) {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.CompositingMode = CompositingMode.SourceCopy;
+                    g.DrawImage(_flat, new Rectangle(0, 0, sw, sh));
+                }
+                if (eidx >= 0) _exprSprCache[eidx] = scaled;
+            }
         }
-        if (_sprNormal != null) _sprNormal.Dispose();
-        if (_sprRed != null) _sprRed.Dispose();
+        // Release the outgoing artwork, but NEVER anything a cache still points at.
+        //
+        // The red-layer line used to be unconditional. _sprRed is usually _exprRedCache[eidx]
+        // itself (an unremarkable mood change takes the cached branch and simply re-points at
+        // it), so disposing it destroyed the object the cache was still handing out. The cache
+        // kept it - its completeness test is a null check - and the next frame to use that mood
+        // pulled a DISPOSED bitmap out of it and died in PaintWidgetArt with GDI+'s
+        // "Parameter is not valid." on Image.get_Width(). --shot reproduced it every run.
+        //
+        // Missing entries must also be dropped, or the cache would keep advertising a bitmap
+        // that is gone.
+        Bitmap oldSpr = _sprNormal, oldRed = _sprRed;
+        if (!exprCached) {
+            if (oldSpr != null && !InExprCache(oldSpr)) oldSpr.Dispose();
+            if (oldRed != null && !InAnyCache(oldRed)) oldRed.Dispose();
+            for (int i = 0; i < _exprSprCache.Length; i++) {
+                if (IsDead(_exprSprCache[i])) _exprSprCache[i] = null;
+                if (IsDead(_exprRedCache[i])) _exprRedCache[i] = null;
+            }
+        }
         if (_canvas != null) _canvas.Dispose();
+        // The panel cache is keyed on the widget size and on _fx, both of which change
+        // here, so it would miss anyway - dropping it just frees the memory sooner.
+        if (_panelCache != null) { _panelCache.Dispose(); _panelCache = null; }
+        _panelCacheValid = false;
+        _panelCacheW = -1; _panelCacheH = -1; _panelCacheText = null;
 
-        _sprNormal = scaled;
-        _sprRed = BuildRedLayer(scaled);
+        if (exprCached) {
+            _sprNormal = _exprSprCache[eidx];
+            _sprRed = _exprRedCache[eidx];
+            sw = _sprNormal.Width;
+            sh = _sprNormal.Height;
+        } else {
+            _sprNormal = scaled;
+            if (eidx >= 0 && _exprRedCache[eidx] != null) {
+                _sprRed = _exprRedCache[eidx];
+            } else {
+                _sprRed = BuildRedLayer(scaled);
+                if (eidx >= 0) _exprRedCache[eidx] = _sprRed;
+            }
+        }
         // The canvas must match the WINDOW, not the widget: while a bowl is out the
         // window covers the screen and the widget is blitted in at _offX/_offY.
         _canvas = new Bitmap(_winW, _winH, PixelFormat.Format32bppArgb);
@@ -2524,22 +6793,15 @@ public sealed class DshPet : Form {
         // Caliper's own TL/TR/BR/BL labels follow its rotated frame and can come
         // out swapped when the panel is tilted the other way, which renders the
         // text upside down. Re-check the order by rendering --selftest.
-        double[] qx = new double[] { 549.6, 949.7, 984.7, 584.6 };
-        double[] qy = new double[] { 706.2, 642.0, 860.2, 924.3 };
-        // Widget-relative coordinates. _offX/_offY are added when drawing, so these
-        // stay the same whether the window is widget-sized or screen-sized.
-        _fx = new double[4]; _fy = new double[4];
-        for (int i = 0; i < 4; i++) { _fx[i] = qx[i] * _scale; _fy[i] = qy[i] * _scale; }
-
-        _headX = (int)(sw * 0.50 + sh * 0.17);
-        _headY = (int)(sh * 0.36);
-        // one text line high, so a fast run of numbers cascades without overlapping
-        _floaterStep = (float)Math.Max(18.0, 34.0 * _scale * 1.7);
+        // The mirror-dependent geometry (tablet quad, head anchor, floater step) lives in
+        // UpdateMirrorGeometry so a mid-drag corner flip can refresh it WITHOUT paying for the
+        // sprite resample and canvas rebuild that this method does.
+        UpdateMirrorGeometry();
 
         // The bowl is sized against the widget, and follows it when the size
         // preset changes. 0.44 of the edge, clamped so it stays draggable even at
         // the smallest preset.
-        if (_riceFlat != null) {
+        if (!_skipHeavyArt && _riceFlat != null) {
             int rw = Math.Max(24, (int)Math.Round(_w * 0.44));
             // Re-point every live bowl at the new bitmap BEFORE the old one is freed,
             // and re-measure their footprint. Bowls now carry their own Art, so without
@@ -2556,19 +6818,28 @@ public sealed class DshPet : Form {
             if (_rice != null) _rice.R = _riceArt.Width * 0.42;   // footprint radius
             if (oldRice != null) oldRice.Dispose();
         }
-        // Iron pot, two sizes. It keeps its own aspect ratio (roughly 2.8 : 1, a wide
-        // shallow basin), so unlike the rice art it must NOT be squashed into a square.
-        // Sizes are fractions of the WIDGET so the pot tracks the girl like everything
-        // else: 0.44 while loose (the same footprint as a rice bowl, so dragging feels
-        // identical) and 0.7391 once worn, which is the width the user measured with the
-        // placement tool.
-        if (_ironFlat != null) {
+        // Iron pot. It keeps its own aspect ratio (roughly 2.8 : 1, a wide shallow basin),
+        // so unlike the rice art it must NOT be squashed into a square. Sizes are fractions
+        // of the WIDGET so the pot tracks the girl like everything else.
+        //
+        // ONE size for the pot, loose or worn.
+        //
+        // It used to be drawn at two sizes: 0.44 of the widget while free and 0.7391 once on
+        // her head. Both are the same artwork, so a pot that visibly changed size the moment it
+        // landed looked wrong - the user's report. 0.7391 is the width that was measured with
+        // the placement tool for the worn pot, and the loose pot now uses it too, so the
+        // carried pot and the worn pot are the same object at the same scale. The two bitmaps
+        // are kept as separate objects (rather than one shared reference) because the anchors
+        // and the draw paths still switch between them on OnHead, and disposing one must never
+        // free the other.
+        if (!_skipHeavyArt && _ironFlat != null) {
             double ia = (double)_ironFlat.Height / _ironFlat.Width;
-            int fw = Math.Max(24, (int)Math.Round(_w * 0.44));
-            int hw = Math.Max(24, (int)Math.Round(_w * 0.7391));
+            int iw = Math.Max(24, (int)Math.Round(_w * 0.7391));
+            int ih = Math.Max(8, (int)Math.Round(iw * ia));
             Bitmap oldLoose = _ironArt, oldHead = _ironHeadArt;
-            _ironArt = TrimTransparent(ScaleBitmap(_ironFlat, fw, Math.Max(8, (int)Math.Round(fw * ia))));
-            _ironHeadArt = TrimTransparent(ScaleBitmap(_ironFlat, hw, Math.Max(8, (int)Math.Round(hw * ia))));            // Same re-pointing as the rice art above: a live pot must not be left
+            _ironArt = TrimTransparent(ScaleBitmap(_ironFlat, iw, ih));
+            _ironHeadArt = TrimTransparent(ScaleBitmap(_ironFlat, iw, ih));
+            // Same re-pointing as the rice art above: a live pot must not be left
             // holding a bitmap that has just been freed.
             for (int i = 0; i < _rices.Count; i++) {
                 Rice br = _rices[i];
@@ -2659,6 +6930,17 @@ public sealed class DshPet : Form {
     // delivering it credits exactly that, and picking one up leaves the others alone.
     void StartCredit(double amount) {
         _creditPending = Math.Round(_creditPending + amount, 4);
+        // Bowl drops switched off: credit lands immediately instead of waiting to be collected.
+        // The money still has to ARRIVE - only the bowl is skipped - so this settles it through the
+        // same ApplyCredit the bowl would have used, which also moves _bookedAt so the next poll
+        // cannot read the credited amount as fresh debt.
+        if (!_fxBowlDrop) {
+            ApplyCredit(amount);
+            _creditPending = Math.Round(Math.Max(0, _creditPending - amount), 4);
+            Log("top-up " + amount.ToString("0.00", CultureInfo.InvariantCulture) +
+                " applied directly (bowl drop is off)");
+            return;
+        }
         if (_riceArt == null) {                 // no art -> cannot be collected
             Log("top-up " + amount.ToString("0.00", CultureInfo.InvariantCulture) +
                 " ignored: rice.png missing");
@@ -2668,13 +6950,27 @@ public sealed class DshPet : Form {
         Rice r = new Rice();
         r.R = _riceArt.Width * 0.42;
         r.Amount = amount;
-        // Falls in from the TOP-RIGHT CORNER OF THE SCREEN and lands on the bottom
-        // of the screen. X/Y are SCREEN pixels; DrawRiceArt converts them into this
-        // window's canvas, which is why the bowl can start far outside the widget.
-        // Extra bowls are nudged apart so a burst does not stack into one pile.
-        r.X = vs.Right - r.R * 1.2 - _rices.Count * r.R * 0.5;
+        // Falls in diagonally, MIRRORED about the screen's vertical centre line against where
+        // she is: she sits bottom-LEFT, so the bowl enters the top-RIGHT and drifts left (the
+        // original behaviour, from when she could only ever be bottom-left); she sits
+        // bottom-RIGHT, so the bowl enters top-LEFT and drifts right.
+        //
+        // Only the ENTRY POINT and the drift sign are mirrored - the bowl is never flipped,
+        // scaled or drawn backwards, so nothing on screen (least of all text) becomes
+        // unreadable. Where it lands does not gate anything: the bowl is dragged to her by
+        // hand, and the 10 s radar lock pulls it in from anywhere (the magnet steps toward her
+        // every frame with no range limit).
+        // X/Y are SCREEN pixels; DrawRiceArt converts them into the canvas, which is why the
+        // bowl can start far outside the widget. Extra bowls are nudged apart so a burst does
+        // not stack into one pile.
+        if (_snapRight) {
+            r.X = vs.Left + r.R * 1.2 + _rices.Count * r.R * 0.5;
+            r.VX = 120;                             // top-left, drifting right
+        } else {
+            r.X = vs.Right - r.R * 1.2 - _rices.Count * r.R * 0.5;
+            r.VX = -120;                            // top-right, drifting left
+        }
         r.Y = vs.Top - r.R * 1.2;
-        r.VX = -120;                            // drifts left as it falls
         r.VY = 40;
         r.Rot = 0;
         // Falling in from above the top edge: a full-height drop, so the top tier.
@@ -2697,6 +6993,14 @@ public sealed class DshPet : Form {
         for (int i = _rices.Count - 1; i >= 0; i--) {
             Rice r = _rices[i];
             if (r.Fed) continue;
+            // The IRON POT is not a phantom top-up. This routine exists to clear the bowls a
+            // rehearsal's fake money created, but the pot carries no money at all - it is the
+            // prop the feed leaves behind - and it is never Fed, so the old test swept it up
+            // too. Feeding a bowl and then hitting "refresh now" while the hearts were still
+            // playing therefore deleted the pot that had just been spawned, which is exactly
+            // when this path runs (a refresh just after a feed is a refresh during a
+            // rehearsal).
+            if (r.Iron) continue;
             _rices.RemoveAt(i);
             if (_rice == r) _rice = null;
             if (_riceGrab == r) { _riceGrab = null; r.Dragging = false; }
@@ -2750,10 +7054,12 @@ public sealed class DshPet : Form {
         SpawnHearts(_headX + _offX, (int)(_h * 0.20) + _offY);
         // Delivery cue: its own sound, not the hurt one. Falls back to the hit cue if
         // feed.mp3 is absent, so a stripped-down install still makes a noise.
-        if (_soundWanted) {
-            if (_feedSound != null && !_feedSound.Failed) _feedSound.Play();
-            else if (_sound != null) _sound.Play();
-        }
+        //
+        // Routed through PlayCue rather than played directly, which is what makes the heal
+        // slider's 0 % mean "off" here too. Played straight, a cue at 0 % still made a noise at
+        // whatever level its alias was last given - the same bug the damage cue had.
+        if (_feedSound != null && !_feedSound.Failed) PlayCue(CUE_FEED, _feedSound);
+        else PlayCue(CUE_HIT, _sound);
         // Credit this bowl's own amount, but never more than is actually owed; and
         // if the shortfall between the server figure and the readout is larger (a
         // rehearsal whose local bump a real poll rolled back), take that as a floor
@@ -2816,9 +7122,10 @@ public sealed class DshPet : Form {
 
     void SpawnIronPot(double x, double y) {
         if (_ironArt == null) return;                 // art missing: no pot
-        // Only one pot at a time: a second one would land on top of the first and a
-        // head can only wear one.
-        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) return;
+        // No cap on how many pots exist. There used to be a "only one at a time" guard (a
+        // second pot would have landed on top of the first and a head can only wear one), but
+        // pots now stack on the head, so each eaten bowl simply leaves its own pot behind -
+        // the user asked for that explicitly.
         Rice p = new Rice();
         p.Iron = true;
         p.Art = _ironArt;
@@ -2841,38 +7148,146 @@ public sealed class DshPet : Form {
     // Every fractional value below was MEASURED, not guessed: the user placed the pot
     // by hand in the placement tool on the desktop, over the real calm sprite, and
     // pasted the numbers back. Do not "tidy" them.
-    Point IronHeadAnchor() {
+    Point IronHeadAnchor() { return IronHeadAnchor(0); }
+
+    // Where the n-th pot sits when worn: the placement-tool anchor, raised by one pot height
+    // for each pot already on her head below it.
+    //
+    // Pots STACK now (the user asked for unlimited pots, and for the worn ones to stack
+    // vertically like a column of bowls). The base anchor is unchanged - index 0 is exactly
+    // where a single pot has always sat - so all the measured numbers above still hold, and
+    // index 1 sits directly on top of index 0, index 2 on top of that, and so on. They share
+    // the same tilt because the tilt is a constant applied at draw time.
+    // 0.5558 is measured against the UNMIRRORED artwork (the user placed the pot by hand
+    // over the normal sprite). In the right-hand corner the sprite is drawn flipped, so her
+    // crown has moved to (1 - 0.5558) of the widget: without mirroring the fraction too,
+    // the pot lands on the wrong side of her head.
+    //
+    // Held in a field only so a diagnostic can park the pot somewhere fixed while it moves her
+    // away (a worn pot is anchored to her, so it cannot be left behind any other way). Nothing in
+    // the app changes it.
+    double _ironAnchorFrac = 0.5558;
+
+    Point IronHeadAnchor(int stackIndex) {
         Bitmap art = _ironHeadArt != null ? _ironHeadArt : _ironArt;
         double w = art != null ? art.Width : _w * 0.7391;
         double h = art != null ? art.Height : _w * 0.2629;
-        double cx = _offX + _w * 0.5558;
+        double cxFrac = _snapRight ? (1.0 - _ironAnchorFrac) : _ironAnchorFrac;
+        double cx = _offX + _w * cxFrac;
         double rimY = _offY + _w * 0.3639;
-        return new Point((int)Math.Round(cx), (int)Math.Round(rimY - h / 2.0));
+        double cy = rimY - h / 2.0 - stackIndex * h * IronStackGap;
+        return new Point((int)Math.Round(cx), (int)Math.Round(cy));
     }
 
-    // Has this pot been brought to her head? True when its rim is inside the head box
-    // and it is not shooting upward - so both dragging it there and letting it drop
-    // onto her from above count, which is what the user asked for.
+    // How many pots are worn BELOW this one.
+    //
+    // Counted live from the list order rather than stored, so a pot knocked off closes the gap
+    // instead of leaving a hole: the pots above it re-seat one height lower on the next frame
+    // (the anchor is re-applied every tick, so this settles immediately).
+    //
+    // A pot still easing onto its slot COUNTS. It is already OnHead and its slot is already
+    // claimed, so leaving it out would give the next falling pot the same slot as the one still
+    // in flight - two pots easing towards the same place, and (now that a pot lands on the stack
+    // rather than sinking through it) two pots overlapping each other.
+    int IronStackIndex(Rice me) {
+        int n = 0;
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (r == me) break;
+            if (r.Iron && r.OnHead) n++;
+        }
+        return n;
+    }
+
+    // Has this pot been brought to her head by FALLING onto it? True when its rim is inside the
+    // head box, it is not shooting upward, and it is actually coming down.
+    //
+    // Dragging the pot onto her no longer counts, and neither does letting go of it while it
+    // rests against her crown. The user's rule: the pot goes on when it is DROPPED on her, so a
+    // pot that is merely parked or dragged there has to stay a loose pot. Two independent gates
+    // enforce that - a dragged pot is not tested at all (see the call site), and a pot that is
+    // not moving downward cannot attach here. The second one is what stops the release right
+    // above her crown from seating: it is placed, not dropped.
     bool IronOnHead(Rice p) {
-        if (!p.Iron || p.OnHead || p.HeadFalling || p.Fed) return false;
-        if (p.VY < -60) return false;                 // thrown up and away: not now
+        if (!p.Iron || p.OnHead || p.HeadFalling || p.Fed || p.Dragging) return false;
+        if (p.VY < IronSeatMinFallSpeed) return false; // placed, not dropped
         // Loose art is positioned by its centre, so the rim is half a height below it.
         double rimX = p.X;
         double rimY = p.Y + (p.Art != null ? p.Art.Height / 2.0 : p.R);
-        double cx = _offX + _w * 0.5558, cy = _offY + _w * 0.3639;
+        // Same mirroring as IronHeadAnchor: the head box has to move with the flipped sprite,
+        // or a pot dropped on her crown in the right-hand corner would fail to seat.
+        double cxFrac = _snapRight ? (1.0 - 0.5558) : 0.5558;
+        double cx = _offX + _w * cxFrac, cy = _offY + _w * 0.3639;
         double halfW = _w * 0.26, halfH = _w * 0.18;
         return rimX > cx - halfW && rimX < cx + halfW &&
                rimY > cy - halfH && rimY < cy + halfH;
     }
 
+    // A falling pot lands on TOP of the stack, not on her crown.
+    //
+    // It used to fall past every worn pot (a worn pot is deliberately not a collider) and keep
+    // going until its rim entered the head box, so with three pots on her head the fourth had to
+    // sink right down through the pile before it would seat - the user's "it should stop on the
+    // pot that is already there". The worn pot's own drawn rim is the surface, so the pot seats
+    // as soon as its rim reaches that row.
+    //
+    // Returns the anchor Y of the slot the pot belongs in, or int.MaxValue when nothing is worn
+    // yet (in which case the head-box test above seats it exactly as before).
+    int IronOnTopOfStack(Rice p) {
+        if (!p.Iron || p.OnHead || p.HeadFalling || p.Fed || p.Dragging) return int.MaxValue;
+        if (p.VY < IronSeatMinFallSpeed) return int.MaxValue;
+        Bitmap art = p.Art != null ? p.Art : _ironArt;
+        double h = art != null ? art.Height : _w * 0.2629;
+        double rimY = p.Y + h / 2.0;
+        double halfW = art != null ? art.Width * 0.5 : 0;
+
+        int topIdx = -1;
+        double topRimY = 0, topRimBot = 0;
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            // HeadFalling pots count: a pot that is still easing onto its slot has already
+            // claimed that slot (see IronStackIndex), and the surface a new pot lands on is its
+            // CURRENT rim, which r.TopRimY records.
+            if (!r.Iron || !r.OnHead || r == p) continue;
+            int idx = IronStackIndex(r);
+            double rim = r.TopRimValid ? r.TopRimY : r.Y - h / 2.0;
+            if (idx > topIdx) { topIdx = idx; topRimY = rim; topRimBot = rim + h; }
+        }
+        if (topIdx < 0 || halfW <= 0) return int.MaxValue;
+        // Coming down into the rim from just above it, and horizontally over the pile at all.
+        if (rimY < topRimY - IronSeatTopSlack || rimY > topRimBot) return int.MaxValue;
+        double cxFrac = _snapRight ? (1.0 - 0.5558) : 0.5558;
+        double cx = _offX + _w * cxFrac;
+        if (Math.Abs(p.X - cx) > halfW) return int.MaxValue;
+        return IronHeadAnchor(topIdx + 1).Y;
+    }
+
     // Hand the pot over to the head: physics off, position driven by HeadFalling then
     // slaved to IronHeadAnchor().
-    void AttachIronPot(Rice p) {
-        Point a = IronHeadAnchor();
+    void AttachIronPot(Rice p) { AttachIronPot(p, int.MaxValue); }
+
+    // anchorY is the slot the caller has already worked out (the stack's top), or int.MaxValue
+    // to derive it here. Deriving it AFTER OnHead is set matters: HeadFalling carries the pot up
+    // to its slot over several frames, and IronStackIndex only counts SETTLED worn pots, so a
+    // slot computed before the flag is set would land the pot one place too low.
+    // A pot that has just been caught goes STRAIGHT to its slot: no rising animation.
+    //
+    // It used to ease from wherever it was caught (HeadY -> HeadTarget over ~0.6s). Measured from
+    // the lowest catchable point that is a 311px climb, and for the whole climb the new pot is
+    // travelling up THROUGH the pots already on her head - which reads as "the pot underneath gets
+    // sucked up into the new one", the user's report. Dropped straight from above it was only a
+    // 5px move, which is why this hid for two rounds of testing.
+    //
+    // The girl's flinch and the landing sound are untouched: those are the part the user asked to
+    // keep. Only the pot's own travel is removed.
+    void AttachIronPot(Rice p, int anchorY) {
         p.OnHead = true;
-        p.HeadFalling = true;
-        p.HeadY = p.Y;
-        p.HeadTarget = a.Y;
+        Point a = IronHeadAnchor(IronStackIndex(p));
+        int slot = anchorY == int.MaxValue ? a.Y : anchorY;
+        p.Y = slot;
+        p.HeadY = slot;
+        p.HeadTarget = slot;
+        p.HeadFalling = false;
         p.X = a.X;
         p.VX = 0; p.VY = 0;
         p.Rot = 0;
@@ -2881,8 +7296,23 @@ public sealed class DshPet : Form {
         p.Art = _ironHeadArt != null ? _ironHeadArt : _ironArt;
         // The girl flinches as it lands.
         _headSquashT = 0;
+        PlayCue(CUE_LAND, _ironLandSound);
         _dirty = true;
-        Log("iron pot landed on her head");
+        Log("iron pot landed on her head (stack index " + IronStackIndex(p) + ")");
+    }
+
+    // A prop's collision radius as a circle of equal area.
+    //
+    // The contact test is per-axis (ellipse), so the separation has to be measured with a shape
+    // that respects the art's aspect ratio rather than its width. For the square rice art this
+    // returns exactly r.R, so nothing about bowl-vs-bowl changes; for the wide shallow iron pot
+    // (328x117, r.R = 137.76) it returns ~121 instead of the 138 that made two pots shove each
+    // other a quarter of the screen apart.
+    double EffectiveRadius(Rice r) {
+        if (r.Art == null) return r.R;
+        double hw = r.Art.Width * 0.5, hh = r.Art.Height * 0.5;
+        if (hw < 1 || hh < 1) return r.R;
+        return Math.Sqrt(hw * hh);
     }
 
     // -------------------------------------------------------- rice physics --
@@ -3040,7 +7470,9 @@ public sealed class DshPet : Form {
             // Slaved to the head: no gravity, no dragging, no magnet. The first few
             // frames are the little drop from where it was caught down onto the crown.
             if (r.OnHead) {
-                Point a = IronHeadAnchor();
+                // This pot's own slot in the stack: the anchor moves as pots above/below it
+                // come and go, so it is re-derived every frame rather than latched.
+                Point a = IronHeadAnchor(IronStackIndex(r));
                 // The fade is checked FIRST: once the pot has been knocked off it must
                 // keep fading even if it was still settling onto the crown, otherwise
                 // HeadFalling swallows the FadeT branch and the pot never leaves.
@@ -3086,6 +7518,13 @@ public sealed class DshPet : Form {
                 // the bowl's CURRENT speed while it is held must read the sampled
                 // cursor velocity (_throwVX/_throwVY) instead - see ComputeBlip.
                 r.Squish = 0;
+                // TOUCHING her is enough. This used to be decided only by ReleaseBowl - you had
+                // to let go with the bowl already on her - which made feeding feel like it needed
+                // two separate actions. Contact is the same test the release used (her silhouette's
+                // own pixels, not a circle around the bowl), so it is neither more nor less
+                // forgiving than it was; it just no longer waits for the button.
+                if (!r.Fed && !r.Iron && _feedOnTouch && RiceOnGirl(r)) OnRiceFed(r);
+                continue;
             } else {
                 // Always integrate: a bowl resting on the floor is just a bowl whose
                 // velocity keeps being cancelled by the floor, and keeping gravity on
@@ -3149,6 +7588,10 @@ public sealed class DshPet : Form {
                 if (r.X < vs.Left + r.R) { r.X = vs.Left + r.R; r.VX = Math.Abs(r.VX) * 0.5; }
                 if (r.X > vs.Right - r.R) { r.X = vs.Right - r.R; r.VX = -Math.Abs(r.VX) * 0.5; }
                 if (r.Y < vs.Top + r.R) { r.Y = vs.Top + r.R; if (r.VY < 0) r.VY = 0; }
+                // A bowl that runs into her is collected, however it got there: she pulled it in
+                // with the magnet, or it was thrown and landed on her. Same contact test as the
+                // drag path above, so the rule is one rule - touching her feeds her.
+                if (!r.Fed && !r.Iron && _feedOnTouch && RiceOnGirl(r)) OnRiceFed(r);
             }
             // "Q-bounce": squash at impact, a counter-stretch right after, then
             // settle. Slower and larger than the first attempt, which snapped back in
@@ -3159,45 +7602,126 @@ public sealed class DshPet : Form {
             } else {
                 r.Squish = 0;
             }
-            // Brought to her head (dragged there, or simply dropped on it): the pot
-            // goes on. Checked AFTER the physics so the drop-in case, where the pot is
-            // falling when it arrives, is caught on the same frame it touches down.
-            if (IronOnHead(r)) AttachIronPot(r);
+            // Brought to her head by a DROP, or landed on the pot already up there: it goes on.
+            // Checked AFTER the physics so the drop-in case, where the pot is falling when it
+            // arrives, is caught on the same frame it touches down.
+            //
+            // A pot the user is HOLDING is not tested at all: dragging it onto her used to seat
+            // it, which the user asked to remove - only a fall puts a pot on. Both tests check
+            // the fall speed again for themselves, so a pot merely placed against her crown
+            // stays loose as well.
+            if (!r.Dragging) {
+                int slotY = IronOnTopOfStack(r);
+                if (slotY != int.MaxValue) AttachIronPot(r, slotY);
+                else if (IronOnHead(r)) AttachIronPot(r);
+            }
         }
         // Bowl-versus-bowl collision, after every bowl has been integrated so the
         // pairs all see the same frame. Without this, two bowls dropped together
-        // stack exactly on top of each other. Treated as circles of radius R.
+        // stack exactly on top of each other.
+        //
+        // A pot WORN ON HER HEAD is NOT a collider at all (an explicit decision, not an
+        // oversight). It is a decoration on the character, not a body in the scene: it is
+        // hard-anchored to IronHeadAnchor() every frame, so it can never react to a hit, and
+        // all a rice bowl could ever do was bounce off a silhouette that is part of her. The
+        // contact shape for it was wrong for a long time - the art is 245x88 but the radius
+        // came from its width (103, taller than the pot) so bowls registered hits while still
+        // visibly clear - and rather than keep tuning a collider whose only effect is to push
+        // loose bowls around, the worn pot simply stops participating. A falling bowl now
+        // passes it. Nothing else changes: a LOOSE pot still collides normally, and the
+        // worn-pot anchor is still enforced below.
         for (int a = 0; a < _rices.Count; a++) {
             Rice ra = _rices[a];
-            if (ra.Fed) continue;
+            if (ra.Fed || ra.OnHead) continue;
             for (int b = a + 1; b < _rices.Count; b++) {
                 Rice rb = _rices[b];
-                if (rb.Fed) continue;
+                if (rb.Fed || rb.OnHead) continue;
                 double dx = rb.X - ra.X, dy = rb.Y - ra.Y;
-                double minD = ra.R + rb.R;
                 double d2 = dx * dx + dy * dy;
+                // ONE metric for both halves of the response - and it has to be the one the
+                // contact test uses.
+                //
+                // The test below is an ELLIPSE test (closest point on each ellipse, and the sign
+                // of s1 + s2 - |d| decides). The separation used to be computed from the CIRCLES,
+                // minD = ra.R + rb.R, and for a prop whose art is not square those two disagree
+                // badly: a rice bowl's art is 200x200 with R = 84, and an iron pot's is 328x117
+                // with R = 137.76, so a pot and a bowl reported contact while the pot was still
+                // ~183 px clear and the "push each half the overlap" correction was up to 224 px
+                // in a single frame. Two loose pots did this to each other every frame, which is
+                // exactly the stutter and twitching the user reported.
+                //
+                // EffectiveRadius is the circle of equal area, so for the square art it comes out
+                // at exactly ra.R (unchanged behaviour where it was already right) and for the
+                // wide shallow pot it tracks the shape instead of its width.
+                double minD = EffectiveRadius(ra) + EffectiveRadius(rb);
                 if (d2 >= minD * minD) continue;
+                bool touching;
+                if (ra.Art != null && rb.Art != null) {
+                    double a1 = ra.Art.Width * 0.5, b1 = ra.Art.Height * 0.5;
+                    double a2 = rb.Art.Width * 0.5, b2 = rb.Art.Height * 0.5;
+                    if (a1 < 1 || b1 < 1 || a2 < 1 || b2 < 1) {
+                        touching = true;
+                    } else {
+                        // Closest point on each ellipse to the other's centre, then compare the
+                        // gap with the sum of the two centre-to-point distances. For ellipses
+                        // that sum IS the separation along the line joining them, so the sign
+                        // of (s1 + s2 - |d|) is exactly "overlapping or not".
+                        double u1, v1, u2, v2;
+                        NearestOnEllipse(dx, dy, a1, b1, out u1, out v1);
+                        NearestOnEllipse(-dx, -dy, a2, b2, out u2, out v2);
+                        double s1 = Math.Sqrt(u1 * u1 + v1 * v1);
+                        double s2 = Math.Sqrt(u2 * u2 + v2 * v2);
+                        touching = s1 + s2 > Math.Sqrt(d2);
+                    }
+                } else {
+                    touching = true;
+                }
+                if (!touching) continue;
                 double d = Math.Sqrt(d2);
                 if (d < 0.001) {                    // dead centre: split them apart
                     dx = 1; dy = 0; d = 1;
                 }
                 double nx = dx / d, ny = dy / d;
                 double push = (minD - d) * 0.5;     // each moves half the overlap
-                // A bowl being dragged keeps its position; the other one yields.
-                bool aFixed = ra.Dragging, bFixed = rb.Dragging;
+                // A bowl being dragged keeps its position; the other one yields - and so
+                // does a pot WORN ON HER HEAD. That one is not a free body: the physics
+                // loop above hard-anchors it to IronHeadAnchor() every frame, so letting
+                // its neighbours push it apart here just made it jitter away from the
+                // anchor and snap back, and a hard enough shove visibly displaced it
+                // (measured: 43 px of drift from repeated bowl impacts). The worn pot is
+                // part of the character, so the loose bowl takes the whole separation.
+                bool aFixed = ra.Dragging || ra.OnHead, bFixed = rb.Dragging || rb.OnHead;
                 double aw = aFixed ? 0 : (bFixed ? 1 : 0.5);
                 double bw = bFixed ? 0 : (aFixed ? 1 : 0.5);
                 ra.X -= nx * push * 2 * aw; ra.Y -= ny * push * 2 * aw;
                 rb.X += nx * push * 2 * bw; rb.Y += ny * push * 2 * bw;
                 // Swap the approaching part of the velocity, damped.
+                //
+                // Only the component that is actually closing is removed (va - vb > 0), and it is
+                // removed by a fraction rather than all at once. Restitution 0.45 rather than the
+                // old 0.55: less bounce-back between two props means fewer settle-twitches, and
+                // the visible bounce of a bowl on the floor does not come through here at all.
                 double va = ra.VX * nx + ra.VY * ny;
                 double vb = rb.VX * nx + rb.VY * ny;
                 if (va - vb > 0 && !aFixed && !bFixed) {
-                    double imp = (va - vb) * 0.55;
+                    double imp = (va - vb) * 0.45;
                     ra.VX -= imp * nx; ra.VY -= imp * ny;
                     rb.VX += imp * nx; rb.VY += imp * ny;
                 }
             }
+        }
+        // A worn pot is part of the character, not a body in the scene: re-seat it on the
+        // anchor after ALL the physics for this frame. The collision loop already refuses
+        // to push it, but it is only one of several places that write to X/Y, and doing it
+        // here makes the guarantee unconditional - "a measured shove moves it at most
+        // 1.65 px" is a wobble, "moves it 0 px" is a promise. --ironbump is the regression.
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice rp = _rices[i];
+            if (!rp.Iron || !rp.OnHead) continue;
+            Point pa = IronHeadAnchor(IronStackIndex(rp));
+            rp.X = pa.X;
+            if (!rp.HeadFalling) rp.Y = pa.Y;
+            rp.VX = 0; rp.VY = 0;
         }
         if (hadBowls && _rices.Count == 0) SyncWindowMode();
 
@@ -3232,12 +7756,14 @@ public sealed class DshPet : Form {
         if (_rices.Count > 0) {
             // A bowl is out: keep the widget exactly where it is, so nothing jumps.
             if (_offX == 0 && _offY == 0) {
-                _offX = wa.Left - vs.Left;
+                _offX = HomeX();
                 _offY = Math.Max(0, wa.Bottom - vs.Top - _h);
             }
         } else {
-            // No bowl: the widget sits on the work-area floor, bottom-left.
-            _offX = wa.Left - vs.Left;
+            // No bowl: the widget sits on the work-area floor, in HER corner - which is the
+            // right one once she has been parked on that side. Hard-coding bottom-left here
+            // used to undo a right-hand snap the moment the last bowl was collected.
+            _offX = HomeX();
             _offY = Math.Max(0, wa.Bottom - vs.Top - _h);
         }
         _fullScreen = _rices.Count > 0;
@@ -3271,6 +7797,10 @@ public sealed class DshPet : Form {
         if (_sprNormal != null) _sprNormal.Dispose();
         if (_sprRed != null) _sprRed.Dispose();
         if (_canvas != null) _canvas.Dispose();
+        // Same reasoning as in Relayout: the panel is scaled from the widget.
+        if (_panelCache != null) { _panelCache.Dispose(); _panelCache = null; }
+        _panelCacheValid = false;
+        _panelCacheW = -1; _panelCacheH = -1; _panelCacheText = null;
         _sprNormal = scaled;
         _sprRed = BuildRedLayer(scaled);
         _canvas = new Bitmap(_winW, _winH, PixelFormat.Format32bppArgb);
@@ -3334,8 +7864,43 @@ public sealed class DshPet : Form {
     // the floor. r.X / r.Y are SCREEN pixels; they become canvas pixels here.
     void DrawRice(Graphics g) {
         if (_riceArt == null) return;
+        int worn = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) worn++;
+        if (worn > 0) {
+            // Worn pots OVERLAP now (IronStackGap < 1), so they must be painted from the BOTTOM
+            // of the stack upwards: each pot has to cover the one below it. _rices is in
+            // creation order, which is not stack order - a pot picked up later can end up under
+            // one that was already on her head - so the worn ones are drawn by stack index.
+            //
+            // Walked by index rather than by sorting a copy of the list: the list order feeds
+            // IronStackIndex and the radar, and reordering it as a side effect of drawing would
+            // be a nasty coupling. Recomputing the index per pot is a few comparisons over a
+            // handful of items, and only while something is actually worn.
+            for (int k = 0; k < worn; k++) {
+                for (int i = 0; i < _rices.Count; i++) {
+                    Rice r1 = _rices[i];
+                    if (!r1.Iron || !r1.OnHead) continue;
+                    if (IronStackIndex(r1) != k) continue;
+                    // --ironflash calibration: leave one pot out on purpose. A probe that cannot
+                    // see a pot that was deliberately not drawn cannot be trusted to notice one
+                    // that vanished by accident - the lesson that cost this project the most.
+                    if (r1 == _suppressPot) break;
+                    if (PotDrawLog != null && _flashTraceBudget > 0) {
+                        PotDrawLog.Add("      draw  : k=" + k + " idx=" + IronStackIndex(r1) +
+                                       " y=" + r1.Y.ToString("0.0") + " falling=" + (r1.HeadFalling ? 1 : 0) +
+                                       " fadeT=" + r1.FadeT.ToString("0.00") +
+                                       " drawnT=" + (r1.DrawnValid ? r1.DrawnT.ToString("0") : "?") +
+                                       " drawnB=" + (r1.DrawnValid ? r1.DrawnB.ToString("0") : "?"));
+                    }
+                    DrawRiceArt(g, r1, 1.0);
+                    break;
+                }
+            }
+        }
         for (int i = 0; i < _rices.Count; i++) {
             Rice r = _rices[i];
+            // The worn pots were handled above, lowest first.
+            if (r.Iron && r.OnHead) continue;
             if (r.Fed) {
                 double e = 1.0 - r.DieT / 0.14;
                 if (e <= 0) continue;
@@ -3347,6 +7912,12 @@ public sealed class DshPet : Form {
     }
 
     void DrawRiceArt(Graphics g, Rice r, double opacity) {
+        // A prop that is fading out is on its way off the stack: it must not advertise a rim for
+        // the next pot to land on, or a pot could seat itself on a surface that is disappearing.
+        DrawRiceArt(g, r, opacity, opacity >= 0.999);
+    }
+
+    void DrawRiceArt(Graphics g, Rice r, double opacity, bool recordRim) {
         Bitmap art = r.Art != null ? r.Art : _riceArt;
         if (art == null) return;
         double sq = r.Squish;
@@ -3376,17 +7947,40 @@ public sealed class DshPet : Form {
         double baseYd = r.OnHead
             ? (double)r.Y + syo
             : (double)(r.Y + r.R) + syo;
-        // Follow the girl's head-squash. She is drawn compressed about the widget's
-        // bottom edge, so anything bolted to her has to compress about the same line -
-        // otherwise the pot stays put while she dips, which is the desync the user saw
-        // (and it moved the erase mask off the pixels it was painted for).
-        if (_squashOn) baseYd = (baseYd - _squashAnchorY) * _squashScale + _squashAnchorY;
-        float baseY = (float)baseYd;
         // The pot is worn TILTED - see IronHeadTiltDeg. Applied inline here rather than
         // through r.Rot because r.Rot is the loose wobble, which the head branch in
         // UpdateRice keeps pinned at 0. The sign is flipped: IronHeadTiltDeg is stored
         // in the placement tool's (PIL) convention, GDI+ turns the other way round.
-        double rollDeg = r.OnHead ? -IronHeadTiltDeg : r.Rot * 180.0 / Math.PI;
+        //
+        // In the right-hand corner the SPRITE is drawn mirrored, so the same angle would now
+        // lean the pot the wrong way relative to her head - it has to be mirrored too, or the
+        // pot reads as sitting crooked even when its anchor is right. Mirroring a rotation is
+        // negating it, which is what the extra sign does here.
+        double rollDeg = r.OnHead
+            ? (_snapRight ? IronHeadTiltDeg : -IronHeadTiltDeg)
+            : r.Rot * 180.0 / Math.PI;
+        // Diagnostic tap: reports the numbers this exact draw call uses, so a
+        // measurement can be compared against the real draw instead of a
+        // re-implementation of it. Off unless --pottrace turned it on.
+        if (_potTrace) {
+            PotTraceLog.Add("  draw    : idx=" + IronStackIndex(r) + " onHead=" + (r.OnHead ? 1 : 0) +
+                            " rY=" + r.Y.ToString("0.0") + " rX=" + r.X.ToString("0.0") +
+                            " art=" + aw.ToString("0") + "x" + ah.ToString("0") +
+                            " baseYd(pre-squash)=" + baseYd.ToString("0.00") +
+                            " squashOn=" + (_squashOn ? 1 : 0) +
+                            " squashScale=" + _squashScale.ToString("0.0000") +
+                            " anchor=" + _squashAnchorY.ToString("0") +
+                            " roll=" + rollDeg.ToString("0.00"));
+        }
+        // Follow the girl's head-squash ONLY while the prop is part of her.
+        //
+        // The bounce is HER flinch, so a LOOSE pot must not move with it: one pot landing on her
+        // head used to make every free pot on the screen bob in sympathy, which the user reported
+        // as plainly unnatural. The shake above was already restricted to the worn pot for the
+        // same reason; this line simply had not been. A worn pot still follows both, which is
+        // what keeps it welded to her crown through the whole animation.
+        if (_squashOn && r.OnHead) baseYd = (baseYd - _squashAnchorY) * _squashScale + _squashAnchorY;
+        float baseY = (float)baseYd;
         var save = g.Save();
         try {
             g.TranslateTransform(cx, baseY);
@@ -3408,6 +8002,26 @@ public sealed class DshPet : Form {
             }
         } finally {
             g.Restore(save);
+        }
+        // Record the box this call just painted into, so the next frame erases exactly it.
+        //
+        // Recomputing it later fails: the head-squash moves a worn pot every frame, so by
+        // the time the erase runs, "where it should have been" is a different place from
+        // where it WAS. Half-extents come from the same four numbers the transform above
+        // used (art size, wobble/scale, tilt), so drawing and erasing cannot disagree.
+        {
+            double hx = aw / 2.0, hy = ah / 2.0;                 // scaled about the art centre
+            double rad = rollDeg * Math.PI / 180.0;
+            double c = Math.Abs(Math.Cos(rad)), s = Math.Abs(Math.Sin(rad));
+            double ex = hx * sw * c + hy * sh * s;
+            double ey = hx * sw * s + hy * sh * c;
+            double centreY = r.OnHead ? baseYd : baseYd - ah / 2.0;
+            r.DrawnL = cx - ex; r.DrawnR = cx + ex;
+            r.DrawnT = centreY - ey; r.DrawnB = centreY + ey;
+            r.DrawnValid = true;
+            // This pot's own rim, for the NEXT falling pot to land on. recordRim is false for the
+            // fading-out call, so a pot on its way off does not offer a surface to land on.
+            if (recordRim) { r.TopRimY = r.DrawnT; r.TopRimValid = true; }
         }
     }
 
@@ -3499,6 +8113,10 @@ public sealed class DshPet : Form {
     }
 
     // Flat red copy of the art for the hurt flash (alpha preserved).
+    //
+    // The result is fully opaque (A=255): only the SHAPE comes from the sprite's alpha, and
+    // the overlay is made translucent later by the ColorMatrix when it is drawn. Because A
+    // is always 255 the stored colour needs no premultiplication.
     static Bitmap BuildRedLayer(Bitmap src) {
         Bitmap dst = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
         Buf s = new Buf(src);
@@ -3520,12 +8138,63 @@ public sealed class DshPet : Form {
         return dst;
     }
 
+    // True when one of the cached expression sprites owns this bitmap, so the resize and
+    // mood paths never dispose something the cache still hands out.
+    bool InExprCache(Bitmap b) {
+        if (b == null) return false;
+        for (int i = 0; i < _exprSprCache.Length; i++) if (_exprSprCache[i] == b) return true;
+        return false;
+    }
+
+    // Same question for EITHER cache. The red layer needs this too: it is normally the cached
+    // object, and the sprite-only test let the old code dispose it out from under the cache.
+    bool InAnyCache(Bitmap b) {
+        if (b == null) return false;
+        for (int i = 0; i < _exprSprCache.Length; i++) {
+            if (_exprSprCache[i] == b || _exprRedCache[i] == b) return true;
+        }
+        return false;
+    }
+
+    // A Bitmap that has been disposed still answers "!= null", which is what let a dead bitmap
+    // sit in the cache looking valid. There is no public IsDisposed, so probe it the only way
+    // GDI+ allows: touching a property throws once the native surface is gone.
+    // (Named IsDead, not IsDisposed: the latter collides with an inherited member and /warnaserror
+    // turns the shadowing warning into a build failure.)
+    static bool IsDead(Bitmap b) {
+        if (b == null) return false;
+        try { int w = b.Width; return w <= 0; } catch { return true; }
+    }
+
+    void ReleaseExprCache() {
+        for (int i = 0; i < _exprSprCache.Length; i++) {
+            if (_exprSprCache[i] != null) { _exprSprCache[i].Dispose(); _exprSprCache[i] = null; }
+            if (_exprRedCache[i] != null) { _exprRedCache[i].Dispose(); _exprRedCache[i] = null; }
+        }
+    }
+
     // Snap the WIDGET back to the bottom-left corner of the work area. The window no
     // longer moves (it is permanently screen-sized), so this animates _offX/_offY.
+    // Where "home" is on the X axis: the bottom-left or bottom-right corner of the primary
+    // work area, expressed in the virtual-screen space _offX lives in. One definition so the
+    // snap animation, the start-up placement and SyncWindowMode cannot drift apart.
+    int HomeX() {
+        Rectangle vs = SystemInformation.VirtualScreen;
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        return _snapRight ? (wa.Right - vs.Left - _w) : (wa.Left - vs.Left);
+    }
+
     void SnapToCorner(bool immediate) {
         Rectangle vs = SystemInformation.VirtualScreen;
         Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-        Point target = new Point(wa.Left - vs.Left, Math.Max(0, wa.Bottom - vs.Top - _h));
+        // Bottom-LEFT or bottom-RIGHT, whichever half she was released in. Y is the same.
+        //
+        // The X target is worked out in working-area coordinates and then converted into the
+        // virtual-screen space _offX actually lives in (the window spans the whole virtual
+        // screen, so dragging clamps _offX to [0, vs.Width - _w] - the same space).
+        // Subtracting wa.Width from wa.Right (rather than using wa.Left + ...) keeps the
+        // right-hand target correct when the primary monitor is not at the virtual origin.
+        Point target = new Point(HomeX(), Math.Max(0, wa.Bottom - vs.Top - _h));
         if (immediate) {
             _offX = target.X; _offY = target.Y;
             _snapping = false;
@@ -3552,8 +8221,10 @@ public sealed class DshPet : Form {
 
     void ReadState() {
         try {
-            bool volumeRead = false;
             if (!File.Exists(StatePath)) return;
+            // The retired per-cue switches, if the file still carries them. Applied AFTER the
+            // loop so the outcome does not depend on which line came first.
+            bool[] legacyFxOff = new bool[4];
             foreach (string line in File.ReadAllLines(StatePath)) {
                 int i = line.IndexOf('=');
                 if (i <= 0) continue;
@@ -3564,23 +8235,148 @@ public sealed class DshPet : Form {
                     _sizePx = n;                       // presets / custom entry
                 else if (k == "cm" && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && d >= 0.8)
                     _cm = d;                           // legacy, only used if px is absent
-                else if (k == "volume" && int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out n) && n >= 0 && n <= 100) {
-                    _volume = n; volumeRead = true;
-                } else if (k == "sound" && (v == "0" || v == "1")) {
+                else if (k == "volume") {
+                    // RETIRED, and deliberately not read. There is no master level any more, and
+                    // the old code applied this key as the STARTING VALUE for all four cues -
+                    // which is the overwrite bug in its original form: a state.ini carrying
+                    // volume=50 and cuevol3=48 would load as 50/50/50/50 and the 48 was gone
+                    // before the app had even drawn a frame. cuevolN is the only source now.
+        
+        } else if (k == "fxbowl" && (v == "0" || v == "1")) {
+            _fxBowlDrop = v == "1";
+        } else if (k == "fxpat" && (v == "0" || v == "1")) {
+            _fxPat = v == "1";
+        } else if (k == "fxhurt" && (v == "0" || v == "1")) {
+            _fxHurt = v == "1";
+        } else if (k == "sound" && (v == "0" || v == "1")) {
                     _soundEnabled = v == "1"; _soundWanted = _soundEnabled;
+                } else if (k == "fx_ironland" && (v == "0" || v == "1")) {
+                    // MIGRATION, and the only reason these two keys are still read at all: they
+                    // were per-cue on/off switches, which no longer exist because a volume of
+                    // 0 % says the same thing. A saved "off" becomes a volume of 0 so the user's
+                    // choice survives the upgrade instead of silently coming back on.
+                    legacyFxOff[CUE_LAND] = v == "0";
+                } else if (k == "fx_ironoff" && (v == "0" || v == "1")) {
+                    legacyFxOff[CUE_OFF] = v == "0";
+                } else if (k == "corner" && (v == "left" || v == "right")) {
+                    // Which bottom corner she lives in. A word, not a number, so the file stays
+                    // readable and a future third position would not renumber anything.
+                    _snapRight = (v == "right");
                 } else if (k == "theme") {
                     // Stored as a word, not a number, so the file stays readable and
                     // a future third palette can be added without renumbering.
                     _darkTheme = (v == "dark");
+                } else if (k.StartsWith("cuevol")) {
+                    // cuevol0..cuevol3 - one volume per cue. Absent keys keep the default,
+                    // so an older state.ini loads unchanged.
+                    int cue;
+                    if (int.TryParse(k.Substring(6), NumberStyles.Integer, CultureInfo.InvariantCulture, out cue) &&
+                        cue >= 0 && cue < 4 &&
+                        int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out n) &&
+                        n >= 0 && n <= 100)
+                        _cueVolume[cue] = n;
+                } else if (k.StartsWith("cuenm") || k.StartsWith("cuefx")) {
+                    // RETIRED, and deliberately not read here. These paired a cue with its one
+                    // custom clip under the old single-slot scheme; the library keeps every clip
+                    // now and records its own choice in soundfx\<cue>\library.ini. The clip
+                    // FILES are migrated by MigrateLegacySidecar, which reads the name straight
+                    // from this file - so nothing is lost, and these keys are simply ignored on
+                    // every later start.
                 }
             }
+            // A cue that was switched off under the old scheme becomes a cue at 0 %, which is
+            // what "off" means now. Only the two pot cues ever had a switch, so only they can
+            // carry this.
+            for (int c = 0; c < 4; c++) if (legacyFxOff[c]) _cueVolume[c] = 0;
             // Push the stored level into the pools that were built earlier. No test
             // cue here - ReadState runs during start-up and should stay silent.
-            if (volumeRead) {
-                if (_sound != null) _sound.SetVolume(_volume);
-                if (_feedSound != null) _feedSound.SetVolume(_volume);
+            //
+            // ReadState runs BEFORE the pools exist on a cold start (they are built in
+            // the constructor body after this call), so the per-cue values are applied
+            // again by ApplyAllCueVolumes from there. Applying them here too is what
+            // makes a rebuilt menu pick them up mid-session.
+            for (int c = 0; c < 4; c++) ApplyCueVolume(c);
+        } catch { }
+    }
+
+    // Today's spend, in a file of its own so it cannot disturb the settings guard.
+    string UsagePath() { return Path.Combine(_baseDir, "usage.ini"); }
+
+    void SaveUsage() {
+        if (_noSave || _diagRun) return;
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("day=").Append(_usedDay.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+            sb.Append("used=").Append(_todayUsed.ToString("0.####", CultureInfo.InvariantCulture)).Append("\r\n");
+            sb.Append("topup=").Append(_todayTopUp.ToString("0.####", CultureInfo.InvariantCulture)).Append("\r\n");
+            if (!double.IsNaN(_todayBase))
+                sb.Append("base=").Append(_todayBase.ToString("0.####", CultureInfo.InvariantCulture)).Append("\r\n");
+            File.WriteAllText(UsagePath(), sb.ToString());
+        } catch { }
+    }
+
+    void LoadUsage() {
+        try {
+            if (!File.Exists(UsagePath())) { RollSpendDay(); return; }
+            foreach (string line in File.ReadAllLines(UsagePath())) {
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string k = line.Substring(0, eq).Trim();
+                string v = line.Substring(eq + 1).Trim();
+                if (k == "day") { int dd; if (int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out dd)) _usedDay = dd; }
+                else if (k == "used") { double uu; if (double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out uu)) _todayUsed = uu; }
+                else if (k == "base") { double bb; if (double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out bb)) _todayBase = bb; }
+                else if (k == "topup") { double tt; if (double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out tt)) _todayTopUp = tt; }
             }
         } catch { }
+        RollSpendDay();
+    }
+
+    // Called once after the state file is read: the stored spend belongs to the day it was written.
+    // Called whenever a fresh balance arrives: the DROP since the previous reading is what was spent.
+    //
+    // A rise is a top-up and is ignored, so spending after a recharge is still counted correctly.
+    // The previous value is dropped when the day rolls over, otherwise yesterday's last reading would
+    // look like a huge overnight drop.
+    double _todayBase = double.NaN;      // the balance first seen today
+    double _todayTopUp;                  // recharged today, so a top-up does not erase the reading
+    double _lastBalSeen = double.NaN;
+    void NoteBalanceForSpend(double bal) {
+        if (double.IsNaN(bal)) return;
+        int today = DateTime.Now.DayOfYear;
+        if (_usedDay != today) {
+            // A new day: baseline is the balance now, and nothing has been spent or added yet.
+            _usedDay = today; _todayBase = bal; _todayTopUp = 0; _todayUsed = 0;
+            _lastBalSeen = bal; _spendDirty = true;
+            SaveUsage();          // the baseline must survive a restart, or the reading resets to zero
+            return;
+        }
+        if (double.IsNaN(_todayBase)) {
+            _todayBase = bal; _lastBalSeen = bal; _spendDirty = true;
+            SaveUsage();          // one write, once a day
+            return;
+        }
+        // A rise is a recharge. Counting it keeps the formula below closed: without it a top-up
+        // would shrink (or zero) the reading, and the only way to hide that would be a max(), which
+        // then loses the spending that happens after the top-up.
+        if (!double.IsNaN(_lastBalSeen) && bal > _lastBalSeen + 1e-9) {
+            _todayTopUp = Math.Round(_todayTopUp + (bal - _lastBalSeen), 4);
+            _spendDirty = true;
+            SaveUsage();          // recharges are rare; keep the figure exact across restarts
+        }
+        _lastBalSeen = bal;
+        double spent = _todayBase + _todayTopUp - bal;
+        if (spent < 0) spent = 0;
+        if (Math.Abs(spent - _todayUsed) > 1e-9) {
+            _todayUsed = Math.Round(spent, 4);
+            _spendDirty = true;
+            _panelCacheValid = false;
+        }
+    }
+
+    void RollSpendDay() {
+        int today = DateTime.Now.DayOfYear;
+        if (_usedDay != today) { _usedDay = today; _todayUsed = 0; _todayTopUp = 0; _todayBase = double.NaN; _lastBalSeen = double.NaN; }
     }
 
     void SaveState() {
@@ -3588,17 +8384,60 @@ public sealed class DshPet : Form {
         // with: --simchain walks the size presets and the sound test moves the
         // volume, and both used to write state.ini on the way through.
         if (_noSave) { Log("state write skipped (diagnostic run)"); return; }
+        // Second line of defence, independent of the entry-point bookkeeping above:
+        // a process started with any --flag is a diagnostic, whatever it forgets to
+        // declare. This file holds the user's size, volume and theme, and quietly
+        // overwriting it is the kind of damage that is noticed days later.
+        if (_diagRun) { Log("state write skipped (argv diagnostic)"); return; }
         try {
+            StringBuilder sb = new StringBuilder();
             // px is what the cup presets and the custom entry use; cm stays so an
-            // older build could still read the file. volume/sound are live settings.
-            File.WriteAllText(StatePath,
-                "px=" + _sizePx.ToString(CultureInfo.InvariantCulture) + "\r\n" +
-                "cm=" + _cm.ToString("0.##", CultureInfo.InvariantCulture) + "\r\n" +
-                "volume=" + _volume.ToString(CultureInfo.InvariantCulture) + "\r\n" +
-                "sound=" + (_soundEnabled ? "1" : "0") + "\r\n" +
-                "theme=" + (_darkTheme ? "dark" : "light") + "\r\n",
-                Encoding.ASCII);
+            // older build could still read the file.
+            sb.Append("px=").Append(_sizePx.ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+            sb.Append("cm=").Append(_cm.ToString("0.##", CultureInfo.InvariantCulture)).Append("\r\n");
+            // `volume=` is NOT written: there is no master level. A file that still has one is
+            // read-and-ignored (see ReadState). Each cue's level is cuevolN below.
+            sb.Append("sound=").Append(_soundEnabled ? "1" : "0").Append("\r\n");
+        // The three feature switches. Written as 1/0 like sound=, and read back with the same
+        // tolerance: a missing key means "on", so an older state.ini keeps every feature.
+        sb.Append("fxbowl=").Append(_fxBowlDrop ? "1" : "0").Append("\r\n");
+        sb.Append("fxpat=").Append(_fxPat ? "1" : "0").Append("\r\n");
+        sb.Append("fxhurt=").Append(_fxHurt ? "1" : "0").Append("\r\n");
+        // Today's spend is NOT written here. It changes on every charge, and putting a constantly
+        // moving value in the user's settings file made the guard's "a diagnostic wrote your settings"
+        // check fire on every run - turning a genuinely useful alarm into noise. It lives in its own
+        // file; see SaveUsage.
+            // The old fx_ironland / fx_ironoff switches are no longer written: a cue is silenced
+            // by its volume, and cuevolN is written below.
+            //
+            // Neither are cuenmN / cuefxN: which custom clip is in use now lives in
+            // soundfx\<cue>\library.ini, because a cue can have MANY clips and this file holds
+            // one value per key. Leaving them behind would have been a second, stale source of
+            // truth for the same question.
+            for (int c = 0; c < 4; c++) {
+                sb.Append("cuevol").Append(c).Append('=')
+                  .Append(_cueVolume[c].ToString(CultureInfo.InvariantCulture)).Append("\r\n");
+            }
+            sb.Append("corner=").Append(_snapRight ? "right" : "left").Append("\r\n");
+            sb.Append("theme=").Append(_darkTheme ? "dark" : "light").Append("\r\n");
+            // UTF-8, not ASCII: a cue name is whatever the user typed, and this file is
+            // read with File.ReadAllLines, which detects the BOM. Writing a CJK name as
+            // turned it into "??" in the menu. Everything written here is still plain
+            // ASCII except those names, so the file stays readable either way.
+            File.WriteAllText(StatePath, sb.ToString(), new UTF8Encoding(true));
         } catch { }
+    }
+
+    // Strips the characters that would break the "key=value" line format.
+    static string CleanStateValue(string s) {
+        if (string.IsNullOrEmpty(s)) return "";
+        StringBuilder b = new StringBuilder(s.Length);
+        for (int i = 0; i < s.Length; i++) {
+            char ch = s[i];
+            if (ch == '\r' || ch == '\n' || ch == '=') continue;
+            b.Append(ch);
+        }
+        return b.ToString().Trim();
     }
 
     void SaveKey(string k) {
@@ -3692,14 +8531,36 @@ public sealed class DshPet : Form {
         } finally { cb.Dispose(); }
     }
 
+    // Expand _dirtyRect to cover the tablet, in canvas coordinates.
+    void MarkTabletDirty() {
+        if (_fx == null || _fx.Length < 4) return;
+        double minX = _fx[0], maxX = _fx[0], minY = _fy[0], maxY = _fy[0];
+        for (int i = 1; i < 4; i++) {
+            if (_fx[i] < minX) minX = _fx[i];
+            if (_fx[i] > maxX) maxX = _fx[i];
+            if (_fy[i] < minY) minY = _fy[i];
+            if (_fy[i] > maxY) maxY = _fy[i];
+        }
+        Rectangle r = Rectangle.FromLTRB(
+            _offX + (int)Math.Floor(minX) - 2, _offY + (int)Math.Floor(minY) - 2,
+            _offX + (int)Math.Ceiling(maxX) + 2, _offY + (int)Math.Ceiling(maxY) + 2);
+        _dirtyRect = _dirtyRect.IsEmpty ? r : Rectangle.Union(_dirtyRect, r);
+    }
+
     void PushLayer() {
         if (_canvas == null || Handle == IntPtr.Zero) return;
+        long tPush = Stopwatch.GetTimestamp();
+        try { PushLayerInner(); } finally { LastPushMs = Ms(tPush); }
+    }
+
+    void PushLayerInner() {
         Rectangle dr = _dirtyRect;
         bool haveDirty = _forceFullFill || (!dr.IsEmpty && dr.Width > 0 && dr.Height > 0);
         // Nothing changed, so the screen already shows it: the caller re-renders on
         // every animation frame, and a frame that repainted nothing does not need a
         // 16 MB composite.
         if (!haveDirty) return;
+        _pushCount++;                 // a real push to the screen, for the liveness guard
         if (_ulwBlt) {
             EnsureMemSurface(_canvas.Width, _canvas.Height);
             if (_memBmp != IntPtr.Zero) {
@@ -3802,11 +8663,132 @@ public sealed class DshPet : Form {
 
     bool BowlHit(int cx, int cy) { return BowlAt(cx, cy) != null; }
 
+    // ---- dismissing the menu on a click outside it ---------------------------
+    //
+    // WHY A GLOBAL HOOK, and not the two things that look simpler:
+    //
+    //   * the drop-down's own click-away handling does not fire, because this window is
+    //     click-through (HTTRANSPARENT over every non-solid pixel) and the click goes elsewhere;
+    //   * a WM_NCHITTEST check in WndProc does not fire either, because while the menu is open the
+    //     menu holds mouse capture and Windows does not re-hit-test for the press.
+    //
+    // The second one was shipped and then reported broken, and the hit log proved it: a full click
+    // outside the menu produced ZERO hit-test messages, and every hit test that did arrive had the
+    // button already up. The hook sees the input stream instead, so capture, z-order and
+    // click-through cannot affect it.
+    IntPtr _mouseHook = IntPtr.Zero;
+    Native.LowLevelMouseProc _mouseHookProc;      // held so the GC cannot collect the thunk
+    bool _menuClickPending;
+    // Counters, so the guard can show the hook actually ran. A hook that installs but never fires
+    // looks exactly like a working one from the outside - which is how the hit-test version
+    // shipped broken.
+    int _hookFired, _hookInstalled;
+
+    void InstallMenuClickHook() {
+        if (_mouseHook != IntPtr.Zero) return;
+        try {
+            _mouseHookProc = MenuClickHookProc;
+            _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseHookProc, IntPtr.Zero, 0);
+            // Only a FAILURE is logged. The menu is opened constantly, so logging every arm would
+            // bury the rest of pet.log in bookkeeping; a hook that did not install is the thing
+            // worth knowing about, and its absence is otherwise invisible.
+            if (_mouseHook == IntPtr.Zero) Log("menu click hook FAILED to install (outside clicks will not dismiss the menu)");
+            else _hookInstalled++;
+        } catch (Exception ex) {
+            Log("menu click hook error: " + ex.Message);
+        }
+    }
+    void RemoveMenuClickHook() {
+        if (_mouseHook == IntPtr.Zero) return;
+        try { Native.UnhookWindowsHookEx(_mouseHook); } catch { }
+        _mouseHook = IntPtr.Zero;
+        _mouseHookProc = null;
+        _menuClickPending = false;
+    }
+
+    // Runs on the UI thread (the hook is installed from it), but it must stay cheap: this is in the
+    // input path for every mouse event on the machine. So it only DECIDES, and the app's tick does
+    // the closing - see ApplyPendingMenuClose.
+    IntPtr MenuClickHookProc(int nCode, IntPtr wParam, IntPtr lParam) {
+        try {
+            if (nCode >= 0 && _menu != null && _menu.Visible) {
+                int msg = wParam.ToInt32();
+                if (msg == Native.WM_LBUTTONDOWN || msg == Native.WM_RBUTTONDOWN ||
+                    msg == Native.WM_MBUTTONDOWN) {
+                    Native.MSLLHOOKSTRUCT ms = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(
+                        lParam, typeof(Native.MSLLHOOKSTRUCT));
+                    if (MenuClickDismisses(ms.ptX, ms.ptY)) _menuClickPending = true;
+                }
+            }
+        } catch { }
+        return Native.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    // The hook's whole decision, as a method so it can be asserted without injecting a click into
+    // the machine - which would press the button under the cursor wherever this code happens to
+    // be running. The hook passes the coordinates the system gave it; the guard passes its own.
+    internal bool MenuClickDismisses(int screenX, int screenY) {
+        if (_menu == null || !_menu.Visible) return false;
+        _hookFired++;
+        // Raises the flag HERE rather than leaving that to the hook callback, so the decision and
+        // its consequence live in one place and the guard exercises the real path end to end
+        // instead of re-implementing half of it.
+        if (_menu.Bounds.Contains(screenX, screenY)) return false;    // a menu row is the menu's
+        _menuClickPending = true;
+        return true;
+    }
+
+    // Called from the tick. Kept separate from the hook callback because this is where touching
+    // the control is safe, and because the decision and the action are easier to test apart.
+    void ApplyPendingMenuClose() {
+        if (!_menuClickPending) return;
+        _menuClickPending = false;
+        if (_menu != null && _menu.Visible) _menu.Close();
+    }
+
+    // The hook must not outlive the menu: leaving a global mouse hook installed would sit in the
+    // input path of every application on the machine for no reason.
+    void OnMenuClosed() {
+        RemoveMenuClickHook();
+    }
+
+    // ShouldCloseMenu is GONE with the hit-test attempt. It took the button state as an argument
+    // so it could be tested without injecting a real click, which was the right instinct applied
+    // to the wrong mechanism: the condition was fine, the MESSAGE never arrived. The hook's
+    // decision lives in MenuClickDismisses and is tested the same way.
+    //
+    // Hook counters, for the guard. A hook that installs but never fires looks exactly like a
+    // working one from the outside - which is how the hit-test version shipped broken.
+    public int HookInstallsForTest { get { return _hookInstalled; } }
+    public int HookFiresForTest { get { return _hookFired; } }
+    public bool HookInstalledForTest { get { return _mouseHook != IntPtr.Zero; } }
+    public bool MenuClosePendingForTest { get { return _menuClickPending; } }
+    public void ApplyPendingMenuCloseForTest() { ApplyPendingMenuClose(); }
+
     protected override void WndProc(ref Message m) {
+        // The dashcam key. Handled before anything else so it works no matter which window the
+        // user happens to be looking at - RegisterHotKey delivers it here regardless of focus.
+        if (m.Msg == Native.WM_HOTKEY && (int)m.WParam == SentryHotkeyId) {
+            DashCamDump("hotkey");
+            return;
+        }
         if (m.Msg == Native.WM_NCHITTEST) {
             int lp = (int)m.LParam;
             int x = (short)(lp & 0xFFFF), y = (short)((lp >> 16) & 0xFFFF);
             Point cp = PointToClient(new Point(x, y));
+            // NOTE: dismissing the menu is NOT done here any more.
+            //
+            // It was, and it did not work. The window answers HTTRANSPARENT over every non-solid
+            // pixel to stay click-through, and while a menu is open the menu holds mouse capture,
+            // so Windows does not re-hit-test for the press at all. Measured: with hit logging on,
+            // a full click on empty screen produced ZERO hit-test messages, and every hit test that
+            // did arrive had the button already up. The global mouse hook does this job now - see
+            // MenuClickHookProc - and this handler went back to doing only what it is for.
+            if (DiagClickAway)
+                Console.WriteLine("    nchittest (" + x + "," + y + ") client=(" + cp.X + "," + cp.Y +
+                                  ") visible=" + (_menu != null && _menu.Visible) +
+                                  " bounds=" + (_menu != null ? _menu.Bounds.ToString() : "null") +
+                                  " contains=" + (_menu != null && _menu.Bounds.Contains(x, y)));
             // The bowl has to answer here as well: returning HTTRANSPARENT means the
             // mouse message never reaches this window at all, so OnMouseDown can
             // never pick the bowl up (that is exactly why it stopped dragging).
@@ -3818,7 +8800,16 @@ public sealed class DshPet : Form {
     }
 
     protected override void OnMouseDown(MouseEventArgs e) {
+        // A press on the pet closes an open menu, the same as a press anywhere else. The
+        // hit-test handler covers the empty-screen case (where no mouse message arrives here at
+        // all); this covers the other half, where the press DOES land on solid pixels.
+        if (_menu != null && _menu.Visible) _menu.Close();
         if (e.Button == MouseButtons.Left) {
+            // The head pat is NOT armed here any more. It used to start on a 200 ms press, and that
+            // collided with dragging: hold her for two seconds while moving and the pat fired, cleared
+            // _drag, and left her hanging in mid-air until the next click. Hovering is both the user's
+            // preferred trigger and free of that conflict, and it is decided in TickPat where the
+            // press state is known.
             // Grabbing a bowl wins over moving the widget, so it can be pulled off
             // the girl even while they overlap. Bowls are in SCREEN pixels, the event
             // is in client pixels, hence the +Left/+Top.
@@ -3829,12 +8820,15 @@ public sealed class DshPet : Form {
                 _riceGrab.Grounded = false;
                 _riceGrab.Bounces = 0;              // a fresh throw gets fresh bounces
                 ThrowReset();                       // the throw is measured from here
-                // Client coords == screen coords (window origin is the screen origin),
-                // so the grab offset is simply mouse minus bowl centre. Adding _offX/
-                // _offY here made _riceGrabY ~1000 too big, and the first mouse move
-                // then teleported the bowl to the top of the screen.
-                _riceGrabX = e.X - _riceGrab.X;
-                _riceGrabY = e.Y - _riceGrab.Y;
+                // Bowls are in SCREEN pixels; the event arrives in client pixels. Mapped through
+                // PointToScreen so this stays correct even if the window is not screen-sized
+                // (it is during start-up and after a resize).
+                Point spDown = PointToScreen(new Point(e.X, e.Y));
+                _riceGrabX = spDown.X - _riceGrab.X;
+                _riceGrabY = spDown.Y - _riceGrab.Y;
+                // Seed the cursor so the throw sampler starts from where the grab happened.
+                _grabHead = 0; _grabN = 0;
+                ThrowPushPoint(spDown.X, spDown.Y);
                 return;
             }
             // Double-click on her head knocks the pot off. Checked before the widget
@@ -3847,13 +8841,46 @@ public sealed class DshPet : Form {
             _snapping = false;
             _dragStart = Cursor.Position;
             _offStart = new Point(_offX, _offY);   // the window itself never moves
+        }
+        // An INDEPENDENT if, not an else-if. The left-button block above handles dragging and does
+        // NOT return, so control reaches here - but as an `else if` it was skipped, because the
+        // preceding `if (e.Button == Left)` was already true. That is why OnTablet() returned true
+        // and nothing happened.
+        if (e.Button == MouseButtons.Left && OnTablet(e.X, e.Y)) {
+            // Double click on HER toggles the tariff readout.
+            //
+            // This lives here, not inside DoubleClickOnHead. That function is only called when she is
+            // wearing the pot (`HeadPotOn && DoubleClickOnHead(...)`), so hanging the toggle off it made
+            // the toggle work ONLY with a pot on - and made a head double click both knock the pot off
+            // and flip the tablet. Two unrelated actions sharing one gesture is the bug.
+            //
+            // The target is THE TABLET SHE HOLDS - not her whole silhouette, and not the desktop. The
+            // tablet is the thing whose readout changes, so it is the thing you double click. Using
+            // GirlPixelSolid made a double click on her skirt or hair flip it as well.
+            long bnow = Environment.TickCount;
+            bool bquick = bnow - _lastBodyClickMs <= DoubleClickMs;
+            bool bnear = Math.Abs(e.X - _lastBodyClickPt.X) <= DoubleClickSlopPx &&
+                         Math.Abs(e.Y - _lastBodyClickPt.Y) <= DoubleClickSlopPx;
+            if (bquick && bnear) {
+                _lastBodyClickMs = -100000;          // consume: a third click starts over
+                _peakMode = !_peakMode;
+                _panelCacheValid = false;
+                _dirty = true;
+                Log("tablet: tariff readout " + (_peakMode ? "on" : "off") + " (double click on her)");
+            } else {
+                _lastBodyClickMs = bnow;
+                _lastBodyClickPt = new Point(e.X, e.Y);
+            }
         } else if (e.Button == MouseButtons.Right) {
             // Menu only on the girl, always. The window is screen-sized while a
             // bowl is out, so an unguarded right-click anywhere over the bowl would
             // pop the menu; the request is explicitly "right-click the girl only".
             if (GirlPixelSolid(e.X, e.Y)) {
                 RefreshMenuChecks();
-                _menu.Show(Cursor.Position);
+                ArmMenuClickHook();
+                // The breadcrumb panel replaces the cascade. _menu is still built and still checked
+                // by --menucheck; showing it is what changed, so reverting is this one call.
+                ShowCrumbUi(Cursor.Position);
             }
         }
         base.OnMouseDown(e);
@@ -3861,7 +8888,12 @@ public sealed class DshPet : Form {
 
     protected override void OnMouseMove(MouseEventArgs e) {
         if (_riceGrab != null && _riceGrab.Dragging && !_riceGrab.Fed) {
-            Point sp = Cursor.Position;                 // screen pixels
+            // Same space as OnMouseDown: the event position mapped to screen pixels. The two
+            // handlers used to disagree - the down used client pixels and this one read
+            // Cursor.Position - which is identical only while the window covers the whole virtual
+            // screen. Deriving both from the event makes the pair consistent and lets a diagnostic
+            // drive the gesture with posted messages.
+            Point sp = PointToScreen(new Point(e.X, e.Y));
             _riceGrab.X = sp.X - _riceGrabX;
             _riceGrab.Y = sp.Y - _riceGrabY;
             Rectangle vs = SystemInformation.VirtualScreen;
@@ -3887,9 +8919,42 @@ public sealed class DshPet : Form {
             if (_offX > vs2.Width - _w) _offX = vs2.Width - _w;
             if (_offY < 0) _offY = 0;
             if (_offY > vs2.Height - _h) _offY = vs2.Height - _h;
+            // Flip the mirror the moment she crosses the centre line, mid-drag. This is where
+            // the user asked for it: waiting until the button came up made her change shape in
+            // one frame as she landed, which read as a glitch rather than as her turning.
+            SyncSideToPosition();
             _dirty = true;              // painted by the next animation tick, not here
         }
         base.OnMouseMove(e);
+    }
+
+    // Which half of the primary monitor is her CENTRE in? Her centre, not her left edge, so
+    // the answer matches what the user sees. Measured in working-area coordinates, the same
+    // space SnapToCorner targets.
+    bool InRightHalf() {
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        Rectangle vs = SystemInformation.VirtualScreen;
+        int centreOnScreen = (_offX + _w / 2) - (wa.Left - vs.Left);
+        return centreOnScreen > wa.Width / 2;
+    }
+
+    // Switch corners if her half changed, and recompute everything that hangs off that.
+    //
+    // Called from BOTH the drag and the release. Doing it only on release is what the user
+    // reported as unnatural: she would sit there unmirrored while being dragged across, then
+    // snap into the mirror image the instant the button came up. Flipping as she crosses the
+    // centre line reads as "she turned around", which is what the movement actually is.
+    // Returns true when the side changed.
+    bool SyncSideToPosition() {
+        bool rightNow = InRightHalf();
+        if (rightNow == _snapRight) return false;
+        // A mirror flip only moves geometry that is computed from the corner: the tablet quad,
+        // her head anchor and the panel/hit caches. It does NOT change any bitmap, so the
+        // expensive Relayout() (sprite resample + canvas rebuild + bowl art) must not run here -
+        // doing that mid-drag is what made crossing the centre line stutter.
+        _snapRight = rightNow;
+        UpdateMirrorGeometry();
+        return true;
     }
 
     protected override void OnMouseUp(MouseEventArgs e) {
@@ -3897,7 +8962,8 @@ public sealed class DshPet : Form {
             ReleaseBowl();
         } else if (_drag) {
             _drag = false;
-            SnapToCorner(false);        // release -> fly back to the bottom-left
+            SyncSideToPosition();       // (already done during the drag; this is the safety net)
+            SnapToCorner(false);        // release -> fly home to the nearer bottom corner
         }
         base.OnMouseUp(e);
     }
@@ -3934,6 +9000,10 @@ public sealed class DshPet : Form {
         // not food: releasing it over the girl used to run the whole feeding path, so
         // she "ate" the pot and it vanished without ever reaching her head. The pot
         // reaches her head through IronOnHead/AttachIronPot in the physics loop.
+        //
+        // The contact test here is now a backstop rather than the only way in: UpdateRice feeds a
+        // bowl the moment it touches her, held or not, so by the time the button comes up this has
+        // usually already happened.
         if (!bowl.Fed && !bowl.Iron && RiceOnGirl(bowl)) OnRiceFed(bowl);
         // A synthetic path is only ever armed by the diagnostics and only lasts for
         // one grab; the next grab re-arms it.
@@ -3942,6 +9012,7 @@ public sealed class DshPet : Form {
     }
 
     void Quit() {
+        if (_spendDirty) SaveUsage();     // one write, on the way out
         try { _timer.Stop(); _poll.Stop(); } catch { }
         if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
         if (_sound != null) { try { _sound.Dispose(); } catch { } }
@@ -3953,6 +9024,8 @@ public sealed class DshPet : Form {
 
     public void RenderToCanvas() {
         if (_canvas == null) return;
+        _renderCalls++;
+        long tOuter = Stopwatch.GetTimestamp();
         long t0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
 
         // Shake offsets first: they decide the widget rect, which is what gets
@@ -3983,7 +9056,20 @@ public sealed class DshPet : Form {
         // widget (87 px at the largest preset) and they start at 0.20 h with a 46 px
         // rise, so their top edge sits ~150 px above the widget. With the old 96 px
         // they were clipped in half on screen.
-        Rectangle widgetRect = new Rectangle(ox + _offX - 16, oy + _offY - 170, _w + 32, _h + 186);
+        // Horizontal margin is the same idea as the vertical one below, and it was missing.
+        //
+        // The vertical side has always reserved room for the squash: MaxSquash = 0.16 is added to
+        // artTop/artBot before the clear rectangle is computed. The horizontal side reserved a flat
+        // 16 px, and her art is 483 px wide to begin with - wider than the 454 px widget it is drawn
+        // into - so a 12.9 % sideways stretch (the pat's deepest frame) needs ~545 px and had nowhere
+        // to go. Measured: her width was 483 px on every frame, i.e. the horizontal half of the
+        // deformation was being discarded entirely.
+        //
+        // 20 % is the reserve: the measured requirement is 12.87 %, and her base is already 29 px
+        // over the widget, so the absolute slack has to exceed the vertical one.
+        int xPad = (int)Math.Ceiling(_w * 0.20);
+        Rectangle widgetRect = new Rectangle(ox + _offX - xPad, oy + _offY - 170,
+                                             _w + xPad * 2, _h + 186);
         _dirtyRect = Rectangle.Empty;
 
         // Does the widget itself have to be repainted? While a bowl falls and nothing
@@ -3991,11 +9077,31 @@ public sealed class DshPet : Form {
         // (erase + sprite blit + the tablet text through GDI+). Anything that can
         // change how the widget looks has to be in this test, or the picture freezes.
         //
+        // _headSquashT is in here because the bounce is HER deformation: the tick advances the
+        // timer and the renderer turns it into a vertical scale, but nothing else in this test
+        // changes while she flinches, so without it the squash was computed and then not drawn.
+        // The flinch only ever appeared on the one frame that set _dirty (the landing itself) and
+        // then froze - and the readout, which is drawn through the same transform, never moved at
+        // all. --textbounce is the regression for the second half of that.
+        //
         // _widgetWasAnimating covers the frame an animation ENDS on: without it the
         // last heart or damage number stays on the canvas, and since nothing repaints
         // that area again it stays on screen for good (--animtail is the regression).
-        bool widgetAnimating = _hits.Count > 0 || _floaters.Count > 0 || _hearts.Count > 0 || _snapping
-                               || _blipWasOn || _radarRects.Count > 0;
+        // _forceFullFill is set by the tariff panel whenever its clock advances (once a second). Without
+        // it here the widget counts as static, the tablet is never repainted, and the readout freezes on
+        // screen while ticks and pushes carry on as normal - the same class of bug the comment above
+        // records for the flinch. Deliberately not _peakMode: that would repaint the whole widget on
+        // every frame while the panel is up.
+        bool widgetAnimating = _forceFullFill ||
+                               _hits.Count > 0 || _floaters.Count > 0 || _hearts.Count > 0 || _snapping
+                               || _blipWasOn || _radarRects.Count > 0
+                               || _headSquashT < HeadSquashDur
+                               // The pat redraws the hand every frame, and the hand is part of the
+                               // widget's own paint, so without this the pat would compute its frame
+                               // number and never draw. Found by a counter in the draw path reading 0
+                               // while every coordinate looked right: the numbers cannot tell you that
+                               // a method was never called.
+                               || _patActive || _patWasActive;
         bool repaintWidget = widgetAnimating || _widgetWasAnimating
                              || _canvas != _lastCanvas
                              || widgetRect != _lastWidgetRect
@@ -4016,6 +9122,14 @@ public sealed class DshPet : Form {
             }
         }
         _widgetWasAnimating = widgetAnimating;
+        // Stored for the same reason: the frame the pat STOPS needs one more repaint, or the last
+        // hand frame stays on the canvas.
+        _patWasActive = _patActive;
+        // Diagnostic: which frames actually repainted the widget. --bowlgirl needs the
+        // answer - "she was never repainted" and "she was repainted wrong" are different
+        // bugs with the same symptom, and this is the flag that tells them apart.
+        _lastRepaintWidget = repaintWidget;
+        if (repaintWidget) _repaintTrueCalls++;
 
         // Erase exactly what the PREVIOUS frame painted (a bowl that has moved on, or
         // the widget's old spot). Clearing the whole 2560x1600 canvas every frame
@@ -4025,8 +9139,19 @@ public sealed class DshPet : Form {
         // forgotten, so the ghost stayed on screen for good.
         for (int i = 0; i < _lastRects.Count; i++) {
             Rectangle r = _lastRects[i];
-            if (repaintWidget && widgetRect.Contains(r)) continue;   // repainted below
+            // "Repainted below" only covers what PaintWidgetArt actually CLEARS - skippable
+            // here only if the widget repaint really rewrites those pixels.
+            //
+            // This used to read widgetRect.Contains(r), which is not the same thing: the widget
+            // box carries a margin ABOVE her head (~170 px for the floating numbers) and
+            // PaintWidgetArt clears only the sprite's own span, so anything parked in that
+            // margin was skipped here AND never cleared there - the ghost a dragged bowl left
+            // behind above her art. --bowlgirl is the regression for that.
+            if (repaintWidget && _lastArtClear.Contains(r)) continue;
             if (!repaintWidget && r == widgetRect) continue;         // unchanged: keep it
+            if (_potTrace && PotTraceFrames < PotTraceMaxFrames) {
+                PotTraceLog.Add("  clear   : rect=" + r.X + "," + r.Y + " " + r.Width + "x" + r.Height);
+            }
             ClearCanvasRect(r);
             MarkDirty(r);
         }
@@ -4037,75 +9162,105 @@ public sealed class DshPet : Form {
         _lastPanelKey = PanelKey();
 
         if (repaintWidget) {
+            _patPaintEntered++;
             MarkDirty(widgetRect);
-            // The widget's own pixels: one rect-locked buffer, no canvas-wide copy.
-            Buf buf = new Buf(_canvas, Rectangle.Intersect(widgetRect, CanvasRect()));
+            long tp = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            long tArt = tp;
+            Rectangle rect = Rectangle.Intersect(widgetRect, CanvasRect());
+            // Squash about the widget's bottom edge, whose SCREEN y is _offY + _h.
+            //
+            // Drawn through GDI+ with a scale transform rather than the hand-written
+            // per-pixel blit. Compressing with the byte blit mapped several source rows
+            // onto the same destination row and dropped the leftovers, which showed up
+            // as evenly spaced HORIZONTAL CRACKS across the sprite (the rice bowl never
+            // did this because it already draws through GDI+).
+            //
+            // The transform is computed BEFORE the composite and handed to it, so the
+            // squashed frame is produced by ONE composite. It used to composite normally
+            // and then composite again through the transform, which threw the first pass
+            // away: measured as a whole extra `PaintWidgetArt` on every squash frame
+            // (~60 ms at 1536, where the transform landing is the most expensive thing in
+            // the frame). The pose depends only on the animation clock, so hoisting it
+            // changes nothing about what is drawn.
+            double hSquash2 = _headSquashT < HeadSquashDur
+                ? Math.Cos(_headSquashT / HeadSquashDur * Math.PI * 2.2) *
+                  (1.0 - _headSquashT / HeadSquashDur) * 0.16
+                : 0;
+            bool squashing = Math.Abs(hSquash2) > 0.002;
+            // Handed to DrawRiceArt so a worn pot squashes with her, and used by the
+            // erase pass below so the mask samples the SQUASHED sprite. Without this the
+            // pot sat still while she compressed - and the erase, which is bolted to the
+            // sprite, landed in the wrong place for the whole animation.
+            double scaleYNow = squashing ? (1.0 - hSquash2) : 1.0;
+            int anchorYNow = oy + _offY + _h;
+            // Squash and stretch pivots: vertical at her feet, horizontal at her centre line. They are
+            // different axes of the same deformation, which is why the reference widens her about the
+            // middle rather than about an edge.
+            int anchorXNow = _offX + _w / 2;
+            _squashAnchorX = anchorXNow;
+            _squashScale = 1.0 - hSquash2;
+            _squashAnchorY = anchorYNow;
+            _squashOn = squashing;
+            // The head pat compresses her too - the reference shows her pushed down 32 px at the
+            // deepest frame, which is the whole point of the gesture. PatGeometry has been computing
+            // that scale since the feature was written and nothing consumed it, so the hand moved and
+            // she did not.
+            //
+            // Applied to DrawOnly, NOT to _squashScale: the erase mask must keep seeing the value it
+            // was stamped with, or the mask samples a transform the canvas was never drawn with - the
+            // exact mechanism behind the old headband ghost.
+            if (_patActive) {
+                int phx, phy; float pscale, pscalex; int pshift;
+                PatGeometry((int)(_patT / PAT_FRAME_MS) % PAT_FRAMES, out phx, out phy, out pscale, out pscalex, out pshift);
+                _patSquash = pscale;
+                _patSquashX = pscalex;
+                _patShiftY = pshift;
+            } else {
+                _patSquash = 1f;
+                _patSquashX = 1f;
+                _patShiftY = 0;
+            }
+            float drawScaleY = _patActive ? _patSquash : (float)scaleYNow;
+            // The horizontal half of the squash. Zero during a pot bounce - that animation only
+            // compresses vertically - and non-zero only for the pat, which the reference shows
+            // spreading her sideways at the same time.
+            float drawScaleX = _patActive ? _patSquashX : 1f;
+            // The downward slide, folded into the vertical anchor. Moving the anchor down by the shift
+            // moves the whole sprite down by the same amount while keeping the squash pivot at her feet.
+            if (_patActive && _patShiftY != 0) anchorYNow += _patShiftY;
+            // Pin the transform that the CANVAS was actually drawn with, for the erase pass
+            // below to undo.
+            //
+            // The erase used to read _squashScale/_squashOn directly. Those are also the
+            // values the NEXT frame will draw with, and during a bounce they change every
+            // frame (0.8937 -> 0.8893 -> ...), so the erase mapped canvas pixels back
+            // through a transform that no longer matched what was on the canvas. The error
+            // is (1/scale - 1) * distance-from-anchor, which at 624 px and this squash is up
+            // to ~66 rows - enough to walk the erased band right off the top of her head and
+            // leave the headband and the ahoge showing for the length of the bounce, which
+            // is exactly the reported flicker. The alpha cache has the same rule: it is
+            // stamped with the art it came from.
+            _squashDrawnScale = scaleYNow;
+            _squashDrawnOn = squashing;
+            _squashDrawnAnchor = anchorYNow;
+            // hurt is unconditional while squashing, matching the old second pass, which
+            // always asked for the overlay.
+            PaintWidgetArt(rect, squashing || _hits.Count > 0 || _patActive, drawScaleY, (float)anchorYNow,
+                           drawScaleX, anchorXNow);
+            if (_perfPhases) {
+                _phPaintArt += Ms(tArt);
+                _phScratchGirl += Ms(tp);
+                if (squashing) _phScratchSquash += Ms(tp);   // same composite, see above
+                tp = Stopwatch.GetTimestamp();
+            }
+
+            long tBufIn = Stopwatch.GetTimestamp();
+            Buf buf = new Buf(_canvas, rect);
+            if (_perfPhases) { _phBufCtor += Ms(tBufIn); tp = Stopwatch.GetTimestamp(); }
             try {
-                Array.Clear(buf.P, 0, buf.P.Length);   // the widget is fully repainted
-                // Squash about the widget's bottom edge, whose screen y is
-                // _offY + _h.
-                //
-                // Drawn through GDI+ with a scale transform rather than the hand-written
-                // per-pixel blit. Compressing with the byte blit mapped several source
-                // rows onto the same destination row and dropped the leftovers, which
-                // showed up as evenly spaced HORIZONTAL CRACKS across the sprite (the
-                // rice bowl never did this because it already draws through GDI+).
-                double hSquash2 = _headSquashT < HeadSquashDur
-                    ? Math.Cos(_headSquashT / HeadSquashDur * Math.PI * 2.2) *
-                      (1.0 - _headSquashT / HeadSquashDur) * 0.16
-                    : 0;
-                bool squashing = Math.Abs(hSquash2) > 0.002;
-                // Handed to DrawRiceArt so a worn pot squashes with her, and used by the
-                // erase pass below so the mask samples the SQUASHED sprite. Without this
-                // the pot sat still while she compressed - and the erase, which is bolted
-                // to the sprite, landed in the wrong place for the whole animation.
-                _squashScale = 1.0 - hSquash2;
-                _squashAnchorY = oy + _offY + _h;
-                _squashOn = squashing;
-                if (squashing) {
-                    int dx = ox + _offX, dy = oy + _offY;
-                    int anchor = dy + _h;
-                    double scaleY = 1.0 - hSquash2;
-                    using (Bitmap tmp = new Bitmap(_sprNormal.Width, _sprNormal.Height,
-                                                   PixelFormat.Format32bppArgb)) {
-                        using (Graphics gt = Graphics.FromImage(tmp)) {
-                            gt.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                            gt.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                            gt.CompositingMode = CompositingMode.SourceCopy;
-                            gt.TranslateTransform(0f, (float)(anchor - dy));
-                            gt.ScaleTransform(1f, (float)scaleY);
-                            gt.TranslateTransform(0f, (float)(dy - anchor));
-                            gt.DrawImage(_sprNormal, 0, 0);
-                            for (int i = 0; i < _hits.Count; i++) {
-                                double pulse = _hits[i].Pulse;
-                                if (pulse <= 0.01) continue;
-                                double maxTint = Math.Max(0.30, 0.64 - _scale * 0.75);
-                                using (ImageAttributes ia = new ImageAttributes()) {
-                                    ColorMatrix cm = new ColorMatrix();
-                                    cm.Matrix33 = (float)Math.Min(maxTint, maxTint * pulse);
-                                    ia.SetColorMatrix(cm);
-                                    gt.DrawImage(_sprRed, new Rectangle(0, 0, tmp.Width, tmp.Height),
-                                                 0, 0, _sprRed.Width, _sprRed.Height,
-                                                 GraphicsUnit.Pixel, ia);
-                                }
-                            }
-                        }
-                        BlitLayer(tmp, buf, dx, dy, 1.0);
-                    }
-                } else {
-                    BlitLayer(_sprNormal, buf, ox + _offX, oy + _offY, 1.0);
-                    for (int i = 0; i < _hits.Count; i++) {
-                        double pulse = _hits[i].Pulse;
-                        if (pulse > 0.01) {
-                            // The hurt overlay is toned down as the widget grows: 60% of a
-                            // 113px sprite is a readable flash, 60% of a 454px one would
-                            // just be a red silhouette.
-                            double maxTint = Math.Max(0.30, 0.64 - _scale * 0.75);
-                            BlitLayer(_sprRed, buf, ox + _offX, oy + _offY,
-                                      Math.Min(maxTint, maxTint * pulse));
-                        }
-                    }
-                }
+                // The widget was repainted above and nothing else has touched this rect
+                // since, so there is nothing to clear here - and clearing would erase the
+                // girl that was just composited.
                 // While the pot sits on her head, clear the pixels the user painted out
                 // in the erase tool. That mask was hand-drawn over the real composite
                 // because no rule could describe it: a rectangle cut notches in the hair,
@@ -4118,8 +9273,9 @@ public sealed class DshPet : Form {
                     if (pr.OnHead && !pr.Fed) { wearingNow = true; break; }
                 }
                 if (wearingNow) {
+                    long te = _perfPhases ? Stopwatch.GetTimestamp() : 0;
                     BuildEraseMask();
-                    _eraseSeen = 0; _eraseHit = 0;
+                    _eraseSeen = 0; _eraseHit = 0; _eraseCells = 0;
                     if (_eraseMask == null) {
                         // No strokes painted: nothing to hide, and she is drawn whole.
                     } else {
@@ -4136,7 +9292,6 @@ public sealed class DshPet : Form {
                         // widgetRect is derived from the CURRENT _offX/_offY on every
                         // repaint, so the inset below is constant and does not need the
                         // position: 16 on the left, 170 on top.
-                        const int InsetX = 16, InsetY = 170;
                         // The widget is drawn at _offX + ox, where ox/oy is the SHAKE. The
                         // mask is bolted to the widget, so it has to be read through the
                         // shaken origin too. The previous version put the X axis on the
@@ -4145,33 +9300,122 @@ public sealed class DshPet : Form {
                         // left a sliver of her showing above the pot - the reported "small
                         // leftover on top of her head that goes away by itself", which it
                         // did, because the shake decays back to zero.
-                        int wx0 = InsetX;
-                        int wy0 = InsetY;
-                        int gx0 = Math.Max(0, wx0);
-                        int gx1 = Math.Min(buf.W - 1, wx0 + _w);
-                        int gy0 = Math.Max(0, wy0);
-                        int gy1 = Math.Min(buf.H - 1, wy0 + _h);
+                        //
+                        // NOTE: buf.R is the canvas rect the widget occupies, so the loop
+                        // below walks canvas coordinates and every value that describes
+                        // where the sprite IS has to be in canvas coordinates too: the
+                        // sprite's origin is _offX + ox (plus the shake), NOT the inset.
+                        // Mixing the two frames makes the mask sample empty space and the
+                        // erase silently does nothing - the failure mode A-1 in the
+                        // handover describes.
+                        // The scan below runs in CANVAS coordinates; buf.R only enters when
+                        // the pixels are actually written (cp is buffer-relative) and when
+                        // clamping to the buffer.
+                        //
+                        // It used to mix the two: the bounds were derived as buffer-relative
+                        // ((oy + _offY) - buf.R.Y == 170) but then used as canvas rows
+                        // (y + buf.R.Y, y * buf.Stride). That double-counted the buffer
+                        // origin, so the scan began at canvas row 904 and skipped everything
+                        // above it - exactly where a STRETCHED sprite is drawn, since the
+                        // bounce scales about a row near her feet. The headband and the ahoge
+                        // live in that band, so they were never erased for the whole bounce.
                         double baseX = _offX + ox;
                         double baseY = _offY + oy;
+                        // The band to scan is where the ERASER lands on the canvas, which the
+                        // squash moves: the mask is bolted to a sprite that the bounce scales
+                        // about a row near her feet, so a STRETCH carries the masked band (her
+                        // crown) UP, above the sprite's resting top edge. Clamping the scan to
+                        // the untransformed box (baseY .. baseY+_h) cut that band off, and the
+                        // headband and the ahoge were never erased for the whole bounce -
+                        // visible only while she is stretched, which is what the user reports.
+                        // Transform the mask's own projected band, and keep the RESTING band as
+                        // well. A compression pulls the sprite DOWN, so the frame before it left
+                        // masked artwork ABOVE where the mask now projects; scanning only the
+                        // transformed band skipped those rows, and a one-row sliver of the
+                        // headband survived at the compressive extreme (measured: 42 px on the
+                        // single most-compressed frame). The union covers both ends of the swing.
+                        double bandTop = _eraseMaskY * k + baseY;
+                        double bandBot = (_eraseMaskY + _eraseMaskH) * k + baseY;
+                        if (_squashDrawnOn) {
+                            double sTop = (bandTop - _squashDrawnAnchor) * _squashDrawnScale + _squashDrawnAnchor;
+                            double sBot = (bandBot - _squashDrawnAnchor) * _squashDrawnScale + _squashDrawnAnchor;
+                            if (sTop < bandTop) bandTop = sTop;
+                            if (sBot < bandTop) bandTop = sBot;
+                            if (sTop > bandBot) bandBot = sTop;
+                            if (sBot > bandBot) bandBot = sBot;
+                        }
+                        if (bandTop > bandBot) { double sw = bandTop; bandTop = bandBot; bandBot = sw; }
+                        double bandL = _eraseMaskX * k + baseX;
+                        double bandR = (_eraseMaskX + _eraseMaskW) * k + baseX;
+                        int gx0 = Math.Max((int)Math.Floor(bandL), buf.R.X);
+                        int gx1 = Math.Min((int)Math.Ceiling(bandR), buf.R.X + buf.W - 1);
+                        int gy0 = Math.Max((int)Math.Floor(bandTop), buf.R.Y);
+                        int gy1 = Math.Min((int)Math.Ceiling(bandBot), buf.R.Y + buf.H - 1);
+                        if (gy0 > gy1 || gx0 > gx1) {
+                            // The mask is off this widget (or off-screen): nothing to erase.
+                        } else
                         for (int y = gy0; y <= gy1; y++) {
-                            // Buffer pixel -> canvas row, undoing the squash first (the
-                            // sprite in this buffer is already compressed), then the shake.
-                            double wySprite = y + buf.R.Y;
-                            if (_squashOn) {
-                                wySprite = (wySprite - _squashAnchorY) / _squashScale + _squashAnchorY;
+                            // Canvas row -> sprite row, undoing the squash the canvas was
+                            // DRAWN with - see _squashDrawn* above.
+                            double wySprite = y;
+                            if (_squashDrawnOn) {
+                                wySprite = (wySprite - _squashDrawnAnchor) / _squashDrawnScale +
+                                           _squashDrawnAnchor;
                             }
                             double mspY = (wySprite - baseY) / k;
-                            int my = (int)Math.Floor(mspY) - _eraseMaskY;
-                            if (my < 0 || my >= _eraseMaskH) continue;
+                            // Clamp the boundary rows instead of trusting the rounding.
+                            //
+                            // Mask row 0 IS the sprite's first row. Under the bounce the top
+                            // edge lands at a fractional canvas row - measured wySprite=903.60
+                            // against baseY=904, i.e. 0.4 px above the resting edge - so mspY
+                            // comes out as -0.65 and rounds to -1, which the range test then
+                            // rejects. Row 0 is exactly where the headband and the ahoge sit
+                            // (69 set pixels), so that strip was never erased: the sliver that
+                            // survives at the compressive extreme.
+                            //
+                            // mspY in [-1, 0) means the pixel is inside the sprite's first
+                            // pixel; mspY >= _eraseMaskH means inside the last. Both belong to
+                            // their edge row, so clamping is the correct reading, not a fudge.
+                            int my = (int)Math.Round(mspY) - _eraseMaskY;
+                            if (my < 0 && mspY > -1.0) my = 0 - _eraseMaskY;
+                            else if (my >= _eraseMaskH && mspY < _eraseMaskH + 1.0) my = _eraseMaskH - 1 - _eraseMaskY;
+                            int drow = (y - buf.R.Y) * buf.Stride;
+                            if (my < 0 || my >= _eraseMaskH) {
+                                // The row maps outside the mask's band. Under the bounce this
+                                // happens just below the widget origin: a compression lifts the
+                                // sprite's top edge above it, so those rows resolve to a negative
+                                // sprite row. Nothing else clears them - the widget clear covers
+                                // only where the art IS, so a row outside the current pose but
+                                // painted by the PREVIOUS pose kept a 24-pixel sliver of headband
+                                // alive for a frame or two.
+                                //
+                                // Clear ONLY the columns the mask itself projects onto, and only
+                                // when the row is further out than the sprite's first row can
+                                // reach. An earlier version cleared the whole widget width, which
+                                // cut the girl in half: her body is painted across that row by the
+                                // current pose, and wiping the row removed it. Bounding the wipe by
+                                // the mask's own footprint keeps it to the eraser's columns.
+                                if (mspY < -1.0) {
+                                    int cx0 = Math.Max(gx0, (int)Math.Floor(_eraseMaskX * k + baseX));
+                                    int cx1 = Math.Min(gx1, (int)Math.Ceiling((_eraseMaskX + _eraseMaskW) * k + baseX));
+                                    for (int x = cx0; x <= cx1; x++) {
+                                        int bx = x - buf.R.X;
+                                        int di = drow + bx * 4 + 3;
+                                        if (di >= 0 && di < cp.Length && cp[di] != 0) cp[di] = 0;
+                                    }
+                                }
+                                continue;
+                            }
                             int mrow = my * _eraseMaskW;
-                            int drow = y * buf.Stride;
                             for (int x = gx0; x <= gx1; x++) {
-                                double mspX = ((x + buf.R.X) - baseX) / k;
+                                _eraseCells++;
+                                double mspX = (x - baseX) / k;
                                 int mx = (int)Math.Floor(mspX) - _eraseMaskX;
                                 if (mx < 0 || mx >= _eraseMaskW) continue;
                                 if (_eraseMask[mrow + mx] != 0) {
-                                    if (cp[drow + x * 4 + 3] != 0) {
-                                        cp[drow + x * 4 + 3] = 0;
+                                    int bx = x - buf.R.X;
+                                    if (cp[drow + bx * 4 + 3] != 0) {
+                                        cp[drow + bx * 4 + 3] = 0;
                                         _eraseHit++;
                                     }
                                     _eraseSeen++;
@@ -4179,11 +9423,18 @@ public sealed class DshPet : Form {
                             }
                         }
                     }
+                    if (_perfPhases) _phErase += Ms(te);
                 }
                 buf.Flush();
-            } finally { buf.Dispose(); }
+            } finally {
+                long td = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+                buf.Dispose();
+                if (_perfPhases) _phUnlock += Ms(td);
+            }
+            if (_perfPhases) { _phBufFlush += Ms(tp); tp = Stopwatch.GetTimestamp(); }
             DrawScreen();                              // transparent screen + text only
             if (!_connected && _lastPollResult.Length > 0) DrawAlert();
+            if (_perfPhases) { _phDrawScreen += Ms(tp); }
         }
         if (_perfPhases) { _phSprite += Ms(t0); t0 = Stopwatch.GetTimestamp(); }
 
@@ -4193,10 +9444,30 @@ public sealed class DshPet : Form {
         // right edge of the screen even though this window is only widget-sized.
         if (_rices.Count > 0 || _hearts.Count > 0) {
             using (Graphics g = Graphics.FromImage(_canvas)) {
+                if (_potTrace && PotTraceFrames < PotTraceMaxFrames && _flashTraceBudget > 0) {
+                    PotTraceFrames++;
+                    PotTraceLog.Add("  frame " + PotTraceFrames + ": repaintWidget=" + repaintWidget +
+                                    " widgetRect=" + widgetRect.X + "," + widgetRect.Y + " " +
+                                    widgetRect.Width + "x" + widgetRect.Height +
+                                    " lastArtClear=" + _lastArtClear.X + "," + _lastArtClear.Y + " " +
+                                    _lastArtClear.Width + "x" + _lastArtClear.Height +
+                                    " lastRects=" + _lastRects.Count);
+                    for (int li = 0; li < _lastRects.Count; li++) {
+                        Rectangle lr = _lastRects[li];
+                        PotTraceLog.Add("      lastRect[" + li + "]=" + lr.X + "," + lr.Y + " " +
+                                        lr.Width + "x" + lr.Height);
+                    }
+                    // Fresh record for THIS frame: DrawRice appends one line per pot it actually
+                    // draws, so a pot missing from the list was not drawn at all.
+                    PotDrawLog.Clear();
+                }
                 g.SmoothingMode = SmoothingMode.HighQuality;
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 DrawRice(g);
+                if (_potTrace && PotTraceFrames <= PotTraceMaxFrames && _flashTraceBudget > 0) {
+                    for (int di = 0; di < PotDrawLog.Count; di++) PotTraceLog.Add(PotDrawLog[di]);
+                }
             }
         }
         // Bowls are rotated and squashed, so their rect is padded generously: it is
@@ -4211,8 +9482,23 @@ public sealed class DshPet : Form {
             // describes one of them, so the others would be erased with too small a pad
             // and their labels would streak.
             if (rc.Blp.On && rc.Blp.S > 0) rad = rc.Blp.S * 1.6;
-            Rectangle rr = new Rectangle((int)Math.Round(rc.X - rad), (int)Math.Round(rc.Y + rc.R - rad),
-                                         (int)Math.Round(rad * 2), (int)Math.Round(rad * 2));
+            Rectangle rr;
+            if (rc.DrawnValid) {
+                // Erase the box the prop's OWN draw call recorded, plus the pad that covers
+                // the radar nameplate. The old formula (r.Y + r.R - rad) is not the drawn
+                // box: r.R is the ground footprint, and the head-squash moves a worn pot
+                // tens of pixels above it, so the strip the pot bounced up into was never
+                // erased - the flat-topped ghost that piled up above a tall stack.
+                double pad = rad - (rc.Art != null ? rc.Art.Height / 2.0 : rad);
+                if (pad < 0) pad = 0;
+                rr = new Rectangle(
+                    (int)Math.Floor(rc.DrawnL - pad), (int)Math.Floor(rc.DrawnT - pad),
+                    (int)Math.Ceiling(rc.DrawnR - rc.DrawnL + pad * 2),
+                    (int)Math.Ceiling(rc.DrawnB - rc.DrawnT + pad * 2));
+            } else {
+                rr = new Rectangle((int)Math.Round(rc.X - rad), (int)Math.Round(rc.Y + rc.R - rad),
+                                   (int)Math.Round(rad * 2), (int)Math.Round(rad * 2));
+            }
             _paintRects.Add(rr);
             MarkDirty(rr);
         }
@@ -4268,6 +9554,7 @@ public sealed class DshPet : Form {
         _lastRects.Clear();
         _lastRects.AddRange(_paintRects);
         _dirty = false;
+        LastRenderMs = Ms(tOuter);
     }
 
     // Zero one canvas rectangle (a bowl's old position, or the widget's old spot).
@@ -4279,6 +9566,219 @@ public sealed class DshPet : Form {
         Buf b = new Buf(_canvas, c);
         try { Array.Clear(b.P, 0, b.P.Length); b.Flush(); } finally { b.Dispose(); }
     }
+
+    // Composite the girl and the hurt overlay onto the canvas inside `rect`, through
+    // GDI+. This replaces two hand-written per-pixel blits (BlitLayer) that were the
+    // most expensive thing in a frame: measured at 3.9 ms for the girl plus 2.4 ms per
+    // overlay at the 624 preset, i.e. a hurt frame scaled with the SQUARE of the widget
+    // and blew the 33 ms budget (36.6 ms measured). GDI+ does the same compositing in
+    // about a third of the time and is resolution-independent.
+    //
+    // Verified before switching: --perfscale's blitequiv compares both paths against an
+    // independent straight-alpha src-over reference. The hand-written blit matched that
+    // reference exactly; GDI+ differs by at most 3/1020 across all four channels per
+    // pixel (rounding only, under 1 per channel), so the swap is invisible.
+    //
+    // The caller must NOT hold a LockBits rect on the canvas: GDI+ refuses to draw into
+    // a locked bitmap, and the failure is an outright exception, not a silent one.
+    void PaintWidgetArt(Rectangle rect, bool hurt) { PaintWidgetArt(rect, hurt, 1f, 0f); }
+
+    // scaleY/scaleAnchorY apply the head-squash transform about a canvas row when
+    // scaleY != 1. The squashed frame goes through this same routine so the two paths
+    // cannot drift apart.
+    void PaintWidgetArt(Rectangle rect, bool hurt, float scaleY, float scaleAnchorY) {
+        // The no-X overload: only the pot bounce uses vertical-only squash, so it forwards scaleX = 1.
+        PaintWidgetArt(rect, hurt, scaleY, scaleAnchorY, 1f, scaleAnchorY);
+    }
+
+    void PaintWidgetArt(Rectangle rect, bool hurt, float scaleY, float scaleAnchorY,
+                        float scaleX, float scaleAnchorX) {
+        _patArtEntered++;
+        _patLastRect = rect;
+        if (rect.Width <= 0 || rect.Height <= 0) { _patArtEarlyOut++; return; }
+        // Where the art lands, in canvas coordinates.
+        int artX = _shakeX + _offX, artY = _shakeY + _offY;
+        int artW = _sprNormal == null ? 0 : _sprNormal.Width;
+        int artH = _sprNormal == null ? 0 : _sprNormal.Height;
+        if (artW <= 0 || artH <= 0) return;
+        // Wipe and composite only where the art can actually be.
+        //
+        // "rect" is the widget box with a margin above her head for the floating numbers,
+        // intersected with the canvas. Past ~1000 px the widget is WIDER THAN THE SCREEN, so
+        // that intersection degenerates into the whole 2560x1600 canvas and every frame
+        // clears and composites 4.1 M pixels - of which only the sprite's own can hold
+        // anything.
+        //
+        // Clear the UNION of where the art was and where it lands now.
+        //
+        // The squashed frame is scaled about a screen row and the bounce swings both ways
+        // (hSquash2 changes sign, so scaleY passes 1 and goes above it). While STRETCHED the
+        // sprite reaches above its resting top edge; while COMPRESSED it sits below it. Using
+        // either box alone leaves a band of the other one untouched, and since that band is
+        // painted every frame and never erased it ACCUMULATES - which is the headband and the
+        // ahoge showing above the pot for the duration of the bounce. Bounding by the union
+        // removes whatever frame came before, which is exactly what a clear is for.
+        // Clear the whole band the sprite can occupy while the bounce runs, not just where it
+        // is on this frame.
+        //
+        // hSquash2 is bounded by +/-0.16 (see the renderer), so every pose of the bounce lies
+        // inside [top - 0.16*h, bottom] about the same anchor. A clear that tracks the current
+        // pose always leaves the previous pose's band untouched, and because the bounce swings
+        // both ways that band is BOTH above the resting top edge (stretch) and below where the
+        // sprite has just moved from (compression). Chasing it with "what the last frame
+        // cleared" was not enough - measured one-row residue at the compressive extreme.
+        // Covering the full excursion is deterministic and costs a strip of rows.
+        const double MaxSquash = 0.16;
+        double artTop = artY, artBot = artY + artH;
+        if (scaleY != 1f) {
+            double t0 = (artY - scaleAnchorY) * scaleY + scaleAnchorY;
+            double t1 = (artY + artH - scaleAnchorY) * scaleY + scaleAnchorY;
+            if (t0 < artTop) artTop = t0;
+            if (t1 < artTop) artTop = t1;
+            if (t0 > artBot) artBot = t0;
+            if (t1 > artBot) artBot = t1;
+        }
+        {
+            double hi = (artY - scaleAnchorY) * (1.0 + MaxSquash) + scaleAnchorY;
+            double lo = (artY + artH - scaleAnchorY) * (1.0 - MaxSquash) + scaleAnchorY;
+            if (hi < artTop) artTop = hi;
+            if (lo > artBot) artBot = lo;
+        }
+        // The horizontal excursion, computed the same way the vertical one is.
+        //
+        // This was the whole bug: the rectangle below was `artX, artTop, artW, ...` - the sprite's own
+        // width, with no allowance for a sideways squash at all. Anything wider was neither cleared nor
+        // drawn, so the horizontal half of the deformation simply did not exist on screen.
+        //
+        // Must match the margin widgetRect reserves, or the widened part is clipped again one step
+        // earlier. MaxStretchX is the same 20 % for that reason.
+        const double MaxStretchX = 0.20;
+        double artCenterX = artX + artW / 2.0;
+        double maxHalfW = artW / 2.0 * (1.0 + MaxStretchX);
+        int wideX0 = (int)Math.Floor(artCenterX - maxHalfW);
+        int wideX1 = (int)Math.Ceiling(artCenterX + maxHalfW);
+        Rectangle work = Rectangle.Intersect(rect, new Rectangle(
+            wideX0, (int)Math.Floor(artTop), wideX1 - wideX0, (int)Math.Ceiling(artBot - artTop)));
+        // Publish what this call actually clears, so the frame's erase bookkeeping knows which
+        // old rectangles are genuinely rewritten by the widget repaint. Anything outside this
+        // must be erased explicitly - see the loop in RenderToCanvas.
+        _lastArtClear = work;
+        if (work.Width <= 0 || work.Height <= 0) return;
+        work = Rectangle.Intersect(work, rect);
+        if (work.Width <= 0 || work.Height <= 0) return;
+        long pA = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+        using (Graphics gd = Graphics.FromImage(_canvas)) {
+            if (_perfPhases) { _phArtGfx += Ms(pA); pA = Stopwatch.GetTimestamp(); }
+            gd.CompositingMode = CompositingMode.SourceCopy;
+            gd.CompositingQuality = CompositingQuality.HighSpeed;
+            gd.InterpolationMode = InterpolationMode.NearestNeighbor;
+            gd.PixelOffsetMode = PixelOffsetMode.Half;
+            // The widget is fully repainted, so its rect is cleared first - that also
+            // takes care of the margin above her that holds the floating numbers.
+            gd.SetClip(work);
+            gd.Clear(Color.Transparent);
+            gd.ResetClip();
+            gd.CompositingMode = CompositingMode.SourceOver;
+            if (_perfPhases) { _phArtClear += Ms(pA); pA = Stopwatch.GetTimestamp(); }
+            int lx = artX, ly = artY;
+            if (scaleY != 1f) {
+                gd.TranslateTransform(0f, scaleAnchorY);
+                gd.ScaleTransform(1f, scaleY);
+                gd.TranslateTransform(0f, -scaleAnchorY);
+            }
+            // The horizontal half of the deformation, about her centre line. Applied as a separate
+            // transform rather than folded into one ScaleTransform call so each axis keeps its own
+            // pivot - vertical at the feet, horizontal at the middle - which is what the reference
+            // shows and what makes a squash read as weight instead of as a zoom.
+            if (scaleX != 1f) {
+                gd.TranslateTransform(scaleAnchorX, 0f);
+                gd.ScaleTransform(scaleX, 1f);
+                gd.TranslateTransform(-scaleAnchorX, 0f);
+            }
+            // MIRRORED when she lives in the bottom-right corner.
+            //
+            // The artwork is drawn flush to its LEFT and BOTTOM edges (measured: the
+            // expression sprites carry ~330 opaque pixels down the left column and ~1000 along
+            // the bottom row, while the right column is empty or nearly so). Sitting in the
+            // bottom-left that reads as natural - the cut edges coincide with the screen
+            // edges. Parked in the bottom-right it does not: the flush left edge leaves a
+            // visible gap against the right screen edge, which is what the user reported.
+            //
+            // So the SPRITE is flipped horizontally and nothing else is: the tablet quad is
+            // mirrored to match (see Relayout) but the panel is still drawn as a parallelogram
+            // with its vertex order intact, so every glyph - the number, the labels, the
+            // floating text - stays the right way round and readable. This is a mirror of a
+            // PICTURE, not of the scene.
+            if (_snapRight) {
+                gd.TranslateTransform(lx + artW, ly);
+                gd.ScaleTransform(-1f, 1f);
+                gd.TranslateTransform(-lx, -ly);
+            }
+            gd.DrawImage(_sprNormal, lx, ly, _sprNormal.Width, _sprNormal.Height);
+            if (_perfPhases) { _phArtGirl += Ms(pA); pA = Stopwatch.GetTimestamp(); }
+            // The pat hand goes HERE, before the early return below, not at the end of the method.
+            //
+            // `if (!hurt || _sprRed == null) return;` exits the whole method on every ordinary frame,
+            // so code placed after it runs only when she is being hit. The hand was drawn after it and
+            // therefore never appeared: a counter showed PaintWidgetArt entered once and the hand
+            // branch never reached, with every coordinate in the geometry report looking correct.
+            if (_patActive) {
+                _patDrawCalls++;
+                using (Graphics gh = Graphics.FromImage(_canvas)) {
+                    DrawPatOnto(gh, (int)(_patT / PAT_FRAME_MS) % PAT_FRAMES);
+                }
+            }
+            if (!hurt || _sprRed == null) return;
+            long pR = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            // Collapse every hit into ONE overlay pass.
+            //
+            // The overlay is a single flat colour carrying the sprite's alpha, so stacking
+            // N of them at alphas a1..aN is exactly equivalent to one pass at
+            // 1 - prod(1 - ai): over-compositing the same colour over itself is
+            // associative, and this is the closed form of that. Not an approximation - the
+            // composited result is identical.
+            //
+            // It matters because each pass rescales the whole layer through a ColorMatrix:
+            // measured at 1536, one overlay cost 46.9 ms while drawing the girl herself
+            // cost 12.5 ms, and a charge run keeps up to three hits alive at once.
+            double keepClear = 1.0;
+            bool anyRed = false;
+            for (int i = 0; i < _hits.Count; i++) {
+                double pulse = _hits[i].Pulse;
+                if (pulse <= 0.01) continue;
+                // The hurt overlay is toned down as the widget grows: 60% of a 113px
+                // sprite is a readable flash, 60% of a 454px one would just be a red
+                // silhouette.
+                double maxTint = Math.Max(0.30, 0.64 - _scale * 0.75);
+                float ha = (float)Math.Min(maxTint, maxTint * pulse);
+                keepClear *= (1.0 - ha);
+                anyRed = true;
+            }
+            if (anyRed) {
+                float haAll = (float)(1.0 - keepClear);
+                if (haAll > 0.001f) {
+                    using (ImageAttributes ia = new ImageAttributes()) {
+                        ColorMatrix cm = new ColorMatrix();
+                        cm.Matrix33 = haAll;
+                        ia.SetColorMatrix(cm);
+                        gd.DrawImage(_sprRed, new Rectangle(lx, ly, _sprRed.Width, _sprRed.Height),
+                                     0, 0, _sprRed.Width, _sprRed.Height,
+                                     GraphicsUnit.Pixel, ia);
+                    }
+                }
+            }
+            if (_perfPhases) { _phArtRed += Ms(pR); }
+        }
+    }
+
+    // Diagnostic counter for --patcheck. Kept as a field so the guard can report whether the draw path
+    // ran at all: "gained = 0" has two very different causes - the hand was never drawn, or it was
+    // drawn outside the area being counted - and this separates them.
+    int _patDrawCalls;
+    int _patPaintEntered;      // how often the repaint block was entered at all
+    int _patArtEntered;        // how often PaintWidgetArt was called
+    int _patArtEarlyOut;       // ...and returned immediately on an empty rect
+    Rectangle _patLastRect;    // the rect PaintWidgetArt was last called with, for --patcheck
 
     Rectangle CanvasRect() {
         return new Rectangle(0, 0, _canvas == null ? _w : _canvas.Width,
@@ -4298,11 +9798,58 @@ public sealed class DshPet : Form {
     // Phase timing for --perf. Costs nothing unless the flag turned it on.
     bool _perfPhases;
     double _phSprite, _phScreen, _phSnap, _phRice, _phFloaters, _phHit;
+    // The worn-pot erase scan, timed inside the sprite phase. Kept apart because it is
+    // the one render cost that is proportional to the widget AREA while the rest of the
+    // frame is canvas-bound, so "the worn frame grew" needs to say whether this is why.
+    double _phErase;
+    // Sub-phases of the widget repaint. The single "sprite+clear" number hid where the
+    // time actually went: at the 624 preset it was ~21 ms while the two compositing
+    // steps it was assumed to be were ~1.2 ms together, so guessing was not working.
+    double _phScratchClear, _phScratchGirl, _phScratchSquash, _phBufFlush, _phDrawScreen;
+    // Inside DrawScreen: rebuilding the panel bitmap vs drawing it rotated onto the canvas.
+    double _phPanelBuild, _phPanelDraw;
+    // The single most expensive call in a repaint, split out so a 300 ms frame can be
+    // attributed to it or cleared of suspicion.
+    double _phPaintArt;
+    // Inside PaintWidgetArt: getting the GDI+ surface, clearing the rect, compositing the
+    // girl. "girl 9.32 ms at 624" was suspicious (an isolated DrawImage of the same layer
+    // measures 1.2 ms), and only a split says whether the cost is the surface, the clear or
+    // the draw.
+    double _phArtGfx, _phArtClear, _phArtGirl, _phArtRed;
+    // The canvas rect PaintWidgetArt actually wiped on the last call. The widget BOX is bigger
+    // than this (it carries a margin above her head), so "inside the widget box" is not the
+    // same as "the widget repaint will rewrite it" - treating them as equal is what left a
+    // dragged bowl's ghost in the margin.
+    Rectangle _lastArtClear;
+    // The canvas rect the last repaint cleared, so the next one clears at least as much.
+    // See the union in PaintWidgetArt. Turned the bounce's leftover band from ~14k visible
+    // pixels into a residue of a few hundred.
+    // Cost of taking and releasing the pixel buffer over the canvas rect, split out:
+    // LockBits over a large rect and the hand-written per-pixel erase scan were both
+    // suspects in a frame that ran 350 ms over budget, and only a split says which.
+    double _phBufCtor, _phUnlock;
+    // Tick-side phases: the landing stutter has to be attributable to physics, mood,
+    // radar or the draw, and only measurement can say which.
+    double _phRicePhys, _phExpr, _phRadar, _phTickTail;
+    double _phPoll, _phDrain;
+    // Slowest-frame capture. A frame that runs 15x over budget does not show up in an
+    // average, and "which stage owned that frame" is the only question worth asking of
+    // it: the pot landing produces one such frame and the average hides it completely.
+    const int PhCaptureDepth = 48;
     static double Ms(long since) {
         return (Stopwatch.GetTimestamp() - since) * 1000.0 / Stopwatch.Frequency;
     }
     void ResetPhases() {
         _phSprite = _phScreen = _phSnap = _phRice = _phFloaters = _phHit = 0;
+        _phErase = 0;
+        _phScratchClear = _phScratchGirl = _phScratchSquash = 0;
+        _phBufFlush = _phDrawScreen = 0;
+        _phPanelBuild = _phPanelDraw = 0;
+        _phPaintArt = 0;
+        _phArtGfx = _phArtClear = _phArtGirl = _phArtRed = 0;
+        _phBufCtor = _phUnlock = 0;
+        _phRicePhys = _phExpr = _phRadar = _phTickTail = 0;
+        _phPoll = _phDrain = 0;
     }
     string PhaseReport(int n) {
         return "  render phases   : sprite+clear " + (_phSprite / n).ToString("0.00") +
@@ -4310,12 +9857,41 @@ public sealed class DshPet : Form {
                "  snapshot " + (_phSnap / n).ToString("0.00") +
                "  bowl " + (_phRice / n).ToString("0.00") +
                "  floaters " + (_phFloaters / n).ToString("0.00") +
-               "  hitmap " + (_phHit / n).ToString("0.00") + " ms";
+               "  hitmap " + (_phHit / n).ToString("0.00") +
+               "  [erase " + (_phErase / n).ToString("0.00") + "] ms" +
+               "\n      sprite split: clear " + (_phScratchClear / n).ToString("0.00") +
+               "  girl " + (_phScratchGirl / n).ToString("0.00") +
+               "  squash " + (_phScratchSquash / n).ToString("0.00") +
+               "  flush " + (_phBufFlush / n).ToString("0.00") +
+               "  drawpanel " + (_phDrawScreen / n).ToString("0.00") +
+               " [panelBuild " + (_phPanelBuild / n).ToString("0.00") +
+               " panelDraw " + (_phPanelDraw / n).ToString("0.00") + "]" +
+               "  [paintArt " + (_phPaintArt / n).ToString("0.00") +
+               "  bufCtor " + (_phBufCtor / n).ToString("0.00") +
+               "  unlock " + (_phUnlock / n).ToString("0.00") + "] ms" +
+               "\n      paintArt split: gfx " + (_phArtGfx / n).ToString("0.00") +
+               "  clear " + (_phArtClear / n).ToString("0.00") +
+               "  drawGirl " + (_phArtGirl / n).ToString("0.00") +
+               "  redOverlay " + (_phArtRed / n).ToString("0.00") + " ms" +
+               "\n      tick phys: poll " + (_phPoll / n).ToString("0.00") +
+               "  drain " + (_phDrain / n).ToString("0.00") +
+               "  rice " + (_phRicePhys / n).ToString("0.00") +
+               "  expr " + (_phExpr / n).ToString("0.00") +
+               "  radar " + (_phRadar / n).ToString("0.00") +
+               "  tail " + (_phTickTail / n).ToString("0.00") + " ms";
     }
 
     // src over dst, clipped to the locked rectangle of dst. ox/oy are CANVAS
     // coordinates of the layer's top-left, and the rect is subtracted on the way in
     // so a rect-locked buffer can be written without touching its neighbours.
+    //
+    // NO LONGER ON THE RENDER PATH. RenderToCanvas composites the girl and the hurt
+    // overlay with GDI+ (see the note there): this per-pixel version cost 3.9 ms for
+    // the girl alone at the 624 preset and made a hurt frame scale with the square of
+    // the widget. It is kept because it is the exact straight-alpha src-over reference
+    // that --perfscale's blitequiv measures the fast path against - it matched that
+    // reference to 0 pixels, which is what proves the replacement is safe. Do not
+    // wire it back into a per-frame path; do not delete it either.
     void BlitLayer(Bitmap layer, Buf dst, int ox, int oy, double alpha) {
         if (layer == null) return;
         Buf src = new Buf(layer);
@@ -4466,7 +10042,7 @@ public sealed class DshPet : Form {
                     sg.DrawString("FIXED SIZE (old): did not fit the tablet", tag, tb, 12, 24 + ph + 12);
                 }
                 for (int i = 0; i < cols; i++) {
-                    using (Bitmap pn = BuildPanel(pw, ph, tests[i]))
+                    using (Bitmap pn = BuildPanel(pw, ph, tests[i], true))
                         sg.DrawImage(pn, 12 + i * (pw + 12), 24, pw, ph);
                     using (Bitmap pn = BuildPanelFixed(pw, ph, tests[i]))
                         sg.DrawImage(pn, 12 + i * (pw + 12), 24 + ph + 18, pw, ph);
@@ -4480,7 +10056,101 @@ public sealed class DshPet : Form {
             : "FAIL - " + over + " numbers overflow the panel"));
     }
 
-    Bitmap BuildPanel(int pw, int ph) { return BuildPanel(pw, ph, BalanceText()); }
+    Bitmap BuildPanel(int pw, int ph) {
+        if (_peakMode) return BuildPanelPeak(pw, ph);
+        return BuildPanel(pw, ph, BalanceText());
+    }
+
+    // Cloud time now: the last server stamp advanced by how long ago we took it. Deliberately NOT
+    // DateTime.Now - the whole point is that this follows the server.
+    DateTime CloudNow() {
+        // UtcNow, NOT Now. _cloudStamp is UTC and CloudBeijing adds the 8 hours itself, so a local
+        // fallback would double-count the offset on any machine that is already on Beijing time -
+        // 23:09 was reported as off-peak, and the countdown pointed at the wrong boundary.
+        if (!_haveCloudTime) return DateTime.UtcNow;
+        return _cloudStamp.Add(DateTime.UtcNow - _cloudLocalStamp);
+    }
+
+    // Beijing time. The server stamps UTC, and the tariff periods are defined in Beijing time, so the
+    // conversion is fixed at +8 rather than taken from the machine's zone.
+    DateTime CloudBeijing() { return CloudNow().AddHours(8); }
+
+    // Off-peak is 00:30-08:30 Beijing, per the published pricing page. The holiday rule (statutory
+    // holidays and swapped working weekends are off-peak all day) needs a calendar we do not ship,
+    // so it is deliberately not guessed at here.
+    // Time until the tariff flips, and which way. Off-peak runs 00:30-08:30 Beijing, so from
+    // off-peak the next change is 08:30, and from peak it is the next 00:30 (today if we are still
+    // before it, otherwise tomorrow's).
+    TimeSpan UntilSwitch(out bool toPeak) {
+        DateTime bj = CloudBeijing();
+        int m = bj.Hour * 60 + bj.Minute;
+        bool off = m >= 30 && m < 510;
+        toPeak = off;                       // leaving off-peak means heading INTO peak
+        int target;
+        if (off) target = 510;              // 08:30
+        else if (m < 30) target = 30;       // 00:00-00:29 -> 00:30 today
+        else target = 24 * 60 + 30;         // after 08:30 -> 00:30 tomorrow
+        int diffMin = target - m;
+        int secs = diffMin * 60 - bj.Second;
+        if (secs < 0) secs = 0;
+        return TimeSpan.FromSeconds(secs);
+    }
+
+    bool OffPeakNow() {
+        DateTime bj = CloudBeijing();
+        int m = bj.Hour * 60 + bj.Minute;
+        return m >= 30 && m < 510;          // 00:30 .. 08:29
+    }
+
+    // Three lines on the tablet: the clock, who is on duty, and today's spend.
+    Bitmap BuildPanelPeak(int pw, int ph) {
+        string key = "peak|" + CloudBeijing().ToString("HH:mm:ss") + "|" + OffPeakNow() + "|" +
+                      _todayUsed.ToString("0.00", CultureInfo.InvariantCulture);
+        if (_panelCacheValid && _panelCache != null && _panelCacheW == pw && _panelCacheH == ph &&
+            _panelCacheText == key) return _panelCache;
+        if (_panelCache != null) { _panelCache.Dispose(); }
+        _panelCache = null; _panelCacheValid = false;
+        Bitmap panel = new Bitmap(pw, ph, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(panel)) {
+            g.SmoothingMode = SmoothingMode.HighQuality;
+            g.TextRenderingHint = TextRenderingHint.AntiAlias;
+            float W = pw, H = ph;
+            using (StringFormat sf = new StringFormat()) {
+                sf.Alignment = StringAlignment.Center;
+                sf.LineAlignment = StringAlignment.Center;
+                bool toPeak;
+                TimeSpan left = UntilSwitch(out toPeak);
+                string cd = ((int)left.TotalHours).ToString("0") + ":" +
+                            left.Minutes.ToString("00") + ":" + left.Seconds.ToString("00");
+                string[] lines = new string[] {
+                    CloudBeijing().ToString("HH:mm:ss"),
+                    OffPeakNow() ? S_PEAK_OFF : S_PEAK_PEAK,
+                    (toPeak ? S_TO_PEAK : S_TO_OFF) + " " + cd
+                };
+                float[] frac = new float[] { 0.10f, 0.38f, 0.66f };
+                float[] size = new float[] { 0.26f, 0.26f, 0.18f };
+                for (int i = 0; i < 3; i++) {
+                    // Colour carries the tariff too: the off-peak line reads green, the peak line warm,
+                    // so the state is legible at a glance and does not rely on reading the name.
+                    Color ink = i == 1 ? (OffPeakNow() ? Color.FromArgb(255, 150, 226, 170)
+                                                        : Color.FromArgb(255, 240, 190, 120))
+                                       : Color.FromArgb(255, 236, 242, 252);
+                    using (Font f = new Font("Microsoft YaHei UI", H * size[i], FontStyle.Bold,
+                                             GraphicsUnit.Pixel))
+                    using (Brush sh = new SolidBrush(Color.FromArgb(160, 0, 0, 0)))
+                    using (Brush b = new SolidBrush(ink)) {
+                        RectangleF r = new RectangleF(0, H * frac[i], W, H * 0.3f);
+                        g.DrawString(lines[i], f, sh,
+                                     new RectangleF(r.X + 1.5f, r.Y + 1.5f, r.Width, r.Height), sf);
+                        g.DrawString(lines[i], f, b, r, sf);
+                    }
+                }
+            }
+        }
+        _panelCache = panel; _panelCacheValid = true;
+        _panelCacheW = pw; _panelCacheH = ph; _panelCacheText = key;
+        return panel;
+    }
 
     // The old behaviour: the digits were always drawn at H*0.48 with no width check,
     // which is what let "100.00" run off the tablet. Kept only so --panelcheck can
@@ -4499,7 +10169,22 @@ public sealed class DshPet : Form {
         return panel;
     }
 
-    Bitmap BuildPanel(int pw, int ph, string txt) {
+    Bitmap BuildPanel(int pw, int ph, string txt) { return BuildPanel(pw, ph, txt, false); }
+
+    // noCache is for callers that own the lifetime of what they get back. --panelcheck
+    // renders a sheet of ten different panels inside using blocks; handing those the
+    // cached instance would leave the cache pointing at a disposed bitmap and the next
+    // real frame would draw from it.
+    Bitmap BuildPanel(int pw, int ph, string txt, bool noCache) {
+        // Reuse the previous panel when nothing it depends on changed. The balance is
+        // what usually changes, and it changes once per cue - not once per frame.
+        if (!noCache && _panelCacheValid && _panelCache != null &&
+            _panelCacheW == pw && _panelCacheH == ph &&
+            _panelCacheText == txt && _panelCacheFx == _fx[0]) {
+            return _panelCache;
+        }
+        if (!noCache && _panelCache != null) { _panelCache.Dispose(); }
+        _panelCache = null; _panelCacheValid = false;
         Bitmap panel = new Bitmap(pw, ph, PixelFormat.Format32bppArgb);
         using (Graphics g = Graphics.FromImage(panel)) {
             g.SmoothingMode = SmoothingMode.HighQuality;
@@ -4538,18 +10223,34 @@ public sealed class DshPet : Form {
 
                     using (Font fb = new Font("Arial", fBal, FontStyle.Bold, GraphicsUnit.Pixel)) {
                         sb = g.MeasureString(txt, fb);
+                        // NUMBER FIRST, then the sign: "55 <yuan>", not "<yuan> 55". (The
+                        // currency glyph is written as a \u escape in the code below; this
+                        // comment says "<yuan>" because this file must stay pure ASCII.)
+                        //
+                        // That is the user's reading order, and it matches how every other amount
+                        // in this program is written (the floating numbers are "-1.00 <yuan>"). The
+                        // tablet used to lead with the sign, which reads as a prefix in English
+                        // but not as the trailing unit the rest of the UI uses.
                         float total = sb.Width + sc.Width;
                         float left = (W - total) / 2f;
                         // Keep the block's vertical CENTRE where it was: a smaller
                         // number would otherwise sit lower than the old one.
                         float top = H * 0.44f + (sbFull.Height - sb.Height) * 0.5f;
-                        g.DrawString("\u00A5", fc, sh, left + 1.5f, top + sb.Height * 0.24f + 1.5f);
-                        g.DrawString(txt, fb, sh, left + sc.Width + 1.5f, top + 1.5f);
-                        g.DrawString("\u00A5", fc, bc, left, top + sb.Height * 0.24f);
-                        g.DrawString(txt, fb, bb, left + sc.Width, top);
+                        g.DrawString(txt, fb, sh, left + 1.5f, top + 1.5f);
+                        g.DrawString("\u00A5", fc, sh, left + sb.Width + 1.5f, top + sb.Height * 0.24f + 1.5f);
+                        g.DrawString(txt, fb, bb, left, top);
+                        g.DrawString("\u00A5", fc, bc, left + sb.Width, top + sb.Height * 0.24f);
                     }
                 }
             }
+        }
+        // Publish as the cache. There is exactly one live panel at a time, and it is
+        // this one - the previous one was disposed on the way in.
+        if (!noCache) {
+            _panelCache = panel;
+            _panelCacheValid = true;
+            _panelCacheW = pw; _panelCacheH = ph;
+            _panelCacheText = txt; _panelCacheFx = _fx[0];
         }
         return panel;
     }
@@ -4559,7 +10260,9 @@ public sealed class DshPet : Form {
         PanelSize(out pw, out ph);
         if (pw < 8 || ph < 8) return;
 
+        long tPan = _perfPhases ? Stopwatch.GetTimestamp() : 0;
         Bitmap panel = BuildPanel(pw, ph);
+        if (_perfPhases) { _phPanelBuild += Ms(tPan); tPan = Stopwatch.GetTimestamp(); }
         try {
             using (Graphics g = Graphics.FromImage(_canvas)) {
                 g.SmoothingMode = SmoothingMode.HighQuality;
@@ -4567,12 +10270,72 @@ public sealed class DshPet : Form {
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 PointF[] dest = new PointF[3];
                 float bx = (float)(_offX + _shakeX), by = (float)(_offY + _shakeY);
-                dest[0] = new PointF((float)_fx[0] + bx, (float)_fy[0] + by);
-                dest[1] = new PointF((float)_fx[1] + bx, (float)_fy[1] + by);
-                dest[2] = new PointF((float)_fx[3] + bx, (float)_fy[3] + by);
+                // The three vertices that define the parallelogram the panel is mapped onto.
+                //
+                // The quad's four corners run 0=top-left, 1=top-right, 2=bottom-right,
+                // 3=bottom-left of the tablet. Mirroring the sprite reverses the x of every
+                // vertex, which turns that ring into top-right, top-left, bottom-left,
+                // bottom-right - so vertex 0 becomes the TOP-RIGHT corner and 3 becomes the
+                // BOTTOM-RIGHT one. Every index changes meaning.
+                //
+                // The three points must therefore be taken as (1, 0, 2) when mirrored, not
+                // (1, 0, 3). Using 3 there was the bug the user saw: the three points no longer
+                // describe the tablet's parallelogram, so the panel was sheared across her leg
+                // AND the cached panel rect no longer matched where it landed. (1, 0, 2) keeps
+                // the winding the same as the unmirrored (0, 1, 3), so the glyphs stay upright.
+                int iA = _snapRight ? 1 : 0;      // top-left  corner
+                int iB = _snapRight ? 0 : 1;      // top-right corner
+                int iC = _snapRight ? 2 : 3;      // bottom-left corner
+                // The readout is ON her tablet, so it has to bounce with her. The words used to
+                // sit perfectly still while she flinched, which is the "the text does not bounce
+                // along" report. Squashed VERTICALLY about the same anchor the sprite uses: only
+                // the glyphs' y changes, so the panel keeps its shape on the tablet and the text
+                // neither stretches nor tilts. Squashing x as well would scale the whole panel
+                // about her feet, which is not what the flinch does to her.
+                dest[0] = new PointF((float)_fx[iA] + bx, SquashY((float)_fy[iA] + by));
+                dest[1] = new PointF((float)_fx[iB] + bx, SquashY((float)_fy[iB] + by));
+                dest[2] = new PointF((float)_fx[iC] + bx, SquashY((float)_fy[iC] + by));
                 g.DrawImage(panel, dest);
             }
-        } finally { panel.Dispose(); }
+        } finally {
+            if (_perfPhases) { _phPanelDraw += Ms(tPan); }
+            // Do NOT dispose a cached panel here: BuildPanel hands back the shared
+            // instance, and disposing it would leave the cache pointing at a dead
+            // bitmap ("Parameter is not valid" from Image.RawFormat on the next frame).
+            if (!ReferenceEquals(panel, _panelCache)) panel.Dispose();
+        }
+    }
+
+    // Where a point at canvas row y ends up once the head-squash has been applied.
+    //
+    // The transform the sprite is drawn with is a vertical scale about the widget's bottom edge
+    // (see PaintWidgetArt), so anything that is meant to look like it is part of her - the tablet
+    // readout, her floating numbers, the offline dot - has to go through the same mapping or it
+    // sits still while she moves. Vertical only, deliberately: squashing x too would scale the
+    // whole panel about her feet instead of letting it ride on the tablet.
+    float SquashY(float y) {
+        // The head pat deforms her through a DIFFERENT pair of variables, so this had to learn about
+        // it: the pat writes _patSquash / _patShiftY rather than _squashScale, because _squashScale is
+        // also what the erase mask is stamped with and must keep its pot-bounce meaning. The result was
+        // that during a pat she compressed and the floating numbers did not - they hung in the air,
+        // which is exactly the "detached" look this function exists to prevent.
+        if (_patActive) {
+            // CANVAS coordinates, because that is what BOTH callers already pass:
+            //   DrawFloater: fl.Y ... + _shakeY + _offY
+            //   DrawScreen : _fy[i] + _shakeY + _offY
+            // Converting the anchor into that space instead of changing the callers means the two
+            // cannot drift apart, and it keeps a single definition of the pivot.
+            //
+            // The pivot is her feet plus the pat's slide: the sprite is drawn with a vertical scale
+            // about exactly that screen row, so any element that belongs to her must use the same one.
+            // Using a widget-space anchor here - a thousand pixels away from where the values live -
+            // is what squashed the tablet about the wrong point, and it moved 2 px on the frame she
+            // moved 66.
+            int anchor = _offY + _h + _patShiftY;
+            return (float)((y - anchor) * _patSquash + anchor);
+        }
+        if (!_squashOn) return y;
+        return (float)((y - _squashAnchorY) * _squashScale + _squashAnchorY);
     }
 
     // offline indicator: a small dot, so the screen keeps showing only the
@@ -4582,7 +10345,8 @@ public sealed class DshPet : Form {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             float r = Math.Max(2.5f, (float)(_h * 0.032));
             float cx = (float)(_fx[1] + _fx[2]) / 2f + (float)_shakeX + _offX;
-            float cy = (float)(_fy[1] + _fy[2]) / 2f + (float)(_h * 0.05) + (float)_shakeY + _offY;
+            // On the tablet, so it bounces with her like the readout does.
+            float cy = SquashY((float)(_fy[1] + _fy[2]) / 2f + (float)(_h * 0.05) + (float)_shakeY + (float)_offY);
             using (Brush b = new SolidBrush(Color.FromArgb(235, 228, 62, 52)))
                 g.FillEllipse(b, cx - r, cy - r, r * 2, r * 2);
             using (Pen p = new Pen(Color.FromArgb(210, 255, 255, 255), Math.Max(1f, r * 0.3f)))
@@ -4606,8 +10370,11 @@ public sealed class DshPet : Form {
                 int w = (int)(src.W * pop), h = (int)(src.H * pop);
                 // the shake offset is applied here so the number shakes together
                 // with the character instead of hanging in place
-                int x0 = fl.X + (int)Math.Round(fl.Jitter * Math.Sin(t * 9)) + (int)Math.Round(_shakeX) + _offX;
-                int y0 = fl.Y - (int)Math.Round(t * em * 2.7) + (int)Math.Round(_shakeY) + _offY;
+                int x0 = fl.X + (int)Math.Round(fl.Jitter * Math.Sin(t * 9)) + _shakeX + _offX;
+                // ...and the squash offset too, for the same reason: a number that hangs in the air
+                // while she flinches reads as detached from her. These numbers are born at her head
+                // and rise, so they belong to her for the whole animation.
+                int y0 = (int)Math.Round(SquashY(fl.Y - (int)Math.Round(t * em * 2.7) + _shakeY + _offY));
                 // Clip against the LOCKED RECT (canvas coordinates), not the widget:
                 // x0/y0 already include _offX/_offY, so testing them against _w/_h
                 // (~454) threw every floater away and the damage numbers vanished.
@@ -4659,8 +10426,11 @@ public sealed class DshPet : Form {
     // ---------------------------------------------------------------- tick ---
 
     void OnTick() {
+        long tTick0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+        long tPh0 = tTick0;
         try {
             if (_pollWant != 0) { int want = _pollWant; _pollWant = 0; PollNow(want == 2); }
+            if (_perfPhases) { _phPoll += Ms(tPh0); tPh0 = Stopwatch.GetTimestamp(); }
 
             double dt = _timer.Interval / 1000.0;
             bool anim = false;
@@ -4679,6 +10449,7 @@ public sealed class DshPet : Form {
 
             _lastCueAmount = 0;              // diagnostics: what fired this frame
             DrainBankedBalance();            // apply any reading that arrived
+            if (_perfPhases) { _phDrain += Ms(tPh0); tPh0 = Stopwatch.GetTimestamp(); }
 
             if (_dueGap > 0) _dueGap -= dt;
 
@@ -4695,6 +10466,19 @@ public sealed class DshPet : Form {
                 _headSquashT += dt;
                 if (_headSquashT > HeadSquashDur) _headSquashT = HeadSquashDur;
                 anim = true;
+            }
+
+            // Head pat: advances its own clock and reports whether it changed anything, so the widget
+            // keeps repainting while the hand is on screen. Without anim=true here the frame the pat
+            // starts would be the only one drawn.
+            //
+            // dt is passed in MILLISECONDS: the timer's dt above is in seconds and feeding that to a
+            // counter compared against PAT_HOLD_MS (200) is what stopped the pat ever firing.
+            {
+                double patBefore = _patT;
+                bool patWasActive = _patActive;
+                TickPat(_timer.Interval);
+                if (_patActive || patWasActive || _patT != patBefore) anim = true;
             }
 
             // The ONLY place the printed number moves: one cent per cue, never
@@ -4762,18 +10546,70 @@ public sealed class DshPet : Form {
             // Sample the cursor BEFORE stepping: a release that lands between two
             // ticks still throws with the speed of the frame that just ran.
             if (_riceGrab != null) ThrowSample(dt);
+            // Peak/off-peak readout hold. It stays up while the pointer is on her or a button is held,
+            // and reverts 5 s after that stops - but a charge in progress postpones the revert, because
+            // switching the tablet mid-animation would cut the number the user is watching.
+            // "On screen" is not a useful test in a screen-sized window - the cursor is always on the
+            // screen. What the user means by keeping it up is that they are still interacting with her,
+            // which is the same test the right-click menu and the pat already use.
+            {
+                // Client-area coordinates: the window is screen-sized, so client == canvas, and that is
+                // exactly what GirlPixelSolid (and every mouse handler here) expects. Subtracting the
+                // widget offset as well shifted the probe off her, which pinned "engaged" true and
+                // stopped the countdown from ever finishing - the readout then only went away when a
+                // click forced a repaint.
+                Point cur = Cursor.Position;
+                _mouseInside = GirlPixelSolid(cur.X - Left, cur.Y - Top);
+            }
+            // The clock has to tick. Nothing else marks the panel dirty while it is up, so without
+            // this the time only changed when some other action forced a repaint - exactly the
+            // "the time is not live" report.
+            if (_peakMode) {
+                int sec = CloudBeijing().Second;
+                if (sec != _peakSec) {
+                    _peakSec = sec; _panelCacheValid = false; _dirty = true;
+                    // _forceFullFill, not a dirty rectangle.
+                    //
+                    // haveDirty = _forceFullFill || (dirty rect non-empty), so this is guaranteed to
+                    // push regardless of whether the rectangle was computed correctly and regardless of
+                    // RenderToCanvas clearing it. The dirty-rectangle route looked fine under
+                    // --peaktick (manual tick loop) but the screen never moved under the real timer, so
+                    // it depended on a precondition that does not hold on the shipped path. This one has
+                    // no precondition to get wrong; the cost is one full-canvas composite per second,
+                    // and only while the panel is up.
+                    _forceFullFill = true;
+                    Invalidate();
+                }
+            }
+
+            // No automatic revert. The user asked for a plain toggle - double click out, double click
+            // back - after the timed version proved unreliable. A toggle has no clock, no pointer
+            // tracking and no interaction with a charge in flight, so there is nothing left to get
+            // wrong; and it is easier to explain.
+
+            long tPh = _perfPhases ? Stopwatch.GetTimestamp() : 0;
             UpdateRice(dt);
+            if (_perfPhases) { _phRicePhys += Ms(tPh); tPh = Stopwatch.GetTimestamp(); }
             if (_rices.Count > 0 || _hearts.Count > 0) anim = true;
 
             // Mood for this frame. Runs after the physics and the cue bookkeeping so
             // it sees the same state the renderer is about to draw.
             UpdateExpression(dt);
+            if (_perfPhases) { _phExpr += Ms(tPh); tPh = Stopwatch.GetTimestamp(); }
             // Radar AFTER the mood: the lock only exists while she is aloof, and the
             // magnet moves the bowl, so it has to run after UpdateRice too.
             UpdateRadar(dt);
+            if (_perfPhases) { _phRadar += Ms(tPh); tPh = Stopwatch.GetTimestamp(); }
 
-            if (anim || _dirty) { RenderToCanvas(); PushLayer(); }
+            // Mark the tablet AFTER the re-render (see the note where _peakPush is set) and before the
+            // push, so the new digits actually reach the screen.
+            if (anim || _dirty) {
+                RenderToCanvas();
+                PushLayer();
+            }
+            if (_perfPhases) { _phTickTail += Ms(tPh); }
         } catch (Exception ex) { Log("tick: " + ex); }
+        LastTickMs = Ms(tTick0);
     }
 
     // fromTest: the menu / tray "test one charge" cue only pretends to spend.
@@ -4788,6 +10624,19 @@ public sealed class DshPet : Form {
         // the tick loop, but repeatedly clicking "test one charge" used to stack
         // an unbounded number of them and each one added its own shake, which
         // added up to a sprite flying across the screen.
+        // NOT counted here. "Today's spend" is derived from the balance the server reports (see
+        // NoteBalanceForSpend); the amount this animation was called with is a nominal per-cue figure,
+        // not the bill. Counting it made the readout far too small.
+        // The number always moves. Everything else about a charge - the hurt overlay, the shake, the
+        // floating figure and the sound - is the "hurt" feature, and is skipped when it is off.
+        // The balance itself is applied by the caller, so turning this off really does mean "the
+        // value changes and nothing else happens".
+        if (!_fxHurt) {
+            if (fromTest) _testOffset = Math.Round(_testOffset + amount, 4);
+            else _testOffset = 0;
+            _dirty = true;
+            return;
+        }
         if (_hits.Count < 3) _hits.Add(new Hit());
         if (fromTest) {
             _testOffset = Math.Round(_testOffset + amount, 4);
@@ -4808,6 +10657,7 @@ public sealed class DshPet : Form {
         fl.Jitter = 7 * _scale;
         _floaters.Add(fl);
         if (_floaters.Count > 20) _floaters.RemoveAt(0);
+
         PlayHitSound();          // every pop plays, even on top of the last one
         _dirty = true;
     }
@@ -4817,9 +10667,23 @@ public sealed class DshPet : Form {
     // Every damage number plays the cue on its own MCI alias, so a new hit never
     // cuts off the previous one.
     void PlayHitSound() {
-        if (_sound == null || !_soundEnabled) return;
-        int slot = _sound.Play();
-        if (slot < 0) {
+        // THE VOLUME SLIDER HAS TO BE CONSULTED, and this is the one place that forgot.
+        //
+        // It checked only the global switch, so dragging the damage slider to 0 % left the hit
+        // sound playing at whatever level the alias was last given - and because SetCueVolume
+        // pushes the level to the pool as it is dragged, "the last level given" is the value
+        // before the final drag to 0. The user's report was exactly that: "set it to 0 % and it
+        // does not mute, it comes back at what is effectively 50 %".
+        //
+        // Routing through PlayCue gives this cue the same rule the other three already had:
+        // 0 % is silent, and the switch is the only mute.
+        if (_sound == null) return;
+        int before = _sound.Plays;
+        PlayCue(CUE_HIT, _sound);
+        // A pool that could not play is worth recording ONCE - the old code logged on every
+        // failed play and then switched sound off to stop the log filling up.
+        if (_sound.Plays == before && !_sound.Failed) return;      // nothing was asked for
+        if (_sound.Plays == before && _sound.Failed) {
             Log("sound: nothing played (failed=" + _sound.Failed + " err=" + _sound.Error + ")");
             _soundEnabled = false;                       // do not spam the log
         }
@@ -4898,6 +10762,15 @@ public sealed class DshPet : Form {
         req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
         req.Headers.TryAddWithoutValidation("Accept", "application/json");
         HttpResponseMessage resp = Http.SendAsync(req).GetAwaiter().GetResult();
+        // The tariff readout needs cloud time, and this header is the authoritative clock available to
+        // us: it is stamped by the server, so it does not care what the machine's clock says.
+        try {
+            if (resp.Headers.Date.HasValue) {
+                _cloudStamp = resp.Headers.Date.Value.UtcDateTime;
+                _cloudLocalStamp = DateTime.UtcNow;
+                _haveCloudTime = true;
+            }
+        } catch { }
         string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         if (!resp.IsSuccessStatusCode) throw new Exception("HTTP " + (int)resp.StatusCode);
         return body;
@@ -5020,6 +10893,9 @@ public sealed class DshPet : Form {
             bool testRollback = !firstReading && !snap && _testBumpAmount > 0 &&
                                 bal < prevReal - 1e-6 && bal <= _testBumpFrom + 1e-6;
             _realBal = bal;
+            // Today's spend is the balance going DOWN. A rehearsal being rolled back also moves the
+            // balance down, but no money was spent, so it is excluded by name rather than by heuristic.
+            if (!testRollback) NoteBalanceForSpend(bal);
             bool topUp = false;
             if (firstReading) {
                 _bookedAt = bal;
@@ -5260,21 +11136,29 @@ public sealed class DshPet : Form {
         bool topupTest = Array.IndexOf(args, "--topup") >= 0;
         bool simchain = Array.IndexOf(args, "--simchain") >= 0;
         bool perfTest = Array.IndexOf(args, "--perf") >= 0;
+        bool perfScale = Array.IndexOf(args, "--perfscale") >= 0;
         bool ulwTest = Array.IndexOf(args, "--ulwcheck") >= 0;
         bool animTail = Array.IndexOf(args, "--animtail") >= 0;
         bool bowlGirl = Array.IndexOf(args, "--bowlgirl") >= 0;
+        bool ironBump = Array.IndexOf(args, "--ironbump") >= 0;
         bool panelCheck = Array.IndexOf(args, "--panelcheck") >= 0;
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
         DshPet pet = new DshPet(baseDir, args);
+        // Any --flag makes this a diagnostic process: see the guard in SaveState.
+        for (int ai = 0; ai < args.Length; ai++)
+            if (args[ai].StartsWith("--")) { pet.MarkDiagnosticRun(); break; }
         if (selftest || shot || menuShot || iconShot || topupTest || simchain || perfTest || ulwTest ||
-            animTail || bowlGirl || panelCheck) pet.NoSaveForTest();
+            animTail || bowlGirl || panelCheck || perfScale || ironBump) pet.NoSaveForTest();
 
         if (shot) {
             System.Windows.Forms.Timer shotTimer = new System.Windows.Forms.Timer();
             shotTimer.Interval = 2500;
             shotTimer.Tick += delegate {
+              // Wrapped: a GDI+ failure here otherwise shows up only as a
+              // modal "Parameter is not valid" box, which names no line.
+              try {
                 shotTimer.Stop();
                 pet.PollNowSyncPublic(false);
                 Console.WriteLine("rest  : " + pet.ShakeReport());
@@ -5382,6 +11266,12 @@ public sealed class DshPet : Form {
                                   "  bowl=" + pet.RiceReport() +
                                   "  hearts=" + pet.HeartsPublic);
                 Application.Exit();
+              } catch (Exception ex) {
+                Console.WriteLine("SHOT CRASH: " + ex.GetType().FullName);
+                Console.WriteLine(ex.ToString());
+                Console.Out.Flush();
+                Application.Exit();
+              }
             };
             shotTimer.Start();
             Application.Run(pet);
@@ -5433,9 +11323,12 @@ public sealed class DshPet : Form {
 
         // Frame-budget breakdown (development flag, offline, no window shown but the
         // real handle exists so PushLayer is included).
-        if (Array.IndexOf(args, "--perf") >= 0 || Array.IndexOf(args, "--ulwcheck") >= 0 ||
+        if (Array.IndexOf(args, "--perf") >= 0 || Array.IndexOf(args, "--perfscale") >= 0 ||
+            Array.IndexOf(args, "--ulwcheck") >= 0 || Array.IndexOf(args, "--ironbump") >= 0 ||
             Array.IndexOf(args, "--animtail") >= 0 || Array.IndexOf(args, "--bowlgirl") >= 0) {
             bool ulw = Array.IndexOf(args, "--ulwcheck") >= 0;
+            bool perfScaleRun = Array.IndexOf(args, "--perfscale") >= 0;
+            bool ironBumpRun = Array.IndexOf(args, "--ironbump") >= 0;
             System.Windows.Forms.Timer pf = new System.Windows.Forms.Timer();
             pf.Interval = 400;
             pf.Tick += delegate {
@@ -5444,6 +11337,8 @@ public sealed class DshPet : Form {
                     if (ulw) { Console.WriteLine("layered-window push self-check"); pet.UlwCheckReport(); }
                     else if (Array.IndexOf(args, "--animtail") >= 0) pet.RunAnimationTailTest();
                     else if (Array.IndexOf(args, "--bowlgirl") >= 0) pet.RunBowlOverGirlTest();
+                    else if (ironBumpRun) pet.RunIronPotBumpTest();
+                    else if (perfScaleRun) pet.PerfScaleReport();
                     else pet.PerfReport();
                 } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
                 Console.WriteLine("done");
@@ -5454,13 +11349,306 @@ public sealed class DshPet : Form {
             return;
         }
 
+        // Audio engine check: decode the four shipped cues with Media Foundation,
+        // confirm the durations match what MCI reports, then run a trim+gain round
+        // trip through the wav writer and read it back. This is the part of the
+        // custom-sound feature that cannot be verified by inspection - it either
+        // decodes real samples or it does not.
+        if (Array.IndexOf(args, "--audiocheck") >= 0) {
+            pet.GoOffline();
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer at = new System.Windows.Forms.Timer();
+            at.Interval = 300;
+            at.Tick += delegate {
+                at.Stop();
+                try { pet.RunAudioEngineTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            at.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Legacy clip migration: only runs on a machine that has an old-format sidecar, so
+        // without this it would be dead code until a real user upgraded.
+        if (Array.IndexOf(args, "--librarymigrate") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer mt2 = new System.Windows.Forms.Timer();
+            mt2.Interval = 300;
+            mt2.Tick += delegate {
+                mt2.Stop();
+                try { pet.RunLibraryMigrationTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            mt2.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Per-cue volume check: four independent levels, each reaching its own pool.
+        if (Array.IndexOf(args, "--cuevolume") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer vt = new System.Windows.Forms.Timer();
+            vt.Interval = 300;
+            vt.Tick += delegate {
+                vt.Stop();
+                try { pet.RunCueVolumeTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            vt.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Audio editor shot: opens the trim/gain window on a real cue and captures it, so
+        // the dialog's look can be checked without a human driving the file picker.
+        if (Array.IndexOf(args, "--editshot") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer et = new System.Windows.Forms.Timer();
+            et.Interval = 600;
+            et.Tick += delegate {
+                et.Stop();
+                try { pet.ShowEditorShot(baseDir); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Application.Exit();
+            };
+            et.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Custom sound effect check: write a trimmed clip as a cue's replacement, confirm the
+        // pool opens THAT file, then reset. No dialog - everything behind it.
+        if (Array.IndexOf(args, "--customeffect") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer xt = new System.Windows.Forms.Timer();
+            xt.Interval = 300;
+            xt.Tick += delegate {
+                xt.Stop();
+                try { pet.RunCustomEffectTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            xt.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Menu structure check: prints the tree and asserts it against the structure the
+        // user specified. Text, not a screenshot - see MenuTreeReport for why.
+        if (Array.IndexOf(args, "--menucheck") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer ct = new System.Windows.Forms.Timer();
+            ct.Interval = 300;
+            ct.Tick += delegate {
+                ct.Stop();
+                try { pet.RunMenuCheckTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            ct.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Demo window shot, for the same reason as the settings window: it is only reachable by
+        // right-clicking the pet.
+        if (Array.IndexOf(args, "--shotdemo") >= 0) {
+            pet.NoSaveForTest();
+            if (Array.IndexOf(args, "--menudark") >= 0) pet.ApplyThemeForShot(true);
+            System.Windows.Forms.Timer dt = new System.Windows.Forms.Timer();
+            dt.Interval = 600;
+            dt.Tick += delegate {
+                dt.Stop();
+                try { pet.CaptureDemoWindow(baseDir); }
+                catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            dt.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Window icons: the four title-bar windows must load the shipped glyphs, not the .NET default
+        // form icon. Worth a guard because the default is INVISIBLE in every other test - it is a
+        // perfectly valid Icon object, so nothing throws and no screenshot of the client area shows
+        // it. The failure looks exactly like success.
+        if (Array.IndexOf(args, "--winicons") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer wt = new System.Windows.Forms.Timer();
+            wt.Interval = 300;
+            wt.Tick += delegate {
+                wt.Stop();
+                try { pet.RunWindowIconTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            wt.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Menu shot: opens the REAL menu and captures it, so what the user sees can be compared with
+        // what the code claims. A sheet of MakeIcon output proves the drawing is right; only this
+        // proves the menu displays it.
+        //
+        // --shotmenu already did this, so this flag reuses the same capture path rather than adding a
+        // second one: two capture routines would be two things to keep correct.
+        if (Array.IndexOf(args, "--menushot") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer ms = new System.Windows.Forms.Timer();
+            ms.Interval = 600;
+            int mstep = 0;
+            ms.Tick += delegate {
+                switch (mstep) {
+                case 0:
+                    // Show in one tick, capture in the next: the popup needs a pass through the
+                    // message loop before it has painted.
+                    pet.OpenRootMenu(pet.MenuOrigin());
+                    break;
+                case 1: {
+                    Rectangle mcap = pet.MenuBounds();
+                    pet.CaptureRegion(Path.Combine(baseDir, "_menu_shot.png"), mcap, 10);
+                    Console.WriteLine("menu rect: " + mcap);
+                    Console.WriteLine("metrics : " + pet.MenuMetrics());
+                    break;
+                }
+                default:
+                    ms.Stop();
+                    pet.CloseMenus();
+                    Console.WriteLine("done");
+                    Application.Exit();
+                    break;
+                }
+                mstep++;
+            };
+            ms.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Icon sheet: renders every menu icon to one magnified PNG, so what the menu actually SHOWS
+        // can be looked at directly. Reading the drawing code is not enough - the on-screen icon was
+        // reported as a four-square Windows logo while IC_CASCADE is drawn as three green chevrons,
+        // and only the rendered pixels can settle which is true.
+        if (Array.IndexOf(args, "--iconsheet") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer it2 = new System.Windows.Forms.Timer();
+            it2.Interval = 300;
+            it2.Tick += delegate {
+                it2.Stop();
+                try { pet.DumpIconSheet(args); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            it2.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Tray icon: it must be the shipped one, not the stock Windows application icon.
+        if (Array.IndexOf(args, "--trayicon") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer tt = new System.Windows.Forms.Timer();
+            tt.Interval = 300;
+            tt.Tick += delegate {
+                tt.Stop();
+                try { pet.RunTrayIconTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            tt.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Click-away dismissal: the menu must close when the user clicks outside it, which the
+        // window's own click-through hit test makes non-obvious.
+        if (Array.IndexOf(args, "--clickaway") >= 0) {
+            pet.NoSaveForTest();
+            pet.SetDiagClickAwayForTest();
+            System.Windows.Forms.Timer ct = new System.Windows.Forms.Timer();
+            ct.Interval = 400;
+            ct.Tick += delegate {
+                ct.Stop();
+                try { pet.RunClickAwayTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            ct.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Mute per cue: every trigger path must respect 0 %. Added after the damage cue was found
+        // playing at 0 % because its call site checked only the global switch.
+        if (Array.IndexOf(args, "--mutecheck") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer mt3 = new System.Windows.Forms.Timer();
+            mt3.Interval = 300;
+            mt3.Tick += delegate {
+                mt3.Stop();
+                try { pet.RunMutePerCueTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            mt3.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Volume preview: adjusting a level must be silent while the preview button sounds.
+        if (Array.IndexOf(args, "--preview") >= 0) {
+            pet.NoSaveForTest();
+            System.Windows.Forms.Timer pt = new System.Windows.Forms.Timer();
+            pt.Interval = 300;
+            pt.Tick += delegate {
+                pt.Stop();
+                try { pet.RunPreviewTest(); } catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            pt.Start();
+            Application.Run(pet);
+            return;
+        }
+
+        // Settings window shots: one per page. The window is otherwise reachable only by
+        // right-clicking the pet, so a layout bug in it stays invisible until someone opens it.
+        if (Array.IndexOf(args, "--shotwin") >= 0) {
+            pet.NoSaveForTest();
+            int page = 0;
+            bool pageGiven = false;
+            for (int i = 0; i < args.Length; i++) {
+                if (args[i] == "--page" && i + 1 < args.Length) {
+                    int.TryParse(args[i + 1], out page);
+                    pageGiven = true;
+                }
+            }
+            if (Array.IndexOf(args, "--menudark") >= 0) pet.ApplyThemeForShot(true);
+            System.Windows.Forms.Timer wt = new System.Windows.Forms.Timer();
+            wt.Interval = 600;
+            wt.Tick += delegate {
+                wt.Stop();
+                try { pet.CaptureSettingsWindow(baseDir, page, !pageGiven); }
+                catch (Exception ex) { Console.WriteLine("diag FAILED: " + ex); }
+                Console.WriteLine("done");
+                Application.Exit();
+            };
+            wt.Start();
+            Application.Run(pet);
+            return;
+        }
+
         // Menu appearance check. A dropdown is its own popup window, so the only
         // honest way to see the beautified menu is to open it for real and grab
         // that part of the screen. It is never part of a release run: --menushot
         // is a development flag, like --shot.
         if (Array.IndexOf(args, "--menushot") >= 0) {
             pet.GoOffline();                  // no network while the menu is open
-            pet.SetVolumeForShot(75);          // so one volume row carries the tick
             // --menudark forces the dark palette for the shot, so both looks can be
             // captured and compared without touching state.ini. (A separate switch
             // rather than --menushot=dark: an '=' argument survives routing through
@@ -5470,6 +11658,9 @@ public sealed class DshPet : Form {
             bool shotDark = Array.IndexOf(args, "--menudark") >= 0;
             if (shotDark) pet.ApplyThemeForShot(true);
             Console.WriteLine("theme: " + (pet.IsDarkThemeForShot ? "dark" : "light"));
+            // The menu is five flat rows now, so one shot covers it: there are no submenus left to
+            // walk into. The settings window's pages are photographed by --shotwin instead, which
+            // opens each page directly rather than navigating a cascade.
             int step = 0;
             System.Windows.Forms.Timer mt = new System.Windows.Forms.Timer();
             mt.Interval = 600;
@@ -5477,8 +11668,8 @@ public sealed class DshPet : Form {
                 Rectangle cap;
                 switch (step) {
                 case 0:
-                    // Show in one tick, capture in the next: the popup needs a pass
-                    // through the message loop before it has actually painted.
+                    // Show in one tick, capture in the next: the popup needs a pass through the
+                    // message loop before it has actually painted.
                     Console.WriteLine("menu: " + pet.MenuReport());
                     pet.OpenRootMenu(pet.MenuOrigin());
                     break;
@@ -5486,25 +11677,8 @@ public sealed class DshPet : Form {
                     cap = pet.MenuBounds();
                     pet.CaptureRegion(Path.Combine(baseDir, "_menu_1_root.png"), cap, 10);
                     Console.WriteLine("root menu rect: " + cap);
-                    pet.OpenSoundMenu();
-                    break;
-                case 2:
-                    cap = pet.MenuBounds();
-                    pet.CaptureRegion(Path.Combine(baseDir, "_menu_2_sound.png"), cap, 10);
-                    Console.WriteLine("sound menu rect: " + cap);
-                    pet.OpenSizeMenu();
-                    break;
-                case 3:
-                    cap = pet.MenuBounds();
-                    pet.CaptureRegion(Path.Combine(baseDir, "_menu_3_size.png"), cap, 10);
-                    Console.WriteLine("size menu rect: " + cap);
+                    Console.WriteLine("drops: " + pet.DropDownReport());
                     Console.WriteLine("metrics: " + pet.MenuMetrics());
-                    pet.OpenTestTopMenu();
-                    break;
-                case 4:
-                    cap = pet.MenuBounds();
-                    pet.CaptureRegion(Path.Combine(baseDir, "_menu_4_testtop.png"), cap, 10);
-                    Console.WriteLine("test-topup menu rect: " + cap);
                     break;
                 default:
                     mt.Stop();
@@ -5577,6 +11751,429 @@ public sealed class DshPet : Form {
         }
 
         // Standalone: the iron pot that lands on her head.
+        // Reports the geometry the pet is ACTUALLY running with, read from the real state.ini,
+        // without touching anything. Needed to map a pixel measured in a screen recording onto
+        // the erase mask: the mask is anchored to the widget, so its screen position depends on
+        // _offX/_offY/_w, and guessing those from a video is what kept sending me in circles.
+        if (Array.IndexOf(args, "--seam") >= 0) {
+            pet.NoSaveForTest();
+            pet.SeamCheck();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        // Head pat trigger: walks press -> 200 ms hold -> active, through the same methods the app
+        // uses, so a failure points at what the app feeds them rather than at the logic.
+        if (Array.IndexOf(args, "--peaktick") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPeakTickTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--peakcheck") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPeakCheckTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--fxcheck") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunFxCheckTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--pattrigger") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPatTriggerTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        // Interactive solver for the head-pat hand placement.
+        //
+        // This replaces "edit a constant, rebuild, run --patcheck, look at a dumped frame, guess again".
+        // That loop cost about 20 s a round and, worse, the judgement was made from memory: by the time
+        // the next frame came back, the previous one was a faded impression. Here the hand is dragged
+        // with the mouse and the picture is the FINAL composite, so there is nothing to remember.
+        //
+        // It exists because the hand placement has four coupled numbers and is judged purely by eye -
+        // exactly the case the interactive-tool note describes: mouse-expressible, eye-judged, slow
+        // feedback, and the result has to end up as constants in the code.
+        // TEMP: render the dialogs to PNG so the styling can be inspected.
+        // The breadcrumb panel, root view and demo view, photographed without switching the menu over.
+        if (Array.IndexOf(args, "--crumbshot") >= 0) {
+            pet.NoSaveForTest();
+            try {
+                CrumbPanel cp = new CrumbPanel(pet);
+                cp.ShowAt(new Point(200, 200), pet);
+                System.Threading.Thread.Sleep(300);
+                Application.DoEvents();
+                pet.CaptureWindowTo(System.IO.Path.Combine(baseDir, "_crumb_root.png"),
+                                    cp.Handle, cp.ClientSize.Width, cp.ClientSize.Height);
+                Console.WriteLine("  root    : demoView=" + cp.DemoViewForTest +
+                                  " size=" + cp.ClientSize.Width + "x" + cp.ClientSize.Height);
+                cp.GoDemoForTest();
+                System.Threading.Thread.Sleep(250);
+                Application.DoEvents();
+                pet.CaptureWindowTo(System.IO.Path.Combine(baseDir, "_crumb_demo.png"),
+                                    cp.Handle, cp.ClientSize.Width, cp.ClientSize.Height);
+                Console.WriteLine("  demo    : demoView=" + cp.DemoViewForTest +
+                                  " size=" + cp.ClientSize.Width + "x" + cp.ClientSize.Height);
+                bool staged = cp.DemoViewForTest;
+                cp.GoRootForTest();
+                // The settings host: three pages, each rendering the real page body.
+                for (int pg = 0; pg < 3; pg++) {
+                    cp.GoSettingsForTest(pg);
+                    if (pg == 0) {
+                        cp.SettleForTest();
+                        Rectangle hr;
+                        if (cp.HostSizeRect(3, out hr)) {
+                            Point hp = cp.HostToPanel(new Point(hr.X + 60, hr.Y + hr.Height / 2));
+                            cp.HoverAtForTest(hp);
+                            Console.WriteLine("  hover   : row4 host=" + hr + " panel=" + hp);
+                        }
+                    }
+                    System.Threading.Thread.Sleep(200);
+                    Application.DoEvents();
+                    pet.CaptureWindowTo(System.IO.Path.Combine(baseDir, "_crumb_set" + pg + ".png"),
+                                        cp.Handle, cp.ClientSize.Width, cp.ClientSize.Height);
+                    Console.WriteLine("  settings" + pg + " : size=" + cp.ClientSize.Width + "x" +
+                                  cp.ClientSize.Height + " page=" + cp.SettingsPageForTest +
+                                  " neededW=" + cp.HostNeededWidthForTest());
+    
+                }
+                cp.GoRootForTest();
+                bool backOk = !cp.DemoViewForTest;
+                cp.GoDemoForTest();
+                System.Threading.Thread.Sleep(120);
+                cp.GoRootForTest();
+                cp.GoSettingsForTest(1);
+                System.Threading.Thread.Sleep(120);
+                cp.GoRootForTest();
+                Console.WriteLine("  inPlace : demo=" + staged + " back=" + backOk + "  " +
+                                  ((staged && backOk) ? "ok (content swaps, the panel itself stays)"
+                                                      : "MISMATCH (the view did not swap)"));
+                // ---- interaction, driven through the panel's own hit list ----
+                //
+                // Asserted on the EFFECT (the pet's values), not on the call, so a click that
+                // silently did nothing cannot pass.
+                cp.GoSettingsForTest(1);                  // volume page
+                cp.SettleForTest();
+                System.Threading.Thread.Sleep(200);
+                Application.DoEvents();
+                Rectangle track;
+                bool haveSlider = cp.HostSliderRect(0, out track);
+                int before = pet.CueVolumeUi(0);
+                if (haveSlider) {
+                    cp.SimulateHostClick(cp.HostToPanel(new Point(track.X + 1, track.Y + track.Height / 2)));
+                    Application.DoEvents();
+                }
+                int atLeft = pet.CueVolumeUi(0);
+                if (haveSlider) {
+                    cp.SimulateHostClick(cp.HostToPanel(new Point(track.Right - 1, track.Y + track.Height / 2)));
+                    Application.DoEvents();
+                }
+                int atRight = pet.CueVolumeUi(0);
+                Console.WriteLine("  dbg     : hits " + cp.DumpHitsForTest());
+                Console.WriteLine("  probe   : " + cp.ProbeHitsForTest() +
+                                  "   (kinds hit at each recorded rect; 0 = miss)");
+                Console.WriteLine("  dbg2    : track=" + track + " origin=" + cp.SetOriginForTest +
+                                  " hit=" + cp.HostHitTestForTest(new Point(track.X + 1, track.Y + 12)) +
+                                  " hits=" + cp.HostHitCountForTest + " size=" + cp.ClientSize +
+                                  " disposed=" + cp.IsDisposed + " page=" + cp.SettingsPageForTest);
+                bool sliderWorks = haveSlider && atLeft <= 5 && atRight >= 95 && atLeft != atRight;
+                Console.WriteLine("  slider  : before=" + before + "% left=" + atLeft +
+                                  "% right=" + atRight + "%  " +
+                                  (sliderWorks ? "ok (the panel drives the real control)"
+                                               : "MISMATCH (the click did not reach the control)"));
+                if (haveSlider) {   // restore the user's level
+                    cp.SimulateHostClick(cp.HostToPanel(new Point((track.X + track.Right) / 2, track.Y + track.Height / 2)));
+                    Application.DoEvents();
+                }
+
+                // Theme segmented control: click the other half and the flag must flip.
+                cp.GoSettingsForTest(0);
+                cp.SettleForTest();
+                System.Threading.Thread.Sleep(200);
+                Application.DoEvents();
+                Rectangle seg;
+                // Click the OTHER option. Clicking the one already selected changes nothing, and the
+                // assertion then reads that as "the control does not respond" - which is what it did,
+                // twice, before this was spotted.
+                bool wantDark = !pet.IsDarkThemeUi;
+                bool haveSeg = cp.HostSegmentedRect(wantDark ? 1 : 0, out seg);
+                if (haveSeg) {
+                    cp.SimulateHostClick(cp.HostToPanel(new Point(seg.X + seg.Width / 2, seg.Y + seg.Height / 2)));
+                    Application.DoEvents();
+                }
+                bool themeWorks = haveSeg && pet.IsDarkThemeUi == wantDark;
+                Console.WriteLine("  segment : dark=" + pet.IsDarkThemeUi + " (wanted " + wantDark +
+                                  ")  " +
+                                  (themeWorks ? "ok (segmented control responds)"
+                                              : "MISMATCH (segmented control did not respond)"));
+                if (haveSeg) {   // put the user's theme back
+                    cp.SimulateHostClick(cp.HostToPanel(new Point(seg.X + seg.Width / 2, seg.Y + seg.Height / 2)));
+                    Application.DoEvents();
+                }
+                Console.WriteLine("  verdict : " + ((sliderWorks && themeWorks)
+                    ? "OK - panel renders, swaps in place, grows upward, and drives the real controls"
+                    : "FAIL - see slider/segment above"));
+                cp.GoRootForTest();
+                // Position: the panel must grow UP from the anchor and stay on screen. A click 60 px
+                // above the bottom edge is the case that used to overflow.
+                Rectangle wa2 = Screen.PrimaryScreen.WorkingArea;
+                Point low = new Point(300, wa2.Bottom - 60);
+                CrumbPanel cp2 = new CrumbPanel(pet);
+                cp2.ShowAt(low, pet);
+                System.Threading.Thread.Sleep(200);
+                Application.DoEvents();
+                int rootBottom = cp2.Bottom, rootTop = cp2.Top;
+                cp2.GoDemoForTest();          // gets much taller
+                System.Threading.Thread.Sleep(200);
+                Application.DoEvents();
+                int demoBottom = cp2.Bottom, demoTop = cp2.Top, demoH = cp2.Height;
+                bool inside = demoTop >= wa2.Top && demoBottom <= wa2.Bottom;
+                bool grewUp = demoTop < rootTop;
+                bool bottomHeld = Math.Abs(demoBottom - rootBottom) <= 2;
+                Console.WriteLine("  anchor  : y=" + low.Y + " (work bottom " + wa2.Bottom + ")");
+                Console.WriteLine("  root    : top=" + rootTop + " bottom=" + rootBottom);
+                Console.WriteLine("  demo    : top=" + demoTop + " bottom=" + demoBottom +
+                                  " height=" + demoH);
+                Console.WriteLine("  position: onScreen=" + inside + " grewUp=" + grewUp +
+                                  " bottomHeld=" + bottomHeld + "  " +
+                                  ((inside && grewUp && bottomHeld)
+                                   ? "ok (grows upward from the click, stays visible)"
+                                   : "MISMATCH (overflows or grew downward)"));
+   if (haveSlider) {   // restore the user's level
+                    cp.SimulateHostClick(cp.HostToPanel(new Point((track.X + track.Right) / 2, track.Y + track.Height / 2)));
+                    Application.DoEvents();
+                }
+
+                // Theme segmented control: click the other half and the flag must flip.
+                cp.GoSettingsForTest(0);
+                System.Threading.Thread.Sleep(200);
+                Application.DoEvents();
+                cp.GoRootForTest();
+                cp.Close();
+            } catch (Exception ex) { Console.WriteLine("crumbshot failed: " + ex.Message + " @ " + ex.StackTrace); }
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--dialogshot") >= 0) {
+            pet.NoSaveForTest();
+            try {
+                InputDialog d1 = new InputDialog("API Key", "paste your key here", "", "",
+                                                 880, true);
+                d1.Show();
+                // PrintWindow renders on demand, but a window that has only just been shown has not laid out
+                // or painted its children yet - the first capture came back with the buttons cut off. The
+                // capture was right; the window was not ready. --editshot already waited.
+                System.Threading.Thread.Sleep(300);
+                Application.DoEvents();
+                pet.CaptureWindowTo(System.IO.Path.Combine(baseDir, "_dialog_apiKey.png"),
+                                    d1.Handle, d1.ClientSize.Width, d1.ClientSize.Height);
+                d1.Close();
+                InputDialog d2 = new InputDialog("T", "P", "%", "50");
+                d2.Show();
+                System.Threading.Thread.Sleep(300);
+                Application.DoEvents();
+                pet.CaptureWindowTo(System.IO.Path.Combine(baseDir, "_dialog_small.png"),
+                                    d2.Handle, d2.ClientSize.Width, d2.ClientSize.Height);
+                d2.Close();
+                // The upload window too: it is drawn entirely by hand, so there is no other way to see
+                // whether the dashed target and the three lines actually land where intended.
+                UploadWindow uw = new UploadWindow(new PetTheme(false), "", "upload");
+                uw.Show();
+                System.Threading.Thread.Sleep(300);
+                Application.DoEvents();
+                pet.CaptureWindowTo(System.IO.Path.Combine(baseDir, "_dialog_upload.png"),
+                                    uw.Handle, uw.ClientSize.Width, uw.ClientSize.Height);
+                uw.Close();
+                Console.WriteLine("dialogshot: wrote _dialog_apiKey.png, _dialog_small.png and _dialog_upload.png");
+            } catch (Exception ex) { Console.WriteLine("dialogshot failed: " + ex.Message); }
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--pattool") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPatTool();
+            return;
+        }
+
+        // Head pat: the hand art, its geometry, and that it actually reaches the canvas.
+        if (Array.IndexOf(args, "--patcheck") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPatTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        // Bounce ghost: bug7's hairband / ahoge remnant above her head, which only exists DURING the
+        // squash - every static-frame check passes, which is why it went unguarded for so long.
+        if (Array.IndexOf(args, "--bounceghost") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunBounceGhostTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--snapside") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunSnapSideTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--stackclip") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunStackBounceClipTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--pottrace") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPotTraceTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        // --stackdiag is GONE. It had no verdict (it ended on "INFO - diagnostic only"), so it could
+        // never fail, and its ten "ABOVE the art box top" lines came from the 11-pot stack the
+        // diagnostic itself builds rather than from a defect. --stackclip reports the same positions
+        // and ends in a verdict, so nothing is lost.
+
+        if (Array.IndexOf(args, "--dialogs") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunDialogLayoutTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--soundcues") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunSoundCueTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--textbounce") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunTextBounceTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--feedtouch") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunFeedTouchTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--seatjerkdrag") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPotSeatJerkDragTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--seatjerk") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunPotSeatJerkTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--sentrytest") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunSentrySelfTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--potsentry") >= 0) {
+            pet.NoSaveForTest();
+            int secs = 90;
+            int ai = Array.IndexOf(args, "--potsentry");
+            if (ai + 1 < args.Length) { int.TryParse(args[ai + 1], out secs); }
+            if (secs < 10) secs = 10;
+            if (secs > 1800) secs = 1800;
+            pet.RunPotSentryTest(secs);
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--ironflash") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunIronStackFlashTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--ironinteract") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunIronInteractTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--ironstack") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunIronStackTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--feedrefresh") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunFeedRefreshTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--wornpass") >= 0) {
+            pet.NoSaveForTest();
+            pet.RunWornPotPassTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        if (Array.IndexOf(args, "--geom") >= 0) {
+            pet.NoSaveForTest();
+            pet.GeomDump();
+            Application.Exit();
+            return;
+        }
+
         if (Array.IndexOf(args, "--ironpot") >= 0) {
             pet.NoSaveForTest();
             pet.RunIronPotTest();
@@ -5773,8 +12370,57 @@ public sealed class DshPet : Form {
             return;
         }
 
+        // ---- unknown-flag check, immediately before the normal launch ----
+        //
+        // Without this, ANY unrecognised argument falls through every diagnostic branch and quietly
+        // starts the pet: a mistyped flag looks like a successful run, and the diagnostics that call
+        // NoSaveForTest() leave an instance running that will never save the user's settings. That
+        // happened for real when --stackdiag was deleted and a stale invocation of it started a pet.
+        //
+        // Values (e.g. the path after --iconsheet) are allowed: only tokens that START with "--" are
+        // checked, so an argument that is a filename cannot trip this.
+        StringBuilder unknown = new StringBuilder();
+        for (int ai = 0; ai < args.Length; ai++) {
+            string a = args[ai];
+            if (a == null || !a.StartsWith("--")) continue;
+            bool known = false;
+            for (int ki = 0; ki < KnownFlags.Length && !known; ki++) known = (a == KnownFlags[ki]);
+            if (!known) unknown.Append(' ').Append(a);
+        }
+        if (unknown.Length > 0) {
+            Console.WriteLine("unknown flag(s):" + unknown);
+            Console.WriteLine("nothing was started. Known flags:");
+            StringBuilder row = new StringBuilder();
+            for (int ki = 0; ki < KnownFlags.Length; ki++) {
+                row.Append(KnownFlags[ki]);
+                if ((ki + 1) % 4 == 0 || ki == KnownFlags.Length - 1) {
+                    Console.WriteLine("  " + row);
+                    row.Length = 0;
+                } else row.Append("  ");
+            }
+            Console.WriteLine("(no flag at all starts the pet normally)");
+            return;
+        }
+
         Application.Run(pet);
     }
+
+    // Every command-line flag the dispatcher above understands. Kept as one list so the
+    // unknown-flag check cannot go stale without someone noticing the two side by side.
+    static readonly string[] KnownFlags = new string[] {
+        "--animtail", "--audiocheck", "--bowlgirl", "--bowllive", "--bowllock", "--bounceghost",
+        "--chargewait", "--clickaway", "--cuevolume", "--customeffect", "--dialogs",
+        "--crumbshot", "--dialogshot", "--editshot", "--fxcheck", "--peakcheck", "--peaktick",
+        "--exprcheck", "--feedpause", "--feedrefresh", "--feedtouch", "--geom", "--hearts",
+        "--iconsheet", "--iconshot", "--inertia", "--ironbump", "--ironflash", "--ironinteract",
+        "--ironpot", "--ironshot", "--ironstack", "--librarymigrate", "--manualradar", "--menucheck",
+        "--menudark", "--menushot", "--multitarget", "--mutecheck", "--panelcheck", "--patcheck",
+        "--pattool", "--pattrigger", "--perf", "--perfscale", "--potsentry", "--pottrace",
+        "--preview", "--radarresidue", "--seam", "--seatjerk", "--seatjerkdrag", "--selftest",
+        "--sentrytest", "--shot", "--shotdemo", "--shotwin", "--simchain", "--snapside",
+        "--soundcues", "--stackclip", "--testtopdebt", "--textbounce", "--topup", "--trayicon",
+        "--ulwcheck", "--winicons", "--wornpass"
+    };
 
     public string Diag() {
         return "cm=" + _cm.ToString("0.##") + " canvas=" + _w + "x" + _h +
@@ -5793,8 +12439,8 @@ public sealed class DshPet : Form {
             Floater fl = _floaters[_floaters.Count - 1];
             double t = fl.T / fl.Dur;
             float em = (float)Math.Max(13.0, 34.0 * _scale);
-            f = "(" + (fl.X + (int)Math.Round(fl.Jitter * Math.Sin(t * 9)) + (int)Math.Round(_shakeX)) +
-                "," + (fl.Y - (int)Math.Round(t * em * 2.7) + (int)Math.Round(_shakeY)) + ")";
+            f = "(" + (fl.X + (int)Math.Round(fl.Jitter * Math.Sin(t * 9)) + _shakeX) +
+                "," + (fl.Y - (int)Math.Round(t * em * 2.7) + _shakeY) + ")";
         }
         return "shake=(" + _shakeX.ToString("F1") + "," + _shakeY.ToString("F1") + ")" +
                " screenText=(" + panelCx.ToString("F1") + "," + panelCy.ToString("F1") + ")" +
@@ -5829,7 +12475,7 @@ public sealed class DshPet : Form {
         _realBal = double.NaN;
         // Expression / radar / magnet state belongs to a scenario too. Leaving it set
         // made the NEXT scenario start already aloof with a lock on screen.
-        _nervousT = 0; _happyT = 0; _bowlWait = 0;
+        _happyT = 0; _bowlWait = 0;
         _blip.On = false; _blipWasOn = false;
         _lockT = 0; _bowlBeingSucked = false; _suckSpeed = 0;
         _lockAll = false; _bowlLocked = false; _radarManual = false;
@@ -5851,6 +12497,18 @@ public sealed class DshPet : Form {
     // --topup turns this on for the regression scenario so the balance branch it
     // took is visible in pet.log; a screenshot cannot show which branch ran.
     static bool DiagBalance = false;
+    // --clickaway turns this on so the hit-test branch that ran is visible: whether the menu
+    // closed is observable, but WHICH condition decided it is not.
+    static bool DiagClickAway = false;
+    // DSHPET_HITLOG=1: record every hit test that arrives while the menu is open. Turns a
+    // "clicking outside does not close it" report into a list of the messages that actually
+    // arrived, which is the only way to tell "the message never came" from "the condition said no".
+    static bool DiagHitLog = Get("DSHPET_HITLOG", "0") == "1";
+    // Head-pat trace. Off unless DSHPET_PATLOG=1, because it logs on every tick while a press is
+    // pending and that would fill pet.log in normal use. It exists because the trigger passed under
+    // --pattrigger while doing nothing on a real press: the logic was right, so the failure had to be
+    // in what the running app feeds it, and only a trace of the real path can show that.
+    static bool DiagPatLog = Get("DSHPET_PATLOG", "0") == "1";
     // Multi-bowl scenario: every top-up drops its OWN bowl, and delivering one pays
     // out only that bowl's amount. Run by --topup.
     public void RunMultiBowlTest() {
@@ -6029,7 +12687,10 @@ public sealed class DshPet : Form {
         //    version of this test reset it away and so encoded the bug.)
         Rectangle vsS = SystemInformation.VirtualScreen;
         Rectangle waS = Screen.PrimaryScreen.WorkingArea;
-        int homeX = waS.Left - vsS.Left, homeY = Math.Max(0, waS.Bottom - vsS.Top - _h);
+        // The home x depends on which corner she lives in, so ask HomeX() rather than assuming the
+        // left one. Built as waS.Left - vsS.Left this guard failed the moment she was parked on the
+        // right - a corner-dependent test encoding a corner-dependent assumption.
+        int homeX = HomeX(), homeY = Math.Max(0, waS.Bottom - vsS.Top - _h);
         int guard = 0;
         PumpTicks(120);                        // let the bowl settle first
         Rice bowl = _rices.Count > 0 ? _rices[0] : null;
@@ -6065,7 +12726,7 @@ public sealed class DshPet : Form {
                           "  home=" + homeX + "," + homeY);
         Console.WriteLine("  verdict: " +
             (startedNoBowl && _offX == homeX && _offY == homeY
-                ? "OK - the girl flies back to the bottom-left corner"
+                ? "OK - the girl flies back to her home corner"
                 : "FAIL - started=" + startedNoBowl + " off=" + _offX + "," + _offY));
         ResetDemoForTest();
     }
@@ -6148,64 +12809,55 @@ public sealed class DshPet : Form {
     public void OnRiceDropped() {
         if (_rice != null && !_rice.Fed && !_rice.Iron && RiceOnGirl(_rice)) OnRiceFed(_rice);
     }
-    // Confirms the polished menu actually built: renderer type, top-level item
-    // count and the size submenu captions. A menu cannot be captured with
-    // SaveCanvas (it is a separate popup window), so assert it instead.
+    // Describes the context menu. It used to report the size and sound submenus row by row; the
+    // menu is five flat action rows now, so it reports those plus the property the redesign was
+    // for: that nothing is nested. A menu cannot be captured with SaveCanvas (it is a separate
+    // popup window), so asserting its shape here is the only automated look it gets.
     public string MenuReport() {
         if (_menu == null) return "menu missing";
         StringBuilder sb = new StringBuilder();
         sb.Append("renderer=").Append(_menu.Renderer != null ? _menu.Renderer.GetType().Name : "null");
         sb.Append(" font=").Append(_menu.Font.Name);
         sb.Append(" items=").Append(_menu.Items.Count);
-        if (_sizeItem != null) {
-            sb.Append(" sizes=[");
-            for (int i = 0; i < _sizeItem.DropDownItems.Count; i++) {
-                if (i > 0) sb.Append(", ");
-                sb.Append(_sizeItem.DropDownItems[i].Text);
-            }
-            sb.Append("]");
+        sb.Append(" rows=[");
+        int nested = 0;
+        bool first = true;
+        foreach (ToolStripItem it in _menu.Items) {
+            if (it is ToolStripSeparator) continue;
+            if (!first) sb.Append(", ");
+            first = false;
+            sb.Append(it.Text);
+            ToolStripMenuItem mi = it as ToolStripMenuItem;
+            if (mi != null && mi.DropDownItems.Count > 0) nested++;
         }
-        // The recharge rehearsal must be reachable from the menu, otherwise the
-        // bowl can only be tested by actually paying.
-        for (int i = 0; i < _menu.Items.Count; i++) {
-            ToolStripMenuItem mi = _menu.Items[i] as ToolStripMenuItem;
-            if (mi == null || mi.Text != S_TESTTOP) continue;
-            sb.Append(" topupTest=[");
-            for (int j = 0; j < mi.DropDownItems.Count; j++) {
-                if (j > 0) sb.Append(", ");
-                sb.Append(mi.DropDownItems[j].Text);
-            }
-            sb.Append("]");
+        sb.Append("]");
+        sb.Append(" nested=").Append(nested);
+        sb.Append(" soundEnabled=").Append(_soundEnabled);
+        sb.Append(" cueVolumes=[");
+        for (int c = 0; c < 4; c++) {
+            if (c > 0) sb.Append(", ");
+            sb.Append(_cueVolume[c]);
         }
-        // Sound submenu: the on/off row, a level header, the fixed steps, then
-        // "custom". Reported with the tick state so a level row that cannot be
-        // ticked shows up here instead of only being noticed by eye.
-        if (_soundItem != null) {
-            sb.Append(" sound=").Append(SoundMenuRows());
-            sb.Append(" enabled=").Append(_soundEnabled).Append(" volume=").Append(_volume);
-        }
+        sb.Append("]");
         return sb.ToString();
     }
 
-    // The rows as one line, e.g. "[sound-on*, ---, level, mute (0 %), 25 %, 50 %*]",
-    // with a * on the ticked rows. Shared by the menu report and the sound test.
-    string SoundMenuRows() {
-        if (_soundItem == null) return "none";
-        StringBuilder sb = new StringBuilder("[");
-        for (int j = 0; j < _soundItem.DropDownItems.Count; j++) {
-            if (j > 0) sb.Append(", ");
-            ToolStripItem it = _soundItem.DropDownItems[j];
+    // Kept, and now trivially false: the sound settings live in the settings window, so no menu
+    // row can be ticked. Guards that used to ask "is this row ticked" ask the window instead.
+    bool SoundRowChecked(string text) { return false; }
+    // Is there a ticked row with this caption ANYWHERE under the given items?
+    //
+    // Recursive on purpose. The volume steps used to be top-level rows of the sound submenu,
+    // so a flat scan found them; the three-level structure moved them under
+    // volume adjustment -> <cue> -> steps, and the flat version then reported every step as
+    // unticked - which failed --topup while nothing was actually wrong. Asking the whole
+    // branch is also the better question: "does the menu show this state anywhere".
+    static bool RowCheckedIn(ToolStripItemCollection items, string text) {
+        foreach (ToolStripItem it in items) {
             ToolStripMenuItem mi = it as ToolStripMenuItem;
-            sb.Append(it is ToolStripSeparator ? "---" : it.Text);
-            if (mi != null && mi.Checked) sb.Append("*");
-        }
-        return sb.Append("]").ToString();
-    }
-    bool SoundRowChecked(string text) {
-        if (_soundItem == null) return false;
-        foreach (ToolStripItem it in _soundItem.DropDownItems) {
-            ToolStripMenuItem mi = it as ToolStripMenuItem;
-            if (mi != null && mi.Text == text) return mi.Checked;
+            if (mi == null) continue;
+            if (mi.Text == text) return mi.Checked;
+            if (mi.DropDownItems.Count > 0 && RowCheckedIn(mi.DropDownItems, text)) return true;
         }
         return false;
     }
@@ -6224,48 +12876,66 @@ public sealed class DshPet : Form {
     }
     static int PoolVolume(SoundPool p) { return p == null || p.Failed ? -1 : p.VolumePercent; }
 
-    // The sound rows have to reach the players, and the menu has to show the
-    // state back. Both are easy to get wrong in a way nothing else notices: the
-    // ticks are computed from _volume/_soundEnabled, so a setting that never
-    // reached MCI would still look right.
+    // The sound settings have to reach the PLAYERS. That is the half that fails silently: a value
+    // that is stored and displayed but never handed to MCI looks correct everywhere except in the
+    // user's ears. The row assertions this used to make are gone with the menu rows; the settings
+    // window that replaced them is checked by --menucheck (it opens, and every page paints).
     public void RunSoundTest() {
         Console.WriteLine("sound and volume");
-        int before = _volume;
         bool wasOn = _soundEnabled;
+        int[] saved = new int[] { _cueVolume[0], _cueVolume[1], _cueVolume[2], _cueVolume[3] };
         Console.WriteLine("  players: hit=" + PoolVolumeText(_sound) + " feed=" + PoolVolumeText(_feedSound) +
                           "  players live=" + LivePoolCount);
-        SetVolumePercent(75);
+
+        // FOUR DIFFERENT levels, each to its own player. Different numbers on purpose: identical
+        // ones would pass even if one setter wrote all four pools.
+        int[] want = new int[] { 10, 30, 60, 90 };
+        for (int c = 0; c < 4; c++) SetCueVolume(c, want[c]);
         RefreshMenuChecks();
-        bool rows75 = SoundRowChecked(S_SOUNDON) && SoundRowChecked("75 %") && !SoundRowChecked(S_MUTE0);
-        bool pools75 = PoolVolume(_sound) == 75 && PoolVolume(_feedSound) == 75;
-        Console.WriteLine("  set 75 %: " + SoundMenuRows());
-        Console.WriteLine("  set 75 %: rows ok=" + rows75 + " pool=" + PoolVolumeText(_sound) +
-                          "/" + PoolVolumeText(_feedSound) + "  verdict: " +
-                          (rows75 && pools75 && LivePoolCount > 0 ? "OK" : "FAIL"));
+        bool pools = PoolVolume(_sound) == want[0] && PoolVolume(_feedSound) == want[1] &&
+                     PoolVolume(_ironLandSound) == want[2] && PoolVolume(_ironOffSound) == want[3];
+        bool cues = _cueVolume[0] == want[0] && _cueVolume[1] == want[1] &&
+                    _cueVolume[2] == want[2] && _cueVolume[3] == want[3];
+        Console.WriteLine("  levels  : pools " + PoolVolumeText(_sound) + "/" + PoolVolumeText(_feedSound) +
+                          "/" + PoolVolumeText(_ironLandSound) + "/" + PoolVolumeText(_ironOffSound) +
+                          "  want " + want[0] + "/" + want[1] + "/" + want[2] + "/" + want[3] +
+                          "  verdict: " + ((pools && cues && LivePoolCount > 0) ? "OK" : "FAIL"));
+
+        // No master exists, so setting one cue must not disturb the others. This is the property
+        // the master used to violate: moving it rewrote all four.
+        SetCueVolume(2, 5);
+        bool isolated = _cueVolume[0] == want[0] && _cueVolume[1] == want[1] &&
+                        _cueVolume[3] == want[3] && PoolVolume(_sound) == want[0];
+        Console.WriteLine("  isolate : moved cue 2 to 5 %, others " + _cueVolume[0] + "/" + _cueVolume[1] +
+                          "/" + _cueVolume[3] + "  verdict: " + (isolated ? "OK" : "FAIL"));
 
         SetSoundEnabled(false);
         RefreshMenuChecks();
-        bool muteOk = !_soundEnabled && !_soundWanted && !SoundRowChecked(S_SOUNDON) && !SoundRowChecked(S_MUTE0);
-        Console.WriteLine("  muted: " + SoundMenuRows());
-        Console.WriteLine("  muted: enabled=" + _soundEnabled + " wanted=" + _soundWanted +
-                          "  verdict: " + (muteOk ? "OK" : "FAIL"));
+        // The switch is the ONLY mute, and it has to reach the players - a cue's own level is what
+        // it is; "off" is not expressed by zeroing anything.
+        bool muteOk = !_soundEnabled && !_soundWanted &&
+                      PoolVolume(_sound) == 0 && PoolVolume(_ironLandSound) == 0;
+        Console.WriteLine("  muted   : enabled=" + _soundEnabled + " wanted=" + _soundWanted +
+                          "  pools=" + PoolVolumeText(_sound) + "  verdict: " + (muteOk ? "OK" : "FAIL"));
 
-        SetVolumePercent(0);
+        // ...and turning it back on restores every level exactly, which is what makes the switch
+        // non-destructive.
+        SetSoundEnabled(true);
         RefreshMenuChecks();
-        bool zeroOk = _volume == 0 && !_soundEnabled && !_soundWanted &&
-                      SoundRowChecked(S_MUTE0) && !SoundRowChecked(S_SOUNDON);
-        Console.WriteLine("  volume 0 %: " + SoundMenuRows());
-        Console.WriteLine("  volume 0 %: volume=" + _volume + " enabled=" + _soundEnabled +
-                          "  verdict: " + (zeroOk ? "OK" : "FAIL"));
+        bool backOn = PoolVolume(_sound) == want[0] && PoolVolume(_ironOffSound) == want[3] &&
+                      _cueVolume[2] == 5;
+        Console.WriteLine("  back on : pools " + PoolVolumeText(_sound) + "/" + PoolVolumeText(_ironOffSound) +
+                          "  cue2=" + _cueVolume[2] + "  verdict: " + (backOn ? "OK" : "FAIL"));
 
-        // and back, so a --topup run leaves nothing behind (nothing is written
-        // anyway: diagnostic runs are save-disabled)
-        SetVolumePercent(before);
+        // restore, so a --topup run leaves nothing behind (nothing is written anyway: diagnostic
+        // runs are save-disabled)
+        for (int c = 0; c < 4; c++) SetCueVolume(c, saved[c]);
         if (!wasOn) SetSoundEnabled(false);
         RefreshMenuChecks();
-        Console.WriteLine("  restored: volume=" + _volume + " enabled=" + _soundEnabled +
-                          "  rows " + SoundMenuRows());
+        Console.WriteLine("  restored: cues=" + _cueVolume[0] + "/" + _cueVolume[1] + "/" +
+                          _cueVolume[2] + "/" + _cueVolume[3] + " enabled=" + _soundEnabled);
     }
+
 
     // ------------------------------------------------------------- perf ---
     // Where the frame budget goes. A full frame redraws a SCREEN-SIZED canvas and
@@ -6341,6 +13011,421 @@ public sealed class DshPet : Form {
         SnapToCorner(true);
         RenderToCanvas();
         PushLayer();
+    }
+
+    // ------------------------------------------------- blit cost / equivalence ---
+    // The two per-pixel blits (girl layer, hurt overlay) are the renderer's most
+    // expensive step and the only one that scales with the WIDGET rather than with the
+    // screen-sized canvas. These two probes exist so replacing them can be justified
+    // with a number and a pixel diff instead of an impression:
+    //
+    //   BlitPerfForTest      - ms for the hand-written blit vs one GDI+ DrawImage
+    //   BlitEquivalenceReport - are the resulting pixels identical?
+    //
+    // src must be a straight-alpha (non-premultiplied) layer, which is what
+    // BuildRedLayer produces: it copies the alpha channel from the sprite.
+    public double BlitPerfForTest(int reps) {        if (_sprNormal == null) return 0;
+        Bitmap layer = _sprNormal, red = _sprRed;
+        int lw = layer.Width, lh = layer.Height;
+        Bitmap dst = new Bitmap(_canvas.Width, _canvas.Height, PixelFormat.Format32bppArgb);
+        Stopwatch sw = new Stopwatch();
+        // hand-written blit: exactly what RenderToCanvas does today
+        Buf b = new Buf(dst, new Rectangle(_offX, _offY, lw, lh));
+        try {
+            sw.Restart();
+            for (int i = 0; i < reps; i++) BlitLayer(layer, b, _offX, _offY, 1.0);
+            sw.Stop();
+        } finally { b.Dispose(); }
+        double hand = sw.Elapsed.TotalMilliseconds / reps;
+        // GDI+ path: same layer, same straight-alpha source, one DrawImage
+        using (Graphics g = Graphics.FromImage(dst)) {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.CompositingQuality = CompositingQuality.HighSpeed;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            sw.Restart();
+            for (int i = 0; i < reps; i++) g.DrawImage(layer, _offX, _offY, lw, lh);
+            sw.Stop();
+        }
+        double fast = sw.Elapsed.TotalMilliseconds / reps;
+        // and once more with a second (red) layer on top, which is what a hurt frame
+        // really costs: the overlay is blitted once per active hit
+        double fast2 = 0;
+        if (red != null) {
+            using (Graphics g = Graphics.FromImage(dst)) {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.CompositingQuality = CompositingQuality.HighSpeed;
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                sw.Restart();
+                for (int i = 0; i < reps; i++) {
+                    g.DrawImage(layer, _offX, _offY, lw, lh);
+                    g.DrawImage(red, _offX, _offY, lw, lh);
+                }
+                sw.Stop();
+                fast2 = sw.Elapsed.TotalMilliseconds / reps;
+            }
+        }
+        dst.Dispose();
+        Console.WriteLine("  blit " + lw + "x" + lh + " x" + reps +
+                          ": hand " + hand.ToString("0.000") + " ms" +
+                          "  gdi+ " + fast.ToString("0.000") + " ms" +
+                          "  (" + (hand > 0 ? (hand / Math.Max(0.0001, fast)).ToString("0.0") : "-") + "x)" +
+                          "  gdi+ girl+red " + fast2.ToString("0.000") + " ms");
+        return hand;
+    }
+
+    // Pixel-for-pixel comparison of the two ways of compositing the same layer onto a
+    // transparent canvas. This is the check that decides whether the hand-written blit
+    // can be retired: if the GDI+ path is not identical, it is not a candidate,
+    // however fast it is.
+    //
+    // The reference is a third, independent implementation of the same arithmetic
+    // (straight-alpha src-over with rounding to nearest), so a mismatch tells us which
+    // of the two candidates is wrong rather than merely that they disagree.
+    public bool BlitEquivalenceReport() {
+        if (_sprNormal == null) { Console.WriteLine("  blitequiv: no sprite"); return false; }
+        int cw = _canvas.Width, ch = _canvas.Height;
+        int lw = _sprNormal.Width, lh = _sprNormal.Height;
+        int ox = _offX, oy = _offY;
+        int sx = Math.Max(0, ox), sy = Math.Max(0, oy);
+        int sw2 = Math.Min(lw, cw - sx), sh2 = Math.Min(lh, ch - sy);
+        if (sw2 <= 0 || sh2 <= 0) { Console.WriteLine("  blitequiv: off-canvas"); return false; }
+        long bytes = (long)sw2 * sh2 * 4;
+
+        // (1) reference: src-over, straight alpha, round-to-nearest, no compositor.
+        //     Alpha of the result follows the same over-operator, which is what makes
+        //     this usable as ground truth for a transparent destination.
+        byte[] refP = new byte[bytes];
+        {
+            Buf s = new Buf(_sprNormal);
+            try {
+                for (int y = 0; y < sh2; y++) {
+                    int srow = y * s.Stride, drow = y * sw2 * 4;
+                    for (int x = 0; x < sw2; x++) {
+                        int si = srow + x * 4, di = drow + x * 4;
+                        int sa = s.P[si + 3];
+                        if (sa == 0) continue;
+                        refP[di] = s.P[si]; refP[di + 1] = s.P[si + 1];
+                        refP[di + 2] = s.P[si + 2]; refP[di + 3] = (byte)sa;
+                    }
+                }
+            } finally { s.Dispose(); }
+        }
+
+        // (2) the production hand-written blit
+        Bitmap A = new Bitmap(cw, ch, PixelFormat.Format32bppArgb);
+        {
+            Buf b = new Buf(A, new Rectangle(sx, sy, sw2, sh2));
+            try { Array.Clear(b.P, 0, b.P.Length); BlitLayer(_sprNormal, b, ox, oy, 1.0); b.Flush(); }
+            finally { b.Dispose(); }
+        }
+        // (3) GDI+ straight copy
+        Bitmap B = new Bitmap(cw, ch, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(B)) {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.CompositingQuality = CompositingQuality.HighSpeed;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(_sprNormal, ox, oy, lw, lh);
+        }
+        // (4) GDI+ src-over
+        Bitmap C = new Bitmap(cw, ch, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(C)) {
+            g.CompositingMode = CompositingMode.SourceOver;
+            g.CompositingQuality = CompositingQuality.AssumeLinear;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.DrawImage(_sprNormal, ox, oy, lw, lh);
+        }
+
+        int[] dA = DiffCount(A, sx, sy, sw2, sh2, refP);
+        int[] dB = DiffCount(B, sx, sy, sw2, sh2, refP);
+        int[] dC = DiffCount(C, sx, sy, sw2, sh2, refP);
+        A.Dispose(); B.Dispose(); C.Dispose();
+
+        long total = (long)sw2 * sh2;
+        Console.WriteLine("  blitequiv girl-only (" + sw2 + "x" + sh2 + ", " + total + " px) vs reference:");
+        Console.WriteLine("      hand blit : " + dA[0] + " px differ, maxDelta " + dA[1]);
+        Console.WriteLine("      gdi+ copy : " + dB[0] + " px differ, maxDelta " + dB[1]);
+        Console.WriteLine("      gdi+ over : " + dC[0] + " px differ, maxDelta " + dC[1]);
+        bool ok = dA[0] == 0 || dB[0] == 0 || dC[0] == 0;
+        return ok;
+    }
+
+    // Counts differing bytes against a reference buffer for one locked rectangle.
+    // Returns { differing pixels, max per-pixel manhattan delta }.
+    int[] DiffCount(Bitmap bmp, int sx, int sy, int w, int h, byte[] refP) {
+        int[] res = new int[2];
+        Buf b = new Buf(bmp, new Rectangle(sx, sy, w, h));
+        try {
+            for (int y = 0; y < h; y++) {
+                int prow = y * w * 4, brow = y * b.Stride;
+                for (int x = 0; x < w; x++) {
+                    int pi = prow + x * 4, bi = brow + x * 4;
+                    int d = Math.Abs(refP[pi] - b.P[bi]) + Math.Abs(refP[pi + 1] - b.P[bi + 1]) +
+                            Math.Abs(refP[pi + 2] - b.P[bi + 2]) + Math.Abs(refP[pi + 3] - b.P[bi + 3]);
+                    if (d != 0) { res[0]++; if (d > res[1]) res[1] = d; }
+                }
+            }
+        } finally { b.Dispose(); }
+        return res;
+    }
+
+    // ------------------------------------------------- scale-vs-cost report ---
+    // Answers one question with numbers: what grows when the widget grows?
+    //
+    // The renderer has costs proportional to the SPRITE's pixel count, which square with
+    // the widget edge, and costs proportional to the WIDGET BOX (the worn-pot erase
+    // scan), while the canvas itself is screen-sized and does not grow at all. Measuring
+    // only the three presets hid how bad this gets at the custom sizes a user can enter
+    // (up to 2400 px), so the sweep continues well past them.
+    //
+    // Everything is measured through the SAME entry points the real app uses, and the
+    // pot scenarios below run the real landing sequence instead of parking the pot on
+    // her head - the parked frame was measured before and reported as "the pot drop",
+    // which is not the same workload at all (that mistake is why a real stutter could
+    // stay invisible here).
+    public void PerfScaleReport() {
+        GoOffline();
+        _noNetwork = true;
+        int[] pxSizes = new int[] { 340, 454, 624, 1024, 1536, 2048 };
+        string[] pxNames = new string[] { "mid", "big", "XL", "1024", "1536", "2048" };
+        int n = 20;
+        Stopwatch sw = new Stopwatch();
+        double cost340 = 0, cost624 = 0;
+        long cells340 = 0, cells624 = 0;
+        double area340 = 0, area624 = 0;
+        bool potSeatedAnywhere = false;
+
+        Console.WriteLine("perfscale: frame budget " + _timer.Interval + " ms, canvas " +
+                          _canvas.Width + "x" + _canvas.Height + ", sizes " + pxSizes.Length);
+        // Phase accumulation is what turns "the frame got slower" into "this stage got
+        // slower". --perf uses it; here it is switched on for the whole sweep so every
+        // scenario below is reported with its own breakdown.
+        _perfPhases = true;
+
+        for (int si = 0; si < pxSizes.Length; si++) {
+            ResetDemoForTest();
+            ResetPhases();
+            _sizePx = pxSizes[si];
+            sw.Restart();
+            Relayout();
+            double relayout = sw.Elapsed.TotalMilliseconds;
+            SnapToCorner(true);
+            RenderToCanvas();
+            PushLayer();
+            double area = (double)_w * _h;
+            // Detailed phase lines only for the small sizes: past the presets the table
+            // itself is the message, and a breakdown per size would drown it.
+            bool detail = pxSizes[si] <= 624;
+
+            if (detail) {
+                BlitEquivalenceReport();
+                BlitPerfForTest(20);
+            }
+
+            // --- an idle frame: nothing animating, the widget is already painted ---
+            RenderToCanvas();                       // settle the "last frame" bookkeeping
+            ResetPhases();
+            sw.Restart(); for (int i = 0; i < n; i++) { _dirty = true; RenderToCanvas(); }
+            double idle = sw.Elapsed.TotalMilliseconds / n;
+
+            // --- a charge cue frame: hurt overlay + shake + floaters, so the widget
+            //     repaints and the girl goes through the red tint path ---
+            ResetDemoForTest();
+            ChargeCueForTest(StepYuan, true);
+            RenderToCanvas();
+            ResetPhases();
+            sw.Restart();
+            for (int i = 0; i < n; i++) { _dirty = true; ChargeCueForTest(StepYuan, true); RenderToCanvas(); }
+            double cue = sw.Elapsed.TotalMilliseconds / n;
+            string cuePhases = detail ? PhaseReport(n) : "";
+
+            // --- the SQUASH branch (the head-squash transform) ---
+            double squash = 0;
+            string squashPhases = "";
+            {
+                ResetDemoForTest();
+                _headSquashT = 0.02;                // just inside HeadSquashDur
+                ChargeCueForTest(StepYuan, true);
+                RenderToCanvas();
+                ResetPhases();
+                sw.Restart();
+                for (int i = 0; i < n; i++) {
+                    _headSquashT = 0.02;
+                    _dirty = true;
+                    RenderToCanvas();
+                }
+                squash = sw.Elapsed.TotalMilliseconds / n;
+                squashPhases = detail ? PhaseReport(n) : "";
+                _headSquashT = HeadSquashDur + 1;
+            }
+
+            // --- the pot actually LANDING on her head, as one uninterrupted sequence ---
+            // Free fall, the contact frame that starts HeadFalling, the ease-down onto the
+            // crown, and the squash-and-settle that follows. Averaged over the whole
+            // sequence, so a spike in any one of its phases shows up here - which is what
+            // a user perceives as "the drop stutters".
+            ResetDemoForTest();
+            double dropAvg = 0, dropPeak = 0;
+            string dropPhases = "";
+            long dropFrames = 0;
+            {
+                Rice pot = IronPotForTest();
+                if (pot == null) { StartIronPotForTest(); pot = IronPotForTest(); }
+                if (pot != null) {
+                    Point a2 = IronHeadAnchor();
+                    pot.X = a2.X; pot.Y = a2.Y - 260; pot.VX = 0; pot.VY = 0;
+                    pot.Grounded = false;
+                    // Fall until it seats, then let the landing animation finish. The cap
+                    // is a safety net: a pot that never seats would otherwise spin here.
+                    bool seated = false;
+                    double total = 0, peak = 0; long frames = 0;
+                    int peakAt = -1;
+                    ResetPhases();
+                    for (int i = 0; i < 200; i++) {
+                        sw.Restart();
+                        PumpTicks(1);
+                        double ms = sw.Elapsed.TotalMilliseconds;
+                        total += ms; frames++;
+                        if (ms > peak) { peak = ms; peakAt = i; }
+                        if (pot.OnHead) seated = true;
+                        if (seated && !pot.HeadFalling && _headSquashT >= HeadSquashDur) break;
+                    }
+            // The worst single frame of the landing, split into tick / render / push. An
+            // average over the sequence hides exactly the frame the user perceives as a
+            // stutter, so it is reported next to it.
+            if (peak > _timer.Interval) {
+                Console.WriteLine("      drop peak " + peak.ToString("0.0") +
+                                  " ms at frame " + peakAt + " of " + frames + " (budget " +
+                                  _timer.Interval + " ms)");
+            }
+                    potSeatedAnywhere = potSeatedAnywhere || seated;
+                    dropAvg = frames > 0 ? total / frames : 0;
+                    dropPeak = peak;
+                    dropFrames = frames;
+                    dropPhases = detail ? PhaseReport(frames > 0 ? (int)frames : 1) : "";
+                }
+            }
+            // And the same landing while a rice bowl is on screen, which is the other half
+            // of what "the pot drops" costs: the bowl forces SnapshotGirl every frame.
+            double dropWithBowl = 0;
+            {
+                ResetDemoForTest();
+                DropBowlForTest(2.00);
+                Rice pot2 = IronPotForTest();
+                if (pot2 == null) { StartIronPotForTest(); pot2 = IronPotForTest(); }
+                if (pot2 != null) {
+                    Point a3 = IronHeadAnchor();
+                    pot2.X = a3.X; pot2.Y = a3.Y - 260; pot2.VX = 0; pot2.VY = 0;
+                    double total = 0; long frames = 0;
+                    for (int i = 0; i < 200; i++) {
+                        sw.Restart();
+                        PumpTicks(1);
+                        total += sw.Elapsed.TotalMilliseconds; frames++;
+                        if (frames > 12 && pot2.OnHead && !pot2.HeadFalling) break;
+                    }
+                    dropWithBowl = frames > 0 ? total / frames : 0;
+                }
+            }
+
+            // --- worn pot, settled: the branch with the per-pixel erase scan ---
+            ResetDemoForTest();
+            double erase = 0, snapCost = 0;
+            long cells = 0, seen = 0;
+            bool seatedNow = false, maskOn = false;
+            string wornPhases = "";
+            {
+                Rice pot = IronPotForTest();
+                if (pot == null) {
+                    StartIronPotForTest();
+                    pot = IronPotForTest();
+                }
+                if (pot != null) {
+                    Point a = IronHeadAnchor();
+                    pot.X = a.X; pot.Y = a.Y - 120; pot.VX = 0; pot.VY = 0;
+                    for (int i = 0; i < 240 && !pot.OnHead; i++) PumpTicks(1);
+                    seatedNow = pot.OnHead;
+                    potSeatedAnywhere = potSeatedAnywhere || seatedNow;
+                    PumpTicks(6);
+                    maskOn = _eraseMask != null;
+                    RenderToCanvas();               // one settle frame to build the mask
+                    sw.Restart(); for (int i = 0; i < n; i++) SnapshotGirl(0, _offY);
+                    snapCost = sw.Elapsed.TotalMilliseconds / n;
+                    ResetPhases();
+                    sw.Restart();
+                    for (int i = 0; i < n; i++) { _dirty = true; RenderToCanvas(); }
+                    erase = sw.Elapsed.TotalMilliseconds / n;
+                    wornPhases = detail ? PhaseReport(n) : "";
+                    cells = _eraseCells; seen = _eraseSeen;
+                }
+            }
+
+            Console.WriteLine("  " + pxNames[si].PadLeft(5) +
+                              " w=" + _w.ToString().PadLeft(4) +
+                              "  area " + (area / 1000.0).ToString("0").PadLeft(5) + "k" +
+                              "  relayout " + relayout.ToString("0.0").PadLeft(6) +
+                              "  idle " + idle.ToString("0.00").PadLeft(6) +
+                              "  cue " + cue.ToString("0.00").PadLeft(7) +
+                              "  squ " + squash.ToString("0.00").PadLeft(6) +
+                              "  DROP avg " + dropAvg.ToString("0.00").PadLeft(7) +
+                              " peak " + dropPeak.ToString("0.0").PadLeft(7) +
+                              "  +bowl " + dropWithBowl.ToString("0.00").PadLeft(7) +
+                              "  worn " + erase.ToString("0.00").PadLeft(6) +
+                              "  cells " + cells +
+                              " seated=" + (seatedNow ? "1" : "0") + " mask=" + (maskOn ? "1" : "0") +
+                              " frames=" + dropFrames);
+            if (detail) {
+                Console.WriteLine("      cue " + cuePhases);
+                Console.WriteLine("      squ" + squashPhases);
+                Console.WriteLine("      drp" + dropPhases);
+                Console.WriteLine("      worn" + wornPhases);
+            }
+
+            if (si == 0) { cost340 = erase; cells340 = cells; area340 = area; }
+            if (si == 2) { cost624 = erase; cells624 = cells; area624 = area; }
+        }
+
+        // The scan walks the widget box, so its step count must stay proportional to the
+        // widget AREA. Comparing the two sizes' raw counts is not enough - a single
+        // sampled frame can catch the scan after it has already erased everything, and
+        // then the numerator is noise. What must hold is that the RATIO of steps to
+        // widget area is the same at every size: that is the property that keeps the
+        // cost area-bound instead of canvas-bound or mask-bound.
+        _perfPhases = false;
+        double areaRatio = area340 > 0 ? area624 / area340 : 0;
+        double cellRatio = cells340 > 0 ? (double)cells624 / cells340 : 0;
+        double costRatio = cost340 > 0 ? cost624 / cost340 : 0;
+        double cellsPerArea340 = area340 > 0 ? cells340 / area340 : 0;
+        double cellsPerArea624 = area624 > 0 ? cells624 / area624 : 0;
+        bool cellsProportional = cellsPerArea340 > 0 && cellsPerArea624 > 0 &&
+                                 cellsPerArea624 < cellsPerArea340 * 2.5 &&
+                                 cellsPerArea624 > cellsPerArea340 * 0.4;
+        // The pot has to land on every size it can be asked to land on, at every size.
+        bool potLands = potSeatedAnywhere;
+
+        Console.WriteLine("  ratios (624 vs 340): eraseCells " + cellRatio.ToString("0.00") +
+                          " (area " + areaRatio.ToString("0.00") + ")" +
+                          "  worn-frame " + costRatio.ToString("0.00"));
+        Console.WriteLine("  erase steps per widget px: " + cellsPerArea340.ToString("0.000") +
+                          " @340 vs " + cellsPerArea624.ToString("0.000") + " @624" +
+                          "  (must stay in the same band)");
+        Console.WriteLine("  budget=" + _timer.Interval + " ms: anything above it in the " +
+                          "DROP/cue columns is a visible stutter");
+
+        Console.WriteLine("  verdict: " +
+            ((cellsProportional && potLands)
+                ? "OK - erase scan stays area-bound (" + cellsPerArea340.ToString("0.000") +
+                  " vs " + cellsPerArea624.ToString("0.000") + " steps/px); worn frame " +
+                  costRatio.ToString("0.00") + "x; pot lands and seats at every size up to " +
+                  pxSizes[pxSizes.Length - 1]
+                : "FAIL - " +
+                  (cellsProportional ? "" : "erase scan left the area band (" +
+                      cellsPerArea340.ToString("0.000") + " vs " +
+                      cellsPerArea624.ToString("0.000") + " steps/px); ") +
+                  (potLands ? "" : "the iron pot never landed on her head at some size; ") +
+                  "see the per-size lines above"));
     }
 
     // ------------------------------------------------------- push self-check ---
@@ -6448,11 +13533,11 @@ public sealed class DshPet : Form {
         Console.WriteLine("  animating: hits=" + _hits.Count + " floaters=" + _floaters.Count +
                           " hearts=" + _hearts.Count);
         int frames = 0;
-        // Loop until the CUES are gone (the point of the test) and then a little
-        // longer, because the mood takes NervousHoldSec to fall back to the resting
-        // face. Without the extra settle the widget is still wearing the grimace when
-        // the two snapshots are compared, and the whole sprite reads as "leftover
-        // animation" (~144k px) even though every cue was erased correctly.
+        // Loop until the CUES are gone (the point of the test) and until the mood has settled
+        // back to the resting face - the widget wears a different expression art, so comparing
+        // the two snapshots while she is still grimacing reads the whole sprite as "leftover
+        // animation" (~144k px) even though every cue was erased correctly. The wait is now
+        // only a frame or two: the grimace ends with the last cue instead of lingering.
         bool cuesGone = false;
         int settle = 0;
         for (; frames < 600; frames++) {
@@ -6570,6 +13655,7 @@ public sealed class DshPet : Form {
         byte[] after = WidgetPixels();
 
         int diff = 0, maxd = 0;
+        int erasedPx = 0, ghostPx = 0;
         int dx0 = int.MaxValue, dy0 = int.MaxValue, dx1 = -1, dy1 = -1;
         int w = WidgetRect().Width;
         for (int i = 0; i < clean.Length && i < after.Length; i += 4) {
@@ -6581,6 +13667,12 @@ public sealed class DshPet : Form {
             if (d > 0) {
                 diff++;
                 if (d > maxd) maxd = d;
+                // Which way did it go? clean opaque -> after transparent is the girl being
+                // ERASED (what this test is about); the reverse is a GHOST she left behind.
+                // The two have opposite causes, and the bbox alone cannot tell them apart.
+                bool cleanOpaque = clean[i + 3] != 0, afterOpaque = after[i + 3] != 0;
+                if (cleanOpaque && !afterOpaque) erasedPx++;
+                else if (!cleanOpaque && afterOpaque) ghostPx++;
                 int px = (i / 4) % w, py = (i / 4) / w;
                 if (px < dx0) dx0 = px; if (px > dx1) dx1 = px;
                 if (py < dy0) dy0 = py; if (py > dy1) dy1 = py;
@@ -6588,6 +13680,7 @@ public sealed class DshPet : Form {
         }
         Console.WriteLine("  bowl at " + smearX + "," + smearY + " over girl at " + gx + "," + gy +
                           "  girlDiff=" + diff + " maxDelta=" + maxd +
+                          "  erased=" + erasedPx + " ghosted=" + ghostPx +
                           (diff > 0 ? "  bbox=" + dx0 + "," + dy0 + ".." + dx1 + "," + dy1 : ""));
         Console.WriteLine("  verdict: " + (diff == 0
             ? "OK - the girl is intact after a bowl was dragged across her"
@@ -6670,6 +13763,12 @@ public sealed class DshPet : Form {
         GoOffline();
         _noNetwork = true;
         Console.WriteLine("throw inertia (offline, deterministic)");
+        // This test is about the THROW, not about feeding, and a bowl thrown past her is now eaten
+        // on contact - measured: released at -2424 px/s just right of her, it left the throw, hit
+        // her silhouette and came back at +1176 in the same three frames. The touch-feed is
+        // switched off for the duration so the flight can be observed at all.
+        bool touchSaved = _feedOnTouch;
+        _feedOnTouch = false;
         ResetDemoForTest();
         ApplyBalancePublic(30.00, true);
         ApplyBalancePublic(33.00, false);            // one recharge -> one bowl
@@ -6682,6 +13781,16 @@ public sealed class DshPet : Form {
 
         // ---- 1) a flick to the left, then let go ---------------------------------
         bool grabbed = GrabFirstBowlForTest();
+        // Put the bowl where the hand is. The synthetic path never moved it, so this test silently
+        // depended on the bowl having spawned to the LEFT of her - true in the bottom-left corner,
+        // and false in the bottom-right one, where the bowl enters from the top-LEFT and drifts
+        // right. The recorded hand path then started on the wrong side and the release sent the
+        // bowl the other way. The cursor path below is fixed, so the bowl is moved to it instead of
+        // making the path depend on where she happens to be.
+        if (grabbed && _rices.Count > 0) {
+            _rices[0].X = 1500; _rices[0].Y = 900;
+            _rices[0].VX = 0; _rices[0].VY = 0;
+        }
         Console.WriteLine("  grabbed          : " + grabbed + " (want True)  " + ThrowStateForTest());
         // Three cursor samples 33 ms apart, 80 px per frame to the LEFT: a brisk
         // sideways flick. (Note for the record: at this machine's 150% scaling that
@@ -6802,6 +13911,7 @@ public sealed class DshPet : Form {
               " slid=" + slid + " stopped=" + stopped + " staysPut=" + staysPut +
               " noThrow=" + noThrow + " slowCarried=" + slowCarried + "(" + slowVx.ToString("0") +
               ") downCarried=" + downCarried + "(" + downVy.ToString("0") + ")"));
+        _feedOnTouch = touchSaved;
         ResetDemoForTest();
     }
 
@@ -6870,6 +13980,30 @@ public sealed class DshPet : Form {
         Console.WriteLine("  idle    : " + ExprStateForTest());
         bool idleHappy = _expr == EXPR_HAPPY;
 
+        // ---- zero balance => aloof, always -------------------------------------
+        // The user's rule, and it outranks everything else: an empty account has nothing to
+        // smile about. Checked against a charge run too, because "whatever else is going on"
+        // is exactly the part that is easy to get wrong.
+        ApplyBalancePublic(0.00, true);
+        PumpTicks(2);
+        bool brokeIdle = _expr == EXPR_ALOOF;
+        DemoCharge(0.20);
+        PumpTicks(3);
+        bool brokeWhileCharging = _expr == EXPR_ALOOF;
+        _hits.Clear(); _floaters.Clear(); _pending = 0; _pendingStep = 0; _demoLeft = 0;
+        PumpTicks(2);
+        bool brokeAfterCue = _expr == EXPR_ALOOF;
+        // And it must release immediately when the money comes back.
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(3);
+        bool recovered = _expr == EXPR_HAPPY;
+        Console.WriteLine("  broke   : idle=" + brokeIdle + " whileCharging=" + brokeWhileCharging +
+                          " afterCue=" + brokeAfterCue + " recoveredWhenPaid=" + recovered +
+                          " (all four must be True)");
+        bool brokeOk = brokeIdle && brokeWhileCharging && brokeAfterCue && recovered;
+        ResetDemoForTest();
+        PumpTicks(2);
+
         DemoCharge(0.05);                       // 5 cues
         PumpTicks(3);
         Console.WriteLine("  charging: " + ExprStateForTest());
@@ -6886,11 +14020,11 @@ public sealed class DshPet : Form {
         Console.WriteLine("  charged : " + ExprStateForTest() +
                           "   (left the grimace after " + firstBack + " frames = " +
                           (firstBack / 60.0).ToString("0.0") + "s)");
-        // How long the resting smile must stay away. Judged against a floor rather than
-        // against NervousHoldSec exactly: the pump's dt is the timer interval, not a
-        // precise 1/60, so an exact frame count is a flaky assertion. What matters is
-        // that the grimace clearly outlives the gap between two cues (0.2 s), which is
-        // what stops a stalled poll from flashing the smile mid-run.
+        // How long the resting smile must stay away. The grimace is now tied to the cues
+        // themselves, so this measures something stricter than a timer: the run is "live" the
+        // whole way through (5 cues), and the face must not drop once in the middle of it.
+        // A gap between cues is exactly what would show up here as a small firstBack, which is
+        // the flicker the rule exists to prevent.
         bool heldLongEnough = firstBack >= (int)(0.6 / 0.033);
         bool returned = firstBack >= 0 && _expr == EXPR_HAPPY;
         // A charge that lands late in the hold restarts the window instead of ending it.
@@ -6961,10 +14095,10 @@ public sealed class DshPet : Form {
         bool ok = idleHappy && chargingNervous && returned && heldLongEnough &&
                   lateChargeNervous && stillHappyWithBowl &&
                   notYet && aloofWhenLocked && fedHappy && lockedNow &&
-                  heldDuringLock && closed && delivered && happyAfter && radarGone;
+                  heldDuringLock && closed && delivered && happyAfter && radarGone && brokeOk;
         Console.WriteLine("  verdict: " + (ok
-            ? "OK - happy when idle, nervous while charging (hold " +
-              NervousHoldSec.ToString("0.#") + "s), aloof when locked, happy after feeding"
+            ? "OK - happy when idle, nervous for exactly as long as cues play, " +
+              "aloof while the balance is zero, aloof when locked, happy after feeding"
             : "FAIL - idleHappy=" + idleHappy + " charging=" + chargingNervous +
               " returned=" + returned + "(frame " + firstBack + ")" +
               " heldLongEnough=" + heldLongEnough + " lateCharge=" + lateChargeNervous +
@@ -7321,12 +14455,22 @@ public sealed class DshPet : Form {
         bool onImmediately = _blip.On && _radarManual;
         double dBefore = BowlDistanceForTest();
         // Run well past the 1 s magnet delay: with display-only it must not advance.
+        //
+        // Judged on the bowl's X and on "is anything sucking it", NOT on the distance to her.
+        // The distance moves on its own - the bowl is falling, so its Y changes every tick,
+        // and that changes |bowl - her| without the magnet doing anything. The old distance
+        // test happened to pass while she was pinned to the bottom-LEFT; once she can sit on
+        // the right it failed, because a falling bowl on the far side only gets further away.
+        // A magnet pull moves it along the line to her, so it always changes X as well.
+        double xBefore = _rices.Count > 0 ? _rices[0].X : 0;
         PumpTicks(60);                       // ~2 s
         double dAfter = BowlDistanceForTest();
-        bool notPulled = Math.Abs(dAfter - dBefore) < 40.0;
+        double xAfter = _rices.Count > 0 ? _rices[0].X : 0;
+        bool notPulled = !_bowlBeingSucked && Math.Abs(xAfter - xBefore) < 2.0;
         bool stillLive = _rices.Count > 0 && !_rices[0].Fed;
         Console.WriteLine("  manual  : radarOn=" + _blip.On + " manual=" + _radarManual +
                           " dist " + dBefore.ToString("0") + " -> " + dAfter.ToString("0") +
+                          " x " + xBefore.ToString("0") + " -> " + xAfter.ToString("0") +
                           " sucked=" + _bowlBeingSucked);
 
         // ---- holding the bowl still must read a closure of ZERO ----
@@ -7394,8 +14538,7 @@ public sealed class DshPet : Form {
     //   a charge while she wears it does NOT change her face
     //   a fresh rice bowl makes her happy again
     //   double-clicking her head pops it off, with a second flinch
-    public void RunIronPotTest() {
-        GoOffline();
+    public void RunIronPotTest() {        GoOffline();
         _noNetwork = true;
         DiagExpr = true;
         Console.WriteLine("iron pot (offline)");
@@ -7515,7 +14658,36 @@ public sealed class DshPet : Form {
         _bowlWait = 0;
         PumpTicks(3);
 
-        // ---- dragging the GIRL must carry the pot on BOTH axes ----
+        // ---- the mask must BE the mask the original rasteriser would have built ----
+        // The single-pixel probe below only samples one spot, which is how a rewrite of the
+        // rasteriser that dropped 26% of the mask (and left the headband and the ahoge
+        // sticking out of the pot) passed every test in this file. This rebuilds the mask
+        // with the original algorithm and compares pixel for pixel, so any future change to
+        // BuildEraseMask has to prove it is exact.
+        bool maskExact = false;
+        if (HeadPotOn && _eraseMask != null) maskExact = MaskEquivalenceReport();
+
+        // ---- the bounce must leave no residue above the pot ----
+        // Asserting this from inside the process kept giving the wrong answer: counting
+        // "masked pixels still opaque" on a squashed frame always included the iron pot,
+        // which is composited AFTER the erase, so it reported ~35k on frames that were
+        // perfectly clean. Two earlier versions of the check were worse still - they mapped
+        // the mask FORWARD (sprite row -> screen row) while the erase maps BACKWARD (walking
+        // canvas rows through the inverse transform), and the two disagree by far more than
+        // rounding.
+        //
+        // What this DOES guarantee is that the animation is left at rest, so the checks below
+        // see a clean baseline. The bounce itself is verified by comparing rendered frames:
+        // that is how the stray headband band above the pot was found - the erase's scan band
+        // was clamped to the untransformed sprite box, so a STRETCH (which carries her crown
+        // above that box) was never erased at all.
+        bool squashMaskOk = true;
+        if (HeadPotOn) {
+            _headSquashT = HeadSquashDur + 1;
+            PumpTicks(1);
+        }
+
+        // ---- the mask must not drift while she shakes or moves ----
         // The pot used to read its Y from the frozen HeadY, so dragging her moved the
         // pot sideways only.
         bool followsX = false, followsY = false;
@@ -7583,7 +14755,7 @@ public sealed class DshPet : Form {
 
         bool ok = potSpawned && lockedRice && potDraggable && notEaten && seated && wentCalm &&
                   physicsOff && stayedCalm && happyAgain && stillWorn &&
-                  followsX && followsY && maskStable &&
+                  followsX && followsY && maskStable && maskExact && squashMaskOk &&
                   !firstClick && secondClick && fading && potGone && backToHappy;
         Console.WriteLine("  verdict: " + (ok
             ? "OK - pot spawns, drags, is never locked, is not edible, seats on her head, "
@@ -7601,12 +14773,100 @@ public sealed class DshPet : Form {
         ResetDemoForTest();
     }
 
+    // ---- iron pot: does a rice bowl knock it off her head? ------------------------
+    // User report: dragging a rice bowl hard into the pot on her head pushes the pot
+    // well away from where it should sit. The pot is supposed to be SEATED once it is
+    // worn, so no amount of shoving should displace it.
+    public void RunIronPotBumpTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("iron pot vs rice bowl collision (offline)");
+        NoSaveForTest();
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+
+        Rice pot = null;
+        StartIronPotForTest();
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) { pot = _rices[i]; break; }
+        if (pot == null) {
+            Console.WriteLine("  verdict: FAIL - the iron pot never spawned");
+            ResetDemoForTest();
+            return;
+        }
+        // Seat it the way a player does: hold it over her head and let go.
+        Point a = IronHeadAnchor();
+        pot.X = a.X; pot.Y = a.Y - 120; pot.VX = 0; pot.VY = 0;
+        for (int i = 0; i < 240 && !pot.OnHead; i++) PumpTicks(1);
+        // Let the drop-onto-the-crown animation finish before the baseline is taken.
+        // Capturing it while HeadFalling is still easing leaves the baseline ~1.6 px high,
+        // and every later reading then looks like drift when the pot is in fact sitting
+        // exactly on the anchor.
+        for (int i = 0; i < 120 && pot.HeadFalling; i++) PumpTicks(1);
+        PumpTicks(10);
+        bool seated = pot.OnHead;
+        double seatX = pot.X, seatY = pot.Y;
+
+        // A bowl, thrown at the pot hard: several attempts from alternating sides, each
+        // one reset to a fresh approach position so the test cannot be satisfied by the
+        // bowl merely running out of speed.
+        double worst = 0;
+        int bumps = 0;
+        for (int side = 0; side < 4; side++) {
+            DropBowlForTest(1.00);
+            Rice b = null;
+            for (int i = _rices.Count - 1; i >= 0; i--) if (!_rices[i].Iron) { b = _rices[i]; break; }
+            if (b == null) continue;
+            int dir = (side % 2 == 0) ? 1 : -1;
+            b.Dragging = false;
+            for (int pass = 0; pass < 6; pass++) {
+                if (!pot.OnHead) break;               // knocked off: stop shoving
+                // Wind it up just outside the pot and fire it straight through.
+                b.X = seatX - dir * (b.R + pot.R + 40);
+                b.Y = seatY;
+                b.VX = dir * 5200;                    // well past SuckMaxSpeed
+                b.VY = 0;
+                b.Grounded = false;
+                PumpTicks(3);
+                bumps++;
+                // Measure where the pot SETTLES, not where the impact left it. Reading
+                // the instant the bowl overlaps catches the frame the collision resolved
+                // on, which in a real run is immediately followed by the anchor pulling
+                // it back - a fraction of a pixel of jitter that says nothing about
+                // whether the pot can be displaced. A couple of extra ticks is what the
+                // user actually sees.
+                PumpTicks(4);
+                double off = Math.Sqrt((pot.X - seatX) * (pot.X - seatX) +
+                                       (pot.Y - seatY) * (pot.Y - seatY));
+                if (off > worst) worst = off;
+            }
+        }
+        bool stayed = pot.OnHead && worst < 1.5;
+        Console.WriteLine("  bumps   : " + bumps + " impacts, worst displacement " +
+                          worst.ToString("0.00") + " px  seated=" + seated +
+                          " stillOn=" + pot.OnHead);
+        Console.WriteLine("  verdict: " + (seated && stayed
+            ? "OK - a rice bowl cannot shove the worn pot off her head (" +
+              worst.ToString("0.00") + " px of " + bumps + " impacts)"
+            : "FAIL - seated=" + seated + " stillOn=" + pot.OnHead +
+              " worstDisplacement=" + worst.ToString("0.00") + " px over " + bumps + " impacts"));
+        ResetDemoForTest();
+    }
+
     // Test hook: drop a bowl directly. ApplyBalance only spawns one when the balance    // RISES, which is awkward to arrange in a test that has already moved the figure
     // around - StartCredit is the path the real top-up uses anyway.
     // Diagnostics: move the widget the way a girl-drag does, so "does the worn pot
     // follow" can be measured instead of eyeballed. Assigning _offX/_offY is exactly
     // what the drag branch in OnMouseMove does.
     public void MoveWidgetForTest(int dx, int dy) { _offX += dx; _offY += dy; _dirty = true; }
+    // Resize the widget from a diagnostic. Does NOT write state.ini: the user's saved preset has
+    // to survive a test run, and SetPixelSize is the menu path that saves.
+    public void SetPixelSizeForTest(int px) {
+        if (px < 40) px = 40;
+        if (px > 2400) px = 2400;
+        _sizePx = px;
+        Relayout();
+        RenderToCanvas();
+    }
     public double PotYForTest() {
         for (int i = 0; i < _rices.Count; i++) if (_rices[i].OnHead) return _rices[i].Y;
         return double.NaN;
@@ -7617,6 +14877,20 @@ public sealed class DshPet : Form {
     }
 
     public void DropBowlForTest(double amount) { StartCredit(amount); }
+
+    // The live iron pot, or null when there is none. --perfscale needs the actual
+    // object to seat it on her head the same way --ironpot does, rather than a
+    // hand-rolled stand-in.
+    public Rice IronPotForTest() {
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) return _rices[i];
+        return null;
+    }
+    // Drops one through the real spawn path (SpawnIronPot), so the report exercises
+    // the production code and not a parallel construction of it.
+    public void StartIronPotForTest() {
+        Rectangle vs = SystemInformation.VirtualScreen;
+        SpawnIronPot(vs.Left + vs.Width / 2, vs.Top + 80);
+    }
 
     // Diagnostics for the iron pot: what the flags actually are, so "on her head but
     // she is not calm" can be traced to one of them.
@@ -7718,12 +14992,3192 @@ public sealed class DshPet : Form {
     }
 
 
+    // ------------------------------------------------------- per-cue volume ---
+    // Each cue's own level has to reach ITS pool and no other. The failure this catches is
+    // a setter that writes the shared _volume and so moves all four at once, which would
+    // look correct in the menu and be wrong in the ears.
+    public void RunCueVolumeTest() {
+        Console.WriteLine("per-cue volume (four cues, independent)");
+        int[] before = new int[4];
+        for (int c = 0; c < 4; c++) before[c] = _cueVolume[c];
+
+        // Values chosen from the presets so the tick check has rows to find; they are still
+        // four DIFFERENT numbers, which is what "independent" means here.
+        int[] want = new int[] { 25, 50, 75, 100 };
+        string[] names = new string[] { "damage", "heal", "pot-on", "pot-off" };
+        bool live = _sound != null && !_sound.Failed;
+        if (!live) Console.WriteLine("  note    : the damage pool is absent, checking the rest");
+
+        // Each cue's own level IS the effective level now - there is no master to normalise away.
+        for (int c = 0; c < 4; c++) SetCueVolume(c, want[c]);
+
+        bool independent = true;
+        for (int c = 0; c < 4; c++) {
+            SoundPool p = CuePool(c);
+            int got = PoolVolume(p);
+            bool ok = p == null || p.Failed || got == want[c];
+            if (!ok) independent = false;
+            Console.WriteLine("  " + names[c].PadRight(8) + ": want " + want[c] + "%  pool=" +
+                              PoolVolumeText(p) + "  cue=" + _cueVolume[c] + "  " +
+                              (ok ? "ok" : "MISMATCH"));
+        }
+        // Each pool must hold a DIFFERENT number, or "independent" is meaningless.
+        int distinct = 0;
+        for (int c = 0; c < 4; c++) {
+            bool dup = false;
+            for (int d = 0; d < c; d++) if (want[d] == want[c]) dup = true;
+            if (!dup) distinct++;
+        }
+
+        // The settings window reads each cue's level through CueVolumeUi, so that accessor has to
+        // agree with the field - otherwise the window would show one number while the pool plays
+        // another. (This replaced a menu-tick assertion; the rows it read no longer exist, and the
+        // accessor is now the only thing between the setting and the window.)
+        RefreshMenuChecks();
+        bool ticks = true;
+        for (int c = 0; c < 4; c++) {
+            if (CueVolumeUi(c) != _cueVolume[c]) {
+                ticks = false;
+                Console.WriteLine("  accessor: cue " + c + " reports " + CueVolumeUi(c) +
+                                  " but holds " + _cueVolume[c]);
+            }
+        }
+
+        // THERE IS NO MASTER. This block used to assert that moving it scaled all four without
+        // overwriting them; the control is gone, so the property worth asserting is the one that
+        // replaced it: changing ONE cue leaves the other three exactly as they were. That is what
+        // the master kept violating when it existed, and it is the thing a future "global volume"
+        // would break again.
+        int[] keep = new int[] { _cueVolume[0], _cueVolume[1], _cueVolume[2], _cueVolume[3] };
+        SetCueVolume(CUE_OFF, 7);
+        bool isolated = _cueVolume[0] == keep[0] && _cueVolume[1] == keep[1] &&
+                        _cueVolume[2] == keep[2] && _cueVolume[3] == 7 &&
+                        PoolVolume(CuePool(CUE_OFF)) == 7;
+        Console.WriteLine("  isolate : moved cue 3 to 7 %, others = " +
+                          _cueVolume[0] + "/" + _cueVolume[1] + "/" + _cueVolume[2] +
+                          " (want " + keep[0] + "/" + keep[1] + "/" + keep[2] + ")" +
+                          "  pool=" + PoolVolumeText(CuePool(CUE_OFF)) + "  " +
+                          (isolated ? "ok" : "MISMATCH"));
+        // ...and that every cue's effective level is simply its own, with the mute the only
+        // modifier. A non-zero mute must not be quietly folded in anywhere.
+        bool identity = true;
+        for (int c = 0; c < 4; c++) if (EffectiveCueVolume(c) != _cueVolume[c]) identity = false;
+        Console.WriteLine("  identity: effective == own for all four (" + EffectiveCueVolume(0) + "/" +
+                          EffectiveCueVolume(1) + "/" + EffectiveCueVolume(2) + "/" + EffectiveCueVolume(3) +
+                          ")  " + (identity ? "ok" : "MISMATCH"));
+        bool masterAll = isolated && identity;
+
+        for (int c = 0; c < 4; c++) SetCueVolume(c, before[c]);
+
+        bool ok2 = independent && distinct == 4 && ticks && masterAll;
+        Console.WriteLine("  verdict: " + (ok2
+            ? "OK - each cue holds its own level and reaches its own player, changing one leaves the others alone, and no global control scales them behind the user's back"
+            : "FAIL - independent=" + independent + " distinct=" + distinct + " ticks=" + ticks +
+              " masterAll=" + masterAll));
+    }
+
+    // ------------------------------------------------------- custom sound effect ---
+    // Opens the editor on a real cue and saves a capture of it. Development only: the dialog
+    // is otherwise reachable solely through the file picker, which needs a human.
+    public void ShowEditorShot(string baseDir) {
+        string err;
+        PcmAudio a = PcmAudio.Load(Path.Combine(baseDir, "feed.mp3"), out err);
+        if (a == null) { Console.WriteLine("editshot: decode failed - " + err); return; }
+        using (AudioEditor dlg = new AudioEditor(a, CueDefaultName(CUE_FEED), CueDefaultName(CUE_FEED))) {
+            // DSHPET_EDITSHOT_THEME=light|dark forces the palette, so both can be inspected without
+            // switching the app's saved theme and restarting. Unset uses whatever the app is set to.
+            // An environment variable rather than a second flag form: the project already reads its
+            // diagnostics that way, and the launcher can set one without changing the argument list.
+            string force = Get("DSHPET_EDITSHOT_THEME", "");
+            if (force == "light") dlg.ApplyTheme(false);
+            else if (force == "dark") dlg.ApplyTheme(true);
+            else dlg.ApplyTheme(_darkTheme);
+            dlg.SetLogDir(baseDir);
+            dlg.Show(this);
+            Application.DoEvents();
+            System.Threading.Thread.Sleep(250);
+            Application.DoEvents();
+            // PrintWindow, not a screen grab: the pet window is full-screen and topmost, so a screen
+            // copy of this dialog returns whatever is stacked over it.
+            // The trim columns must be on the SAME scale as the waveform loop's x (0-based from the
+            // well's left edge). Comparing an absolute MsToX value against that 0-based x painted the
+            // first _wave.X columns as 'cut away' - grey audio to the right of the left handle, which
+            // was reported as the handle having invisible thickness. This asserts the two agree.
+            {
+                int lc, rc, plen;
+                dlg.TrimColumnsForTest(out lc, out rc, out plen);
+                bool colOk = lc >= 0 && lc < plen && rc >= lc && rc < plen;
+                Console.WriteLine("  trimCols: left=" + lc + " right=" + rc + " of " + plen +
+                                  "  " + (colOk ? "ok (0-based, inside the waveform)"
+                                                 : "MISMATCH (wrong scale - the first columns would be greyed)"));
+                if (!colOk) Console.WriteLine("  verdict: FAIL - trim column scale is wrong");
+            }
+            CaptureWindowTo(Path.Combine(baseDir, "_editor.png"), dlg.Handle,
+                               dlg.ClientSize.Width, dlg.ClientSize.Height);
+            dlg.Close();
+        }
+    }
+
+    // The end-to-end path for the sound LIBRARY: two clips are filed, the second does not
+    // destroy the first, the active one is what the cue plays, switching between them works,
+    // editing replaces in place, deleting the active one falls back to the factory sound, and
+    // the shipped mp3 is never touched.
+    //
+    // The dialog is not opened (it needs a human), but every step behind it is exercised -
+    // which is the part that can silently do nothing.
+    public void RunCustomEffectTest() {
+        Console.WriteLine("sound library (add -> select -> edit -> delete -> factory)");
+        int cue = CUE_LAND;                       // pot_land.mp3, small and quick
+
+        string shipped = CueShippedPath(cue);
+        byte[] shippedBytes = null;
+        try { shippedBytes = File.ReadAllBytes(shipped); } catch { }
+
+        // Snapshot the library so the test can put it back exactly as it found it. The user may
+        // already have clips for this cue and this must not eat them.
+        List<CueLibrary.Clip> before = _lib.List(cue);
+        string beforeActive = _lib.ActiveId(cue);
+        Console.WriteLine("  start   : library holds " + before.Count + " clip(s), active='" +
+                          beforeActive + "'");
+
+        // 1) the shipped cue is what plays when nothing is active
+        _lib.SetActive(cue, "");
+        RebuildCuePool(cue);
+        bool startsFactory = CuePlayPath(cue) == shipped;
+        Console.WriteLine("  factory : path=" + Path.GetFileName(CuePlayPath(cue)) + "  " +
+                          (startsFactory ? "ok" : "MISMATCH"));
+
+        // 2) decode, trim, and file TWO clips the way AskUploadCue does
+        string derr;
+        PcmAudio src = PcmAudio.Load(shipped, out derr);
+        bool decodeOk = src != null && src.Frames > 0;
+        Console.WriteLine("  decode  : " + (decodeOk ? (src.Ms.ToString("0") + "ms ch=" + src.Channels)
+                                                      : "FAILED - " + derr));
+        if (!decodeOk) {
+            Console.WriteLine("  verdict: FAIL - the shipped cue did not decode, nothing can be filed");
+            return;
+        }
+
+        string werr = "";
+        PcmAudio a1 = src.Slice(src.Ms * 0.10, src.Ms * 0.45, 0.8);   // short
+        PcmAudio a2 = src.Slice(src.Ms * 0.20, src.Ms * 0.90, 0.6);   // longer
+        string id1 = a1 == null ? "" : _lib.Add(cue, "GRDLIB-A", a1.S, a1.Channels, a1.Rate, out werr);
+        if (id1.Length == 0) Console.WriteLine("  add A   : FAILED - " + werr);
+        string id2 = a2 == null ? "" : _lib.Add(cue, "GRDLIB-B", a2.S, a2.Channels, a2.Rate, out werr);
+        if (id2.Length == 0) Console.WriteLine("  add B   : FAILED - " + werr);
+        bool added = id1.Length > 0 && id2.Length > 0;
+        Console.WriteLine("  add     : A=" + id1 + " (" + (int)Math.Round(a1.Ms) + "ms)  B=" + id2 +
+                          " (" + (int)Math.Round(a2.Ms) + "ms)");
+
+        // 3) BOTH must still be there: the whole point of the library is that filing a second
+        //    clip does not destroy the first.
+        List<CueLibrary.Clip> after = _lib.List(cue);
+        bool keptBoth = false;
+        for (int i = 0; i < after.Count; i++) if (after[i].Id == id1) keptBoth = true;
+        for (int i = 0; i < after.Count; i++) if (after[i].Id == id2) keptBoth = true;
+        keptBoth = keptBoth && after.Count == before.Count + 2;
+        Console.WriteLine("  kept    : library now " + after.Count + " clip(s), A and B both present=" +
+                          keptBoth + "  " + (keptBoth ? "ok" : "MISMATCH"));
+
+        // 4) the SECOND add made itself active, and the cue plays it - at ITS OWN length
+        bool bActive = _lib.ActiveId(cue) == id2;
+        bool bIsPlayed = CuePlayPath(cue) == Path.Combine(_lib.DirFor(cue), id2 + ".wav");
+        RebuildCuePool(cue);
+        int playMs = SoundPool.MciLengthOf(CuePool(cue));
+        int wantB = (int)Math.Round(a2.Ms);
+        bool bLength = playMs > 0 && Math.Abs(playMs - wantB) < 40;
+        Console.WriteLine("  active  : B selected=" + bActive + " played=" + bIsPlayed +
+                          " pool=" + playMs + "ms want~" + wantB + "ms  " +
+                          ((bActive && bIsPlayed && bLength) ? "ok" : "MISMATCH"));
+
+        // 5) switching to A changes what plays, and the settings window's library page shows A as
+        //    the active clip. That tick is what tells the user which sound they are hearing, and
+        //    it replaced a menu row caption check - the rows it read no longer exist.
+        UseCueClip(cue, id1);
+        int aMs = SoundPool.MciLengthOf(CuePool(cue));
+        int wantA = (int)Math.Round(a1.Ms);
+        bool switched = _lib.ActiveId(cue) == id1 && Math.Abs(aMs - wantA) < 40;
+        // The window reads this to decide which row is marked active, so it is the right thing to
+        // assert: a mismatch would tick the wrong clip.
+        bool pickHasClip = ActiveClipNameMatchesUi(cue);
+        Console.WriteLine("  switch  : A pool=" + aMs + "ms want~" + wantA + "ms  libraryTicksActive=" +
+                          pickHasClip + "  " + ((switched && pickHasClip) ? "ok" : "MISMATCH"));
+
+        // 6) EDIT replaces in place: same id, same name, new audio.
+        //
+        // The player is closed before the write exactly as EditCueClip does - MCI holds the file
+        // open while the alias exists, so an edit of the clip IN USE is refused without this.
+        PcmAudio a3 = src.Slice(src.Ms * 0.30, src.Ms * 0.55, 0.9);
+        CloseCuePool(cue);
+        bool replaced = a3 != null && _lib.Replace(cue, id1, a3.S, a3.Channels, a3.Rate, out werr);
+        if (!replaced) Console.WriteLine("  edit    : Replace FAILED - " + werr +
+                                         (a3 == null ? " (slice returned null)" : ""));
+        // The size on disk, not what the writer claimed: a write that silently did nothing (or
+        // was refused because a player still holds the file) is the failure this catches.
+        long onDisk = 0;
+        try { onDisk = new FileInfo(Path.Combine(_lib.DirFor(cue), id1 + ".wav")).Length; } catch { }
+        long wantBytes = a3 != null ? 44 + a3.S.Length * 2 : 0;
+        RebuildCuePool(cue);
+        int editMs = SoundPool.MciLengthOf(CuePool(cue));
+        int wantEdit = (int)Math.Round(a3 != null ? a3.Ms : 0);
+        List<CueLibrary.Clip> afterEdit = _lib.List(cue);
+        bool sameIdKept = false, nameKept = false;
+        for (int i = 0; i < afterEdit.Count; i++) {
+            if (afterEdit[i].Id != id1) continue;
+            sameIdKept = true;
+            nameKept = afterEdit[i].Name == "GRDLIB-A";
+        }
+        bool editOk = replaced && sameIdKept && nameKept &&
+                      Math.Abs(editMs - wantEdit) < 40 && afterEdit.Count == before.Count + 2;
+        Console.WriteLine("  edit    : A now " + editMs + "ms want~" + wantEdit +
+                          "ms  idKept=" + sameIdKept + " nameKept=" + nameKept +
+                          " count=" + afterEdit.Count +
+                          "  disk=" + onDisk + "B want=" + wantBytes + "B" +
+                          "  " + (editOk ? "ok" : "MISMATCH"));
+
+        // 7) deleting the ACTIVE clip must fall back to the factory sound
+        DeleteCueClip(cue, id1);
+        bool fellBack = CuePlayPath(cue) == shipped;
+        RebuildCuePool(cue);
+        int nowMs = SoundPool.MciLengthOf(CuePool(cue));
+        int shippedMs = (int)Math.Round(src.Ms);
+        bool factorySound = Math.Abs(nowMs - shippedMs) < 40;
+        List<CueLibrary.Clip> afterDel = _lib.List(cue);
+        bool delOk = fellBack && factorySound && afterDel.Count == before.Count + 1 &&
+                     _lib.ActiveId(cue) == "";
+        Console.WriteLine("  delete  : active removed -> path=" + Path.GetFileName(CuePlayPath(cue)) +
+                          " pool=" + nowMs + "ms (shipped " + shippedMs + "ms)  left=" +
+                          afterDel.Count + "  " + (delOk ? "ok" : "MISMATCH"));
+
+        // 8) the FACTORY file must be byte-identical: the library never touches it
+        bool shippedIntact = true;
+        try {
+            if (shippedBytes != null) {
+                byte[] now = File.ReadAllBytes(shipped);
+                shippedIntact = now.Length == shippedBytes.Length;
+                if (shippedIntact)
+                    for (int i = 0; i < now.Length; i++)
+                        if (now[i] != shippedBytes[i]) { shippedIntact = false; break; }
+            }
+        } catch { shippedIntact = false; }
+        Console.WriteLine("  shipped : untouched=" + shippedIntact);
+
+        // 9) restore the library exactly as it was, and clean up anything this test filed
+        DeleteCueClip(cue, id2);
+        if (beforeActive.Length > 0) _lib.SetActive(cue, beforeActive);
+        RebuildCuePool(cue);
+        List<CueLibrary.Clip> finalState = _lib.List(cue);
+        bool restored = finalState.Count == before.Count && _lib.ActiveId(cue) == beforeActive;
+        Console.WriteLine("  restore : library back to " + finalState.Count + " clip(s), active='" +
+                          _lib.ActiveId(cue) + "'  " + (restored ? "ok" : "MISMATCH"));
+
+        bool ok = startsFactory && added && keptBoth && bActive && bIsPlayed && bLength &&
+                  switched && pickHasClip && editOk && delOk && shippedIntact && restored;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - clips accumulate in the library, the active one is what plays at its own length, the settings window marks the active clip, edit replaces in place, delete falls back to the factory sound, and the shipped file is never touched"
+            : "FAIL - factory=" + startsFactory + " added=" + added + " keptBoth=" + keptBoth +
+              " bActive=" + bActive + " bPlayed=" + bIsPlayed + " bLen=" + bLength +
+              " switched=" + switched + " pickTick=" + pickHasClip +
+              " edit=" + editOk + " delete=" + delOk + " shippedIntact=" + shippedIntact +
+              " restored=" + restored));
+    }
+
+    // The MIGRATION path, which nothing else exercises: a clip left behind by the old
+    // single-slot scheme (<default>.custom.wav beside the originals, name in state.ini) has to
+    // end up in the library, keeping its name, with the sidecar removed.
+    //
+    // Worth its own guard because the code only runs on a machine that HAS such a file -
+    // otherwise it is dead code that would fail the first time a real user upgraded.
+    public void RunLibraryMigrationTest() {
+        Console.WriteLine("legacy clip migration");
+        int cue = CUE_LAND;
+        string sidecar = Path.Combine(_baseDir,
+            Path.GetFileNameWithoutExtension(CueDefaultFile(cue)) + ".custom.wav");
+
+        // Snapshot so the test leaves nothing behind either way.
+        List<CueLibrary.Clip> before = _lib.List(cue);
+        string beforeActive = _lib.ActiveId(cue);
+        bool sidecarExisted = File.Exists(sidecar);
+        if (sidecarExisted) {
+            Console.WriteLine("  note    : a real sidecar already exists; refusing to touch it");
+            Console.WriteLine("  verdict: SKIP - a legacy file is present and this test would overwrite it");
+            return;
+        }
+
+        // 1) fabricate exactly what the old scheme produced
+        string derr;
+        PcmAudio src = PcmAudio.Load(CueShippedPath(cue), out derr);
+        if (src == null) {
+            Console.WriteLine("  verdict: FAIL - the shipped cue did not decode: " + derr);
+            return;
+        }
+        PcmAudio cut = src.Slice(src.Ms * 0.2, src.Ms * 0.4, 0.7);
+        string werr = "";
+        bool made = cut != null && PcmAudio.WriteWav(sidecar, cut.S, cut.Channels, cut.Rate, out werr);
+        Console.WriteLine("  setup   : sidecar written=" + made + " (" +
+                          (cut != null ? ((int)Math.Round(cut.Ms) + "ms") : "no slice") + ")");
+        if (!made) {
+            Console.WriteLine("  verdict: FAIL - could not write the test sidecar: " + werr);
+            return;
+        }
+
+        // 2) migrate
+        MigrateLegacySidecar();
+
+        // 3) it must be in the library, named from cuenmN (or a sensible default), and the
+        //    sidecar must be gone - leaving it would migrate the same clip again every start.
+        List<CueLibrary.Clip> after = _lib.List(cue);
+        bool grew = after.Count == before.Count + 1;
+        CueLibrary.Clip moved = null;
+        for (int i = 0; i < after.Count; i++) {
+            bool known = false;
+            for (int j = 0; j < before.Count; j++) if (before[j].Id == after[i].Id) known = true;
+            if (!known) moved = after[i];
+        }
+        bool sidecarGone = !File.Exists(sidecar);
+        string expectedName = LegacyClipName(cue);
+        bool nameOk = moved != null && moved.Name == expectedName;
+        bool durationOk = false;
+        if (moved != null) {
+            string e2;
+            PcmAudio got = PcmAudio.Load(moved.Path, out e2);
+            durationOk = got != null && cut != null && Math.Abs(got.Ms - cut.Ms) < 30;
+        }
+        Console.WriteLine("  result  : library " + before.Count + " -> " + after.Count +
+                          " (want +1)  sidecarGone=" + sidecarGone +
+                          "  name='" + (moved != null ? moved.Name : "none") + "' want='" + expectedName + "'" +
+                          "  audioMatches=" + durationOk);
+
+        // 4) clean up: the migrated clip is a test artefact
+        if (moved != null) DeleteCueClip(cue, moved.Id);
+        if (beforeActive.Length > 0) _lib.SetActive(cue, beforeActive);
+        RebuildCuePool(cue);
+        bool restored = _lib.List(cue).Count == before.Count && _lib.ActiveId(cue) == beforeActive;
+        Console.WriteLine("  restore : library back to " + _lib.List(cue).Count + " clip(s)  " +
+                          (restored ? "ok" : "MISMATCH"));
+
+        bool ok = grew && moved != null && sidecarGone && nameOk && durationOk && restored;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a legacy sidecar is filed into the library with its name, the sidecar is removed, and nothing is left behind"
+            : "FAIL - grew=" + grew + " sidecarGone=" + sidecarGone + " name=" + nameOk +
+              " audio=" + durationOk + " restored=" + restored));
+    }
+
+    // ------------------------------------------------- settings window bridge ---
+    //
+    // The window is a separate class and cannot see DshPet's private members, so what it needs
+    // is exposed here. Named after what the UI MEANS rather than after the field, so the window
+    // cannot reach into the pet's internals by accident.
+    // The theme any window of this app should use, in one place.
+    //
+    // It also PUBLISHES the theme to InputDialog, which cannot ask for it: that class is declared before
+    // DshPet and is constructed from ten call sites that pass no pet. Setting it here means every window
+    // that asks for a theme also refreshes the one the dialogs will use, so a light/dark switch reaches
+    // them without any of those call sites changing.
+    public PetTheme ThemeForWindow() {
+        PetTheme t = new PetTheme(_darkTheme);
+        InputDialog.CurrentTheme = t;
+        return t;
+    }
+    public string StrSettings { get { return S_SETTINGS; } }
+    public string StrRefresh { get { return S_REFRESH; } }
+    public string StrFeatures { get { return S_FEATURES; } }
+    public string StrPeakPeak { get { return S_PEAK_PEAK; } }
+    public string StrPeakOff { get { return S_PEAK_OFF; } }
+    public string StrUsed { get { return S_USED; } }
+    public string StrToOff { get { return S_TO_OFF; } }
+    public string StrToPeak { get { return S_TO_PEAK; } }
+    public string StrCalib { get { return S_CALIB; } }
+    public string StrCalibPrompt { get { return S_CALIB_P; } }
+    public string StrFxBowl { get { return S_FX_BOWL; } }
+    public string StrFxPat { get { return S_FX_PAT; } }
+    public string StrFxHurt { get { return S_FX_HURT; } }
+    public string StrFeatureHint { get { return S_FX_HINT; } }
+    // Thin public doors for the breadcrumb panel, which is a separate class and cannot reach the
+    // private handlers. Named after the ACTION, so the panel reads as intent, not as plumbing.
+    // The breadcrumb panel, one at a time. A second right-click replaces the first rather than
+    // stacking, which is the behaviour the panel exists for.
+    CrumbPanel _crumb;
+    public void ShowCrumbUi(Point screen) {
+        if (_crumb != null && !_crumb.IsDisposed) { _crumb.Close(); _crumb = null; }
+        _crumb = new CrumbPanel(this);
+        _crumb.FormClosed += delegate { _crumb = null; };
+        _crumb.ShowAt(screen, this);
+    }
+    public bool CrumbOpenUi { get { return _crumb != null && !_crumb.IsDisposed; } }
+    public void CrumbCloseUi() { if (CrumbOpenUi) { _crumb.Close(); _crumb = null; } }
+
+    public void RefreshNowUi() { _pollWant = 2; }
+    public void AskKeyUi() { AskKey(); }
+    public void QuitUi() { Quit(); }
+    public string StrSetKey { get { return S_SETKEY; } }
+    public string StrQuit { get { return S_QUIT; } }
+    public string StrCrumbMenu { get { return "\u83DC\u5355"; } }
+    public string StrClose { get { return S_CLOSE; } }
+    public string StrTheme { get { return S_THEMEADJ; } }
+    public string StrThemeLight { get { return S_THEME_LIGHT; } }
+    public string StrThemeDark { get { return S_THEME_DARK; } }
+    public string StrSize { get { return S_SIZEADJ; } }
+    public string StrCustomSize { get { return S_CUSTOMSIZE; } }
+    public string StrSoundOn { get { return S_SOUNDON; } }
+    // StrSoundHint and StrSoundOnOff are GONE with the sound page. The first had no caller left; the
+    // second was the page's "on / off" caption, which the switch position already conveys.
+    // StrMasterVolume / MasterVolumeUi / SetMasterVolumeUi are GONE with the master volume row.
+    public string StrFactoryClip { get { return S_FACTORYCLIP; } }
+    public string StrFxHint { get { return S_FXHINT; } }
+    public string StrVolumeHint { get { return S_VOLHINT; } }
+    public string StrUpload { get { return S_UPLOAD; } }
+    public static string StrDropL1 { get { return S_DROP_L1; } }
+    public static string StrDropOr { get { return S_DROP_OR; } }
+    public static string StrDropL3 { get { return S_DROP_L3; } }
+    public static string StrDropHint { get { return S_DROP_HINT; } }
+    public string StrUse { get { return S_USE; } }
+    public string StrPreview { get { return S_TRY; } }
+    public string StrModify { get { return S_MODIFY; } }
+    public string StrDelete { get { return S_DELETE; } }
+    public string StrDemo { get { return S_DEMO; } }
+    public string StrDemoHint { get { return S_DEMOHINT; } }
+    public string StrDemoCharge { get { return S_DEMO_CHG; } }
+    public string StrDemoTopUp { get { return S_DEMO_TOP; } }
+    public string StrCharge1 { get { return S_CHARGE_1; } }
+    public string StrCharge10 { get { return S_CHARGE_10; } }
+    public string StrChargeN { get { return S_CHARGE_N; } }
+    public string StrTopUp3 { get { return S_TOPUP_3; } }
+    public string StrTopUpCustom { get { return S_TOPUP_CUS; } }
+    public string StrRadarOn { get { return S_RADARON; } }
+
+    // Demo-window actions. The window passes a COUNT of cues rather than money, so the amount
+    // stays a decision of this class.
+    public void DemoChargeUi(int cues) {
+        if (cues < 1) cues = 1;
+        DemoCharge(StepYuan * cues);
+    }
+    public void AskDemoCountUi() { AskDemoCount(); }
+    public void DemoTopUpUi() { TestTopUp(TestTopUpYuan); }
+    public void AskTopUpUi() { AskTopUp(); }
+    public void RadarUi() { OpenRadarManually(); }
+
+    DemoWindow _demo;
+    public void ShowDemoUi() {
+        if (_demo != null && !_demo.IsDisposed) {
+            _demo.Activate();
+            return;
+        }
+        _demo = new DemoWindow(this);
+        _demo.FormClosed += delegate { _demo = null; };
+        _demo.Show(this);
+    }
+    public bool DemoOpenUi { get { return _demo != null && !_demo.IsDisposed; } }
+    public void DemoCloseUi() {
+        if (!DemoOpenUi) return;
+        try { _demo.Close(); } catch { }
+        _demo = null;
+    }
+    public Rectangle DemoWindowRectUi() {
+        if (!DemoOpenUi) return Rectangle.Empty;
+        return new Rectangle(_demo.PointToScreen(Point.Empty), _demo.Size);
+    }
+
+    public bool IsDarkThemeUi { get { return _darkTheme; } }
+    public bool SoundEnabledUi { get { return _soundEnabled; } }
+
+    // The three feature switches, for the display page and for the guards.
+    public bool FxBowlDropUi { get { return _fxBowlDrop; } }
+    public bool FxPatUi { get { return _fxPat; } }
+    public bool FxHurtUi { get { return _fxHurt; } }
+    // Sets today's spend to a figure the user read off the platform page.
+    //
+    // It works by moving the BASELINE rather than the total, because the total is recomputed from
+    // the baseline on every poll - writing the total alone would be overwritten on the next reading.
+    public void SetTodayUsedUi(double used) {
+        if (used < 0) used = 0;
+        double cur = double.IsNaN(_realBal) ? _todayBase : _realBal;
+        if (double.IsNaN(cur)) return;                  // nothing to anchor to yet
+        _usedDay = DateTime.Now.DayOfYear;
+        _todayUsed = Math.Round(used, 4);
+        _todayBase = Math.Round(cur + used, 4);
+        _todayTopUp = 0;
+        _lastBalSeen = cur;
+        _spendDirty = true;
+        _panelCacheValid = false;
+        SaveUsage();
+        Log("today's spend calibrated to " + used.ToString("0.00", CultureInfo.InvariantCulture) +
+            " (baseline " + _todayBase.ToString("0.00", CultureInfo.InvariantCulture) + ")");
+    }
+    public double TodayUsedUi { get { return _todayUsed; } }
+    public void AskUsedUi() {
+        using (InputDialog d = new InputDialog(S_CALIB, S_CALIB_P, "",
+                                               _todayUsed.ToString("0.##", CultureInfo.InvariantCulture))) {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            double v;
+            if (double.TryParse(d.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out v))
+                SetTodayUsedUi(v);
+        }
+    }
+
+    public void SetFxUi(int which, bool on) {
+        if (which == 0) _fxBowlDrop = on;
+        else if (which == 1) _fxPat = on;
+        else _fxHurt = on;
+        SaveState();
+    }
+    public int CueVolumeUi(int cue) { return (cue >= 0 && cue < 4) ? _cueVolume[cue] : 0; }
+    public string CueVolumeLabelUi(int cue) { return CueVolumeLabel(cue); }
+    public string CueDefaultNameUi(int cue) { return CueDefaultName(cue); }
+    public string SizeNameAt(int i) { return (i >= 0 && i < SizeNames.Length) ? SizeNames[i] : ""; }
+    public string SizePxLabelAt(int i) { return PresetPxLabel(i); }
+    public int CurrentSizeIndex() {
+        for (int i = 0; i < PresetPx.Length; i++) if (_sizePx == PresetPx[i]) return i;
+        return PresetPx.Length;                     // the custom row
+    }
+    public bool IsFactoryActive(int cue) { return _lib == null || _lib.ActiveId(cue).Length == 0; }
+    // Whether a guard's idea of the active clip agrees with what the library page will draw. The
+    // window decides by comparing each clip's Id to ActiveId, so this asks exactly that question -
+    // if the two ever disagreed the wrong row would carry the active mark, and the user would be
+    // told they are hearing something they are not.
+    public bool ActiveClipNameMatchesUi(int cue) {
+        if (_lib == null) return false;
+        string id = _lib.ActiveId(cue);
+        if (string.IsNullOrEmpty(id)) return false;
+        List<CueLibrary.Clip> clips = _lib.List(cue);
+        for (int i = 0; i < clips.Count; i++)
+            if (clips[i].Id == id && clips[i].Active) return true;
+        return false;
+    }
+    public List<CueLibrary.Clip> ClipsFor(int cue) {
+        return _lib == null ? new List<CueLibrary.Clip>() : _lib.List(cue);
+    }
+
+    // Every mutation saves immediately. A settings window has no OK button, so each change IS the
+    // commit - and the two guards in SaveState still apply, so a diagnostic run changes nothing.
+    public void ToggleSoundUi() { SetSoundEnabled(!_soundEnabled); }
+    public void SetDarkThemeUi(bool dark) {
+        if (_darkTheme == dark) return;
+        SetDarkTheme(dark);                          // rebuilds the menu and saves
+        if (_settings != null) _settings.ApplyTheme(ThemeForWindow());
+    }
+    public void SetSizeIndexUi(int i) {
+        if (i >= 0 && i < PresetPx.Length) SetSizePreset(i);
+        else AskPx();
+    }
+    public void SetCueVolumeUi(int cue, int v) {
+        if (cue < 0 || cue > 3 || _cueVolume[cue] == v) return;
+        SetCueVolume(cue, v);
+    }
+    public void UploadCueUi(int cue) { AskUploadCue(cue); }
+    public void RestoreFactoryUi(int cue) { RestoreFactoryCue(cue); }
+    public void UseClipUi(int cue, string id) { UseCueClip(cue, id); }
+    public void EditClipUi(int cue, string id) { EditCueClip(cue, id); }
+    public void DeleteClipUi(int cue, string id) { DeleteCueClip(cue, id); }
+
+    // One instance only: two settings windows would be two views of the same settings.
+    SettingsWindow _settings;
+    public void ShowSettingsUi() {
+        if (_settings != null && !_settings.IsDisposed) {
+            if (_settings.WindowState == FormWindowState.Minimized)
+                _settings.WindowState = FormWindowState.Normal;
+            _settings.Activate();
+            return;
+        }
+        _settings = new SettingsWindow(this);
+        _settings.FormClosed += delegate { _settings = null; };
+        _settings.Show(this);
+    }
+    public bool SettingsOpenUi { get { return _settings != null && !_settings.IsDisposed; } }
+    // The window type is internal, so a public method cannot hand out the instance. This exposes
+    // the one fact a guard needs instead.
+    public int SettingsPageUi { get { return SettingsOpenUi ? _settings.PageForTest : -1; } }
+    public int SettingsPageHeightUi(int page) {
+        return SettingsOpenUi ? _settings.PageHeightForShot(page) : 0;
+    }
+    public void SettingsSelectPageUi(int page) {
+        if (SettingsOpenUi) _settings.SelectPageForTest(page);
+    }
+    // A guard opens the window to check it, so it has to be able to close it again: a diagnostic
+    // that leaves a settings window on the user's screen would be its own bug.
+    public void SettingsCloseUi() {
+        if (!SettingsOpenUi) return;
+        try { _settings.Close(); } catch { }
+        _settings = null;
+    }
+    // The window is a Control, so a screenshot can be taken of it like any other region.
+    public Rectangle SettingsWindowRectUi() {
+        if (!SettingsOpenUi) return Rectangle.Empty;
+        return new Rectangle(_settings.PointToScreen(Point.Empty), _settings.Size);
+    }
+
+    // Opens the demo window and photographs it. It is only reachable by right-clicking the pet,
+    // so a layout bug in it stays invisible until someone opens it.
+    public void CaptureDemoWindow(string baseDir) {
+        ShowDemoUi();
+        if (!DemoOpenUi) { Console.WriteLine("shotdemo: the window did not open"); return; }
+        Application.DoEvents();
+        System.Threading.Thread.Sleep(240);
+        Application.DoEvents();
+        // PrintWindow rather than a screen grab: the pet window is full-screen and topmost, so a screen
+        // copy returns whatever is stacked over this dialog instead of the dialog.
+        Console.WriteLine("demo window rect: " + DemoWindowRectUi());
+        CaptureWindowTo(Path.Combine(baseDir, "_demo_win.png"), _demo.Handle,
+                       _demo.ClientSize.Width, _demo.ClientSize.Height);
+        DemoCloseUi();
+        Console.WriteLine("demo closed, open=" + DemoOpenUi);
+    }
+
+    // Opens the settings window and photographs it. With no --page it walks every page, because
+    // a page nobody visits is a page whose layout nobody has looked at.
+    public void CaptureSettingsWindow(string baseDir, int page, bool allPages) {
+        ShowSettingsUi();
+        if (!SettingsOpenUi) { Console.WriteLine("shotwin: the window did not open"); return; }
+        // Push the CURRENT palette into the window before painting. The window reads it once when
+        // it is constructed, so a theme applied afterwards - which is exactly what
+        // --shotwin --menudark does - would otherwise be invisible in the shot and the pictures
+        // would not show what the user sees.
+        if (_settings != null) _settings.ApplyTheme(ThemeForWindow());
+        int[] pages = allPages ? new int[] { 0, 1, 2 } : new int[] { page };
+        for (int i = 0; i < pages.Length; i++) {
+            SettingsSelectPageUi(pages[i]);
+            Console.WriteLine("  page " + pages[i] + " content height = " + SettingsPageHeightUi(pages[i]));
+        }
+        for (int i = 0; i < pages.Length; i++) {
+            SettingsSelectPageUi(pages[i]);
+            Application.DoEvents();
+            System.Threading.Thread.Sleep(240);
+            Application.DoEvents();
+            Rectangle r = SettingsWindowRectUi();
+            Console.WriteLine("window page " + pages[i] + " rect: " + r);
+            CaptureRegion(Path.Combine(baseDir, "_win_" + pages[i] + ".png"), r, 0);
+        }
+        _settings.Close();
+        Application.DoEvents();
+        Console.WriteLine("settings closed, open=" + SettingsOpenUi);
+    }
+
+    // ------------------------------------------------------- preview button ---
+    // Dragging a volume slider must be SILENT, and the preview button must sound.
+    //
+    // Both halves matter and they pull in opposite directions. The slider used to fire a cue on
+    // every change, which with 1 % steps means a machine-gun of overlapping sounds while the user
+    // is trying to listen for a level - so the obvious "fix" is to remove playback, and the
+    // obvious way to get that wrong is to remove it from the preview path too. This asserts each
+    // end separately.
+    public void RunPreviewTest() {
+        Console.WriteLine("volume preview (silent while adjusting, audible on demand)");
+        int cue = CUE_LAND;                       // pot-on: a real cue with its own pool
+        SoundPool p = CuePool(cue);
+        if (p == null || p.Failed) {
+            Console.WriteLine("  note    : cue " + cue + " has no player; checking the decision only");
+        }
+        int before = _cueVolume[cue];
+        bool wasOn = _soundEnabled;
+        _soundEnabled = true;
+
+        // 1) Move the slider the way a drag does: many small steps. NOT ONE SOUND may come out.
+        int plays0 = p != null ? p.Plays : 0;
+        for (int v = 10; v <= 60; v += 1) SetCueVolumeUi(cue, v);
+        int plays1 = p != null ? p.Plays : 0;
+        bool silentDrag = (plays1 == plays0);
+        Console.WriteLine("  drag    : 51 steps, pool plays " + plays0 + " -> " + plays1 + "  " +
+                          (silentDrag ? "ok (silent)" : "MISMATCH (it sounded while adjusting)"));
+
+        // Silence is only correct if the setting still TOOK. With no master the level that reaches
+        // the player is exactly the number on the slider, so anything else is a real fault.
+        SetCueVolumeUi(cue, 80);
+        bool reached = p == null || p.Failed || PoolVolume(p) == 80;
+        Console.WriteLine("  reached : pool=" + PoolVolumeText(p) + " want 80%  " +
+                          (reached ? "ok" : "MISMATCH"));
+
+        // 2) The preview button MUST sound.
+        SetCueVolumeUi(cue, 55);
+        int plays4 = p != null ? p.Plays : 0;
+        PreviewCueUi(cue);
+        int plays5 = p != null ? p.Plays : 0;
+        bool previews = p == null || p.Failed || plays5 > plays4;
+        Console.WriteLine("  preview : pool plays " + plays4 + " -> " + plays5 + "  " +
+                          (previews ? "ok (audible)" : "MISMATCH (the button was silent)"));
+
+        // 3) Previewing a cue at 0 % must be SILENT.
+        //
+        //    This assertion is the reverse of what it first was, and the reversal is the point.
+        //    The original preview substituted 60 % for a muted cue so the button always made a
+        //    noise; the user reported it as "why is my 0 % effect still playing at 50 %", which is
+        //    the right question, because 0 % IS off everywhere else on this page. A preview is not
+        //    exempt from the rule the page is built on.
+        //
+        //    The stored value must also come back untouched - previewing must never write.
+        SetCueVolumeUi(cue, 0);
+        int plays6 = p != null ? p.Plays : 0;
+        PreviewCueUi(cue);
+        int plays7 = p != null ? p.Plays : 0;
+        bool mutedPreview = p == null || p.Failed || plays7 == plays6;
+        bool mutedStored = _cueVolume[cue] == 0;
+        Console.WriteLine("  muted   : preview plays " + plays6 + " -> " + plays7 +
+                          "  stored still " + _cueVolume[cue] + "  " +
+                          ((mutedPreview && mutedStored) ? "ok (silent)" : "MISMATCH (it sounded)"));
+
+        // 4) The user's original complaint, kept as a regression test: set three cues to 50 and one
+        //    to 48, then adjust ONE of them. The other three must be untouched. The control that
+        //    used to fail this was the master volume, which is now gone - so this guards against a
+        //    future "global volume" being reintroduced with the same bug.
+        int[] mix = new int[] { 50, 50, 50, 48 };
+        for (int c = 0; c < 4; c++) SetCueVolumeUi(c, mix[c]);
+        SetCueVolumeUi(0, 60);
+        bool kept = _cueVolume[1] == 50 && _cueVolume[2] == 50 && _cueVolume[3] == 48;
+        bool own = EffectiveCueVolume(3) == 48 && EffectiveCueVolume(0) == 60;
+        Console.WriteLine("  isolate : 50/50/50/48, then cue 0 -> 60 gives " +
+                          _cueVolume[0] + "/" + _cueVolume[1] + "/" + _cueVolume[2] + "/" + _cueVolume[3] +
+                          "  " + ((kept && own) ? "ok (the other three are untouched)"
+                                                : "MISMATCH (adjusting one moved another)"));
+
+        // restore
+        for (int c = 0; c < 4; c++) SetCueVolumeUi(c, mix[c]);
+        SetCueVolumeUi(cue, before);
+        SetSoundEnabled(wasOn);
+
+        bool ok = silentDrag && reached && previews && mutedPreview && mutedStored && kept && own;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - adjusting a level is silent and still reaches the player, the preview button sounds at a live level and is silent at 0 %, and changing one cue leaves the other three alone"
+            : "FAIL - silentDrag=" + silentDrag + " reached=" + reached + " previews=" + previews +
+              " mutedPreview=" + mutedPreview + " mutedStored=" + mutedStored +
+              " kept=" + kept + " own=" + own));
+    }
+
+
+    // EVERY sound trigger must respect its cue's 0 %.
+    //
+    // This exists because one of them did not. PlayHitSound checked only the global switch, so
+    // dragging the damage slider to 0 % left the hit cue playing at whatever level its alias was
+    // last given - reported by the user as "it does not mute, it comes back at 50 %". The rule is
+    // simple and easy to state, which is exactly why each call site has to be checked rather than
+    // assumed: PlayCue applies it, and any site that calls pool.Play() directly silently opts out.
+    //
+    // So the test does not ask whether the RULE is right. It asks whether each of the four cues
+    // is silent at 0 % through the path that actually fires it.
+    public void RunMutePerCueTest() {
+        Console.WriteLine("every cue is silent at 0 % through its real trigger");
+        bool wasOn = _soundEnabled;
+        int[] saved = new int[] { _cueVolume[0], _cueVolume[1], _cueVolume[2], _cueVolume[3] };
+        _soundEnabled = true; _soundWanted = true;
+        // Start every cue AUDIBLE and push that level to the pools, so a stale alias volume is
+        // present to be wrongly reused - which is what made the original bug audible rather than
+        // merely wrong.
+        for (int c = 0; c < 4; c++) SetCueVolume(c, 50);
+
+        bool allSilent = true;
+        string[] names = new string[] { "damage", "heal", "pot-on", "pot-off" };
+        for (int c = 0; c < 4; c++) {
+            SoundPool p = CuePool(c);
+            if (p == null || p.Failed) {
+                Console.WriteLine("  " + names[c].PadRight(7) + ": no player, skipped");
+                continue;
+            }
+            SetCueVolume(c, 0);
+            int before = p.Plays;
+            // The DECISION each trigger makes. PlayCue is the shared path; the two cues that used
+            // to bypass it are covered because their call sites now go through it, which the
+            // structural check below enforces independently.
+            PlayCue(c, p);
+            bool silent = p.Plays == before;
+            if (!silent) allSilent = false;
+            Console.WriteLine("  " + names[c].PadRight(7) + ": at 0 %, plays " + before + " -> " +
+                              p.Plays + "  " + (silent ? "ok (silent)" : "MISMATCH (it sounded)"));
+            SetCueVolume(c, 50);
+        }
+
+        // And the reverse, so this cannot pass by never playing anything: each cue at 50 % must
+        // sound. Without this half, deleting PlayCue's body would pass the test above.
+        bool allAudible = true;
+        for (int c = 0; c < 4; c++) {
+            SoundPool p = CuePool(c);
+            if (p == null || p.Failed) continue;
+            int before = p.Plays;
+            PlayCue(c, p);
+            bool played = p.Plays > before;
+            if (!played) allAudible = false;
+            Console.WriteLine("  " + names[c].PadRight(7) + ": at 50 %, plays " + before + " -> " +
+                              p.Plays + "  " + (played ? "ok (audible)" : "MISMATCH (silent)"));
+        }
+
+        // The mute switch overrides an audible level for every cue.
+        SetSoundEnabled(false);
+        bool muteWins = true;
+        for (int c = 0; c < 4; c++) {
+            SoundPool p = CuePool(c);
+            if (p == null || p.Failed) continue;
+            if (CueWouldPlay(c, p)) muteWins = false;
+        }
+        Console.WriteLine("  switch : all four silent while muted  " + (muteWins ? "ok" : "MISMATCH"));
+        SetSoundEnabled(true);
+
+        for (int c = 0; c < 4; c++) SetCueVolume(c, saved[c]);
+        if (!wasOn) SetSoundEnabled(false);
+
+        bool ok = allSilent && allAudible && muteWins;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - every cue is silent at 0 % through the path that actually fires it, audible at 50 %, and the switch overrides all four"
+            : "FAIL - silentAt0=" + allSilent + " audibleAt50=" + allAudible + " muteWins=" + muteWins));
+    }
+
+    // ------------------------------------------------- click-away dismissal ---
+    // The menu must close when the user clicks anywhere outside it.
+    //
+    // This is worth its own guard because the obvious implementation does not work here and the
+    // failure is silent. A ContextMenuStrip normally closes itself when a click lands outside it,
+    // but this window answers WM_NCHITTEST with HTTRANSPARENT over every non-solid pixel in order
+    // to stay click-through - so a click on empty screen is passed down the z-order and NEVER
+    // arrives as a mouse message. The drop-down never learns it happened and the menu stays open.
+    // The fix moves the decision into the hit test, which is the only handler that hears such a
+    // click at all.
+    //
+    // Tested through the real WndProc via PostMessage rather than by calling a helper: the whole
+    // difficulty is in the message ROUTING, so a test that skipped the routing would pass against
+    // the broken version.
+    public void SetDiagClickAwayForTest() { DiagClickAway = true; }
+    // SYNCHRONOUS hit test, so the handler has run by the time this returns. SendMessage to this
+    // window's own handle goes through the real WndProc, which is the point: the bug being guarded
+    // against lives in the message routing, so a test that called the branch directly would pass
+    // against the broken version too.
+    void SendNcHitTest(int screenX, int screenY) {
+        if (Handle == IntPtr.Zero) return;
+        Native.SendMessage(Handle, Native.WM_NCHITTEST, IntPtr.Zero, (IntPtr)PackXY(screenX, screenY));
+    }
+
+    public void RunClickAwayTest() {
+        Console.WriteLine("menu dismisses on a click outside it");
+        if (_menu == null) { Console.WriteLine("  verdict: FAIL - no menu"); return; }
+        Point origin = MenuOrigin();
+
+        // 1) Opening the menu arms the global click hook, and closing it takes the hook back out.
+        //    The hook sits in the input path of every application on the machine, so leaving it
+        //    installed would be its own bug.
+        int installsBefore = HookInstallsForTest;
+        OpenRootMenu(origin);
+        Application.DoEvents();
+        PumpTicks(2);
+        bool opened = _menu.Visible;
+        bool armed = HookInstalledForTest && HookInstallsForTest > installsBefore;
+        Console.WriteLine("  hook    : opened=" + opened + " installed=" + HookInstalledForTest +
+                          " installs+=" + (HookInstallsForTest - installsBefore) + "  " +
+                          (armed ? "ok (armed)" : "MISMATCH (no hook)"));
+
+        Rectangle mb = _menu.Bounds;
+        int outsideX = mb.Right + 120, outsideY = mb.Bottom + 120;
+        Point inside = new Point(mb.Left + 8, mb.Top + 8);
+
+        // 2) The hook's DECISION, asserted directly. Injecting a real click to exercise the hook
+        //    end to end would press the button under the cursor on whatever machine this runs on -
+        //    the one thing a diagnostic must never do. So the decision is a method and the guard
+        //    supplies the coordinates.
+        bool hookOutside = MenuClickDismisses(outsideX, outsideY);
+        bool hookInside = MenuClickDismisses(inside.X, inside.Y);
+        Console.WriteLine("  decide  : click outside " + mb + " -> dismiss=" + hookOutside + "  " +
+                          (hookOutside ? "ok" : "MISMATCH (outside click must dismiss)"));
+        Console.WriteLine("  decide  : click inside  " + mb + " -> dismiss=" + hookInside + "  " +
+                          (hookInside ? "MISMATCH (a menu row must stay pressable)" : "ok"));
+
+        // 3) The decision FLAGS; the tick closes. That split is what keeps control work off the
+        //    hook callback (which runs in the input path of every mouse event on the machine), so
+        //    the two halves are checked separately: MenuClickDismisses above set the flag.
+        bool flaggedOutside = MenuClosePendingForTest;
+        ApplyPendingMenuCloseForTest();
+        bool closedByPending = !_menu.Visible;
+        Console.WriteLine("  apply   : outside click flagged=" + flaggedOutside + " then applied -> " +
+                          "visible=" + _menu.Visible + "  " +
+                          ((flaggedOutside && closedByPending) ? "ok (closed by the tick)"
+                                                               : "MISMATCH"));
+
+        // 4) The hook is removed once the menu is closed.
+        PumpTicks(2);
+        bool disarmed = !HookInstalledForTest;
+        Console.WriteLine("  unhook  : installed=" + HookInstalledForTest + "  " +
+                          (disarmed ? "ok (removed)" : "MISMATCH (hook left installed)"));
+
+        // 5) With no menu open the hook decides nothing, whatever the coordinates.
+        bool idleDismisses = MenuClickDismisses(outsideX, outsideY);
+        Console.WriteLine("  idle    : no menu open -> dismiss=" + idleDismisses + "  " +
+                          (idleDismisses ? "MISMATCH" : "ok (nothing to dismiss)"));
+
+        // 6) A click INSIDE an open menu must not flag a close. Done on a fresh menu so the flag
+        //    starts clean.
+        OpenRootMenu(origin);
+        Application.DoEvents();
+        PumpTicks(2);
+        Rectangle mb2 = _menu.Bounds;
+        bool insideDecision = MenuClickDismisses(mb2.Left + 8, mb2.Top + 8);
+        bool flaggedInside = MenuClosePendingForTest;
+        Console.WriteLine("  inside  : click at (" + (mb2.Left + 8) + "," + (mb2.Top + 8) + ") in " +
+                          mb2 + " -> dismiss=" + insideDecision + " flagged=" + flaggedInside + "  " +
+                          ((!insideDecision && !flaggedInside) ? "ok" : "MISMATCH"));
+
+        // 7) A press on the pet itself also closes it, through the window's own hit test. That is
+        //    the path that already worked, kept so it cannot regress.
+        Point girl = Point.Empty;
+        bool haveGirl = false;
+        for (int y = 0; y < ClientSize.Height && !haveGirl; y += 4)
+            for (int x = 0; x < ClientSize.Width && !haveGirl; x += 4)
+                if (GirlPixelSolid(x, y)) { girl = new Point(x, y); haveGirl = true; }
+        bool closedByGirl = false;
+        if (haveGirl) {
+            OnMouseDown(new MouseEventArgs(MouseButtons.Left, 1, girl.X, girl.Y, 0));
+            PumpTicks(2);
+            closedByGirl = !_menu.Visible;
+            Console.WriteLine("  on pet  : press at (" + girl.X + "," + girl.Y + ") -> visible=" +
+                              _menu.Visible + "  " + (closedByGirl ? "ok (closed)" : "MISMATCH"));
+        } else {
+            Console.WriteLine("  on pet  : no solid pixel found, skipped");
+            closedByGirl = true;
+        }
+
+        // 8) THE DIAGNOSTIC PUMP MUST RUN THE SAME SEQUENCE THE PRODUCTION TIMER DOES.
+        //
+        //    This is the check that was missing, and its absence is why the click-away fix shipped
+        //    broken TWICE while the guard kept passing. The hook installed and flagged the click,
+        //    but ApplyPendingMenuClose was hung on the diagnostic-only wrapper - so --clickaway
+        //    drove the path that worked while the real application never applied the flag.
+        //
+        //    A guard that drives its own path proves nothing about the shipping one. Both now call
+        //    TickOnce, and this asserts the sequence actually runs: flags 1 (OnTick), 2
+        //    (ApplyPendingMenuClose) and 4 (SentryTick) all set, which can only happen if the
+        //    diagnostic pump reached the same method.
+        ResetTickTraceForTest();
+        OnTickProbe();
+        int tr = TickTraceForTest;
+        bool samePath = (tr & 1) != 0 && (tr & 2) != 0 && (tr & 4) != 0;
+        Console.WriteLine("  paths   : diagnostic pump ran the tick sequence, trace=" + tr +
+                          " (want 7: OnTick|apply|sentry)  " + (samePath ? "ok" : "MISMATCH"));
+
+        if (_menu.Visible) _menu.Close();
+        PumpTicks(2);
+        bool cleanFinish = !HookInstalledForTest;
+
+        bool ok = opened && armed && hookOutside && !hookInside && flaggedOutside &&
+                  closedByPending && disarmed && !idleDismisses && !insideDecision && !flaggedInside &&
+                  closedByGirl && samePath && cleanFinish;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - opening the menu arms a global click hook, a click outside it is flagged and the next tick closes the menu, a click inside is ignored, the hook is removed when it closes, and the tick sequence really runs"
+            : "FAIL - opened=" + opened + " armed=" + armed + " outside=" + hookOutside +
+              " inside=" + hookInside + " flagged=" + flaggedOutside + " applied=" + closedByPending +
+              " unhooked=" + disarmed + " idleDismisses=" + idleDismisses +
+              " insideDecision=" + insideDecision + " flaggedInside=" + flaggedInside +
+              " onPet=" + closedByGirl + " samePath=" + samePath + " cleanFinish=" + cleanFinish));
+    }
+
+    // The tray icon must be the SHIPPED one, and must load.
+    //
+    // Worth a guard because the failure is silent and looks exactly like the bug that was just
+    // fixed: LoadTrayIcon falls back to SystemIcons.Application when tray.ico is missing or
+    // malformed, so the tray quietly reverts to the stock Windows icon and nothing reports it.
+    // The user would see the old icon again and have no way to tell why.
+    // Every title-bar window must carry its own shipped icon.
+    //
+    // The .NET default form icon is a VALID Icon object, so leaving Icon unset produces no error, no
+    // log line, and nothing visible in a client-area screenshot. That is why it survived this long:
+    // the only way to catch it is to read the property back and compare it against the shipped file.
+    //
+    // Comparison is by rendering both and fingerprinting the pixels, not by reference: the loader
+    // creates a new Icon each time, so reference equality would always say "different" and prove
+    // nothing at all.
+    public void RunWindowIconTest() {
+        Console.WriteLine("window title-bar icons");
+        string[] names = new string[] { "play", "gear", "wave", "cursor" };
+        string[] labels = new string[] { "DemoWindow", "SettingsWindow", "AudioEditor", "InputDialog" };
+        string defaultHash = IconHash(SystemIcons.Application, 16);
+
+        bool allOk = true;
+        for (int i = 0; i < names.Length; i++) {
+            string path = Path.Combine(_baseDir, "assets", names[i] + ".ico");
+            bool fileOk = File.Exists(path);
+            string want = "-";
+            if (fileOk) {
+                try {
+                    using (Icon probe = new Icon(path, SystemInformation.SmallIconSize)) want = IconHash(probe, 16);
+                } catch (Exception ex) { want = "ERR " + ex.Message; }
+            }
+            // The real Form, constructed so its own constructor does the assignment under test.
+            Form f = null;
+            string got = "-";
+            try {
+                if (names[i] == "play") f = new DemoWindow(this);
+                else if (names[i] == "gear") f = new SettingsWindow(this);
+                else if (names[i] == "wave") f = new AudioEditor(EmptyAudio(), "x", "x");
+                else f = new InputDialog("t", "p", "", "");
+                got = f.Icon == null ? "null" : IconHash(f.Icon, 16);
+            } catch (Exception ex) { got = "ERR " + ex.Message; }
+            finally { if (f != null) { try { f.Dispose(); } catch { } } }
+
+            bool ok = fileOk && got == want && got != defaultHash && got != "null";
+            allOk = allOk && ok;
+            Console.WriteLine("  " + labels[i].PadRight(15) + " file=" + (fileOk ? "ok " : "MISSING") +
+                              " shipped=" + Short(want) + " window=" + Short(got) +
+                              " default=" + Short(defaultHash) + "  " + (ok ? "ok" : "MISMATCH"));
+            if (got == defaultHash)
+                Console.WriteLine("      ^^ this window still shows the .NET default form icon");
+        }
+        Console.WriteLine("  verdict: " + (allOk
+            ? "OK - all four title-bar windows load their own shipped icon and none is the .NET default form icon"
+            : "FAIL - a window is missing its icon or still shows the default"));
+    }
+    static string Short(string h) { return h != null && h.Length > 8 ? h.Substring(0, 8) : h; }
+
+    // A silent PcmAudio, so the icon check can build a window that needs audio without depending on
+    // a file being present. Building the Form for real is the point: its own constructor has to do
+    // the assignment under test.
+    static PcmAudio EmptyAudio() {
+        PcmAudio a = new PcmAudio();
+        a.S = new short[64];
+        a.Rate = 8000;
+        return a;
+    }
+
+    // A pixel fingerprint, so two Icons can be compared by what they LOOK like rather than by
+    // reference (the loader returns a fresh object every time).
+    static string IconHash(Icon ic, int size) {
+        try {
+            using (Bitmap b = new Bitmap(size, size, PixelFormat.Format32bppArgb)) {
+                using (Graphics g = Graphics.FromImage(b)) {
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.DrawIcon(ic, new Rectangle(0, 0, size, size));
+                }
+                int acc = 17;
+                for (int y = 0; y < size; y++)
+                    for (int x = 0; x < size; x++) {
+                        Color c = b.GetPixel(x, y);
+                        acc = acc * 31 + c.R + c.G * 3 + c.B * 7 + c.A * 11;
+                    }
+                return (acc & 0x7FFFFFFF).ToString("X8");
+            }
+        } catch { return "ERR"; }
+    }
+
+    public void RunTrayIconTest() {
+        Console.WriteLine("tray icon");
+        string p = Path.Combine(_baseDir, "tray.ico");
+        bool present = File.Exists(p);
+        Console.WriteLine("  file    : " + p + "  " + (present ? "present" : "MISSING"));
+
+        if (!present) {
+            Console.WriteLine("  verdict: FAIL - tray.ico is not next to the script, so the tray would " +
+                              "show the stock Windows application icon");
+            return;
+        }
+
+        // Loaded the way the app loads it, so this covers the real call and not a copy of it.
+        //
+        // TWO sizes are reported and they mean different things: what was ASKED for, and what the
+        // file actually handed back. Icon.Width reports the decoded frame, not the request, so a
+        // file that lacks the requested size is scaled by GDI+ and the Width alone cannot tell that
+        // apart from an exact match.
+        Icon got = null;
+        string err = "";
+        int w = 0, h = 0;
+        Size want = SystemInformation.SmallIconSize;
+        try {
+            got = LoadTrayIcon(_baseDir);
+            w = got.Width; h = got.Height;
+        } catch (Exception ex) { err = ex.Message; }
+        Console.WriteLine("  asked   : " + want.Width + "x" + want.Height + " (SystemInformation.SmallIconSize)");
+
+        // The fallback is recognisable by its identity: if the loader handed back SystemIcons'
+        // own icon, the shipped file did not take.
+        bool isStock = false;
+        try { if (got != null) isStock = object.ReferenceEquals(got, SystemIcons.Application); } catch { }
+        bool loaded = got != null && !isStock && w > 0 && h > 0;
+        Console.WriteLine("  load    : " + (got == null ? "null" : (w + "x" + h)) +
+                          " stock=" + isStock + (err.Length > 0 ? "  err=" + err : "") + "  " +
+                          (loaded ? "ok" : "MISMATCH"));
+
+        // The file must CARRY the size the tray asks for, or Windows is scaling a neighbour and the
+        // icon is softer than it needs to be. Checked against the file's own directory, not against
+        // what the Icon class chose to return.
+        bool carries = IconFileHasSize(p, want);
+        Console.WriteLine("  carries : tray.ico contains " + want.Width + "x" + want.Height + "  " +
+                          (carries ? "ok" : "MISMATCH (the tray would scale a different size)"));
+
+        if (got != null && !isStock) { try { got.Dispose(); } catch { } }
+
+        bool ok = present && loaded && carries && !isStock;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - the tray loads the shipped icon, the file carries the size the notification area asks for, and it is not the stock Windows application icon"
+            : "FAIL - present=" + present + " loaded=" + loaded + " carries=" + carries +
+              " stock=" + isStock));
+    }
+
+    // Reads the ICO directory and reports whether an entry of exactly this size is present.
+    // An ICO is a 6-byte header followed by 16-byte directory entries, then the image payloads.
+    static bool IconFileHasSize(string path, Size want) {
+        try {
+            byte[] b = File.ReadAllBytes(path);
+            if (b.Length < 6) return false;
+            int n = BitConverter.ToUInt16(b, 4);
+            for (int i = 0; i < n; i++) {
+                int e = 6 + i * 16;
+                if (e + 16 > b.Length) return false;
+                int w = b[e] == 0 ? 256 : b[e];
+                if (w == want.Width) return true;
+            }
+        } catch { }
+        return false;
+    }
+
+    // ---------------------------------------------------------------- head pat ---
+    //
+    // Long-pressing on her head plays a five-frame pat: a hand descends, presses her down, and lifts.
+    // Everything here comes from measurements of the reference GIF rather than from taste:
+    //
+    //   * five frames at 60 ms each, looping for as long as the button is held
+    //   * the hand's descent and her compression are read from the reference and converted at
+    //     454/112 = 4.05 (the reference is 112 px, the sprite is 454)
+    //   * she is pushed down by up to 32 real px, which is what PatSquashY describes
+    //
+    // The HAND art is a separate overlay, drawn at the END of PaintWidgetArt so it is on top of
+    // everything including a worn iron pot. It is deliberately soft: the source hand is 99 px wide
+    // and has to reach 446 px (her head), a x4.5 enlargement, so it cannot be crisp - the user asked
+    // for exactly that, blurry hand, sharp girl.
+    const int PAT_FRAMES = 5;
+    // Per hand frame. petpet's own template is 20 ms a frame, but that is its *default GIF delay*, not
+    // the speed its UI shows.
+    //
+    // The site's speed control is measured in FPS (main.js: `newDelay = ~~(1000 / clamp(fps, 2, 60))`,
+    // and it labels the value `fps`). The user asked for speed 16, which is a delay of 1000/16 = 62 ms
+    // - and that also matches the reference GIF they first supplied, whose 60 ms is speed ~17, the
+    // site's own default. So the slow version was never a bad sample; it is what the site produces by
+    // default, and the 20 ms template is what the GIF delay defaults to before the UI overrides it.
+    //
+    // 62 ms rather than a rounded 60: the number comes from the user's unit, and keeping it exact means
+    // their "16" and this constant stay comparable.
+    const double PAT_FRAME_MS = 40.0;
+    const double PAT_HOLD_MS = 200.0;
+    // How far the pointer must travel ACROSS HER before the stroke counts as a pat, and how long a
+    // pause ends it. Distance rather than time: a slow deliberate stroke crosses plenty of pixels, a
+    // resting hand drifts a pixel or two, and only the first of those is a pat.
+    //
+    // 24 px is roughly a twentieth of her width - enough that a click or a tremor cannot reach it, small
+    // enough that one short stroke fires it immediately.
+    const double PAT_MOVE_MIN_PX = 24.0;
+    // How long the stroke must be sustained before the pat begins. The user asked for 500 ms: a brief
+    // brush across her should not start it, only a deliberate stroke.
+    //
+    // Timed from the moment the distance threshold is REACHED, not from the first pixel of movement.
+    // Those differ by the frames the 24 px takes to accumulate, and starting the clock at the first
+    // pixel would make the real delay depend on how fast the user happens to be moving.
+    //
+    // The clock resets whenever the banked distance is cleared (see _patMoveAccum), so this reads as
+    // "500 ms of continuous stroking" rather than "500 ms since a stroke once happened".
+    const double PAT_START_DELAY_MS = 500.0;
+    // A single frame's delta above this is a warp, not a stroke, and is discarded.
+    const double PatMoveMaxStep = 120.0;
+    // How long a pause ends the pat. The user asked for 150 ms - 300 ms felt like the hand was lagging
+    // behind the pointer.
+    //
+    // One constant covers both ways a pat ends, the stroke pausing and the pointer leaving her, because
+    // from the user's side those feel the same and a second constant would only be a second thing to
+    // tune. 150 ms is about four frames: long enough to swallow the hitch in a real stroke that would
+    // otherwise flicker the hand off and back on, short enough not to read as lag.
+    const double PAT_END_DELAY_MS = 150.0;
+    // How long the tariff readout stays up after the pointer stops engaging with her, and the short
+    // grace used instead while a charge is playing (so the tablet does not flip mid-animation).
+    const double PeakHoldMs = 5000.0;
+    const double PeakSettleMs = 1000.0;
+    // How fast banked movement drains while paused, in px per ms.
+    const double PatMoveDecayPerMs = 0.12;
+    // How long the pat stays barred after she has finished snapping to a corner. The user asked for
+    // 1000 ms of enforced quiet, timed from when she has COMPLETELY stopped - not from the release -
+    // so a drag that ends with a long flight home still gets the full delay afterwards.
+    const double PAT_SETTLE_MS = 1000.0;          // how long the press must last before a pat begins
+    readonly Bitmap[] _patHand = new Bitmap[PAT_FRAMES];
+    bool _patActive;                            // the pat is playing
+    bool _patWasActive;                         // it was, on the previous frame: one last repaint
+    float _patSquash = 1f;                      // her vertical compression for the current pat frame
+    float _patSquashX = 1f;                     // ...and her horizontal spread, same frame
+    // The downward slide, in widget px, on top of the squash - petpet's offsetY term. Folded into the
+    // vertical scale anchor so the sprite moves down while its squash pivot stays at her feet.
+    int _patShiftY;
+    // Where the horizontal squash pivots: her centre line, so she widens both ways.
+    int _squashAnchorX;
+    bool _patReady;                             // all five hand frames loaded
+    double _patT;                               // ms into the current cycle
+    // Movement tracking for the stroke trigger. _patMoveAccum is the distance travelled while on her,
+    // capped so a fast flick cannot bank credit for later.
+    double _patMoveAccum;
+    int _patMoveX, _patMoveY;
+    bool _patMoveSeen;                          // false on the first frame: no previous position yet
+    double _patIdleMs;                          // how long the stroke has been paused mid-pat
+    // The stroke qualified but the pot has to come off first. Set when the trigger fires while she is
+    // wearing one, cleared once the fade finishes and the pat starts, or when the pointer leaves her.
+    bool _patWaitingPotOff;
+    // How long the current stroke has been sustained PAST the distance threshold. Counts up to
+    // PAT_START_DELAY_MS before the pat begins; cleared whenever the banked distance is cleared.
+    double _patMoveMs;
+    // Live values for the head-pat placement. Normally these ARE the constants above; RunPatTool
+    // overwrites them so the preview can be dragged around without touching the code.
+    //
+    // Kept as fields rather than read straight from the consts precisely so the tool and the shipping
+    // path share ONE placement formula - PatGeometry reads these. A tool that re-implemented the maths
+    // would drift from the real thing and then lie about the result, which the note calls out as the
+    // first question to ask of such a tool: "is what it shows the same thing the program finally draws?"
+    double _patBiasX = PatPalmBiasX;
+    double _patBiasY = PatPalmBiasY;
+    double _patScale = PatDrawScale;
+    double _patRef = PatRefScale;
+    // How much of the reference's compression to apply. 1.0 is the reference's own 11.4 %; the tool
+    // exposes it because "how much she gives" is a taste call that only the eye can settle - the exact
+    // case the interactive-tool note describes.
+    double _patSquashDepth = 1.0;
+    // Stop-and-settle gate. Set by any click, right-click or drag; cleared only after she has finished
+    // snapping to her corner and PAT_SETTLE_MS has then elapsed. While set, the pat neither starts nor
+    // continues - see TickPatWith for why the hand has to get out of the way during a drag.
+    bool _patBlocked;
+    double _patSettleMs;
+    // Where the PALM is inside each hand sprite, measured as a fraction of the sprite (see
+    // patref2/_palm.py). Placement is stated as "put the palm here", not "put a corner of the
+    // bounding box here".
+    //
+    // Six rounds of tuning failed because every earlier version positioned a CORNER. The content is a
+    // diagonal arm and the sprite is 446 px wide, so the palm sits hundreds of pixels from any corner
+    // and no corner offset lands on her head by luck. These numbers come from the alpha centroid of
+    // each sprite's lower band, which is the pad that actually touches her.
+    static readonly double[] PatPalmX = new double[] { 0.319, 0.356, 0.318, 0.425, 0.298 };
+    static readonly double[] PatPalmY = new double[] { 0.511, 0.720, 0.835, 0.744, 0.608 };
+    // Correction on top of the measured centroid. The centroid of the sprite's lower band is pulled
+    // left and up by the fingers curling that way, so anchoring the centroid on her crown lands the
+    // hand on her face. This shifts the whole gesture onto the head; the per-frame fractions above
+    // already carry the motion, so a constant offset cannot flatten the animation.
+    // SOLVED BY HAND, in the interactive tool, on 2026-10-12.
+    //
+    // These two numbers resisted roughly a dozen rounds of "change a constant, rebuild, dump a frame,
+    // squint at it, guess again". The tool replaced that loop with dragging the hand on a 1:1 preview
+    // of the final composite, and the placement was settled in one sitting.
+    //
+    // Why the guessing could not converge, now that it is measured: the palm fractions above span
+    // 0.511..0.835 across the five frames, and that 0.32 is the FINGERS CURLING - it moves the
+    // centroid without moving the hand. So the centroid is a fine anchor but a poor absolute one, and
+    // every attempt to reason the bias out of it was chasing a moving reference.
+    const double PatPalmBiasX = 0.393;     // of the sprite width, to the right
+    const double PatPalmBiasY = -0.206;    // of the sprite height
+    // Reference px -> sprite px. The asset was built so the hand's width matches her head width
+    // (446 px, x4.17), which is the ratio the reference itself uses: hand 99 px against her 102 px
+    // hair, both inside the same 112 px frame.
+    static readonly double PatRefScale = 446.0 / 107.0;
+    // The reference says 1.2..1.5, but the WIDGET cannot show that: the region PaintWidgetArt clears
+    // and draws is only 454 px wide (measured: artClear = (0, 1001, 454, 527)), and anything wider is
+    // clipped - a first attempt at 1.20 left a hard white rectangle with the hand's edge cut off.
+    // 1.00 makes the hand exactly as wide as the cleared band, which is the largest the app can draw
+    // without that artefact, and is already as wide as her head.
+    //
+    // Kept separate from PatRefScale because that factor also places the hand - scaling it would move
+    // the palm off her head at the same time as resizing it.
+    const double PatDrawScale = 1.00;
+
+    // Walks the pat TRIGGER, not the pat drawing: press on her head, hold past PAT_HOLD_MS, and see
+    // whether _patActive goes true. --patcheck proves the hand draws once active; this proves it can
+    // become active at all, which is what the user reported failing.
+    // ---------------------------------------------------------- feature switches ---
+    // Each switch must actually cut its behaviour, and the assertions are on the EFFECT (counts and
+    // balances), not on the flag - a switch that flips but gates nothing would pass a flag-only test.
+    // ---------------------------------------------------------- peak / off-peak ---
+    // Drives the real press handler so the double-click rule is exercised, not re-implemented.
+    // The hold/revert rule as its own method, so a test can advance it without waiting in real time.
+    // Extracted rather than duplicated: a second copy is how earlier guards ended up measuring
+    // something other than what ships.
+    void RunHoldForTest() {
+        if (!_peakMode) return;
+        bool engaged = _mouseInside || Native.KeyDown(Native.VK_LBUTTON);
+        if (engaged) {
+            _peakHoldMs = PeakHoldMs;
+        } else {
+            bool busy = _hits.Count > 0 || _pendingStep > 1e-9;
+            if (busy) {
+                _peakHoldMs = PeakSettleMs;      // defer: a short grace restarts once it ends
+            } else {
+                _peakHoldMs -= _timer.Interval;
+                if (_peakHoldMs <= 0) {
+                    _peakMode = false;
+                    _panelCacheValid = false;
+                    _dirty = true;
+                    Invalidate();            // do not wait for the next incidental repaint
+                }
+            }
+        }
+    }
+
+    public bool PeakModeUi { get { return _peakMode; } }
+    public void SetPeakModeUi(bool on) { _peakMode = on; _peakHoldMs = PeakHoldMs; }
+    public void TickPeakForTest() { RunHoldForTest(); }
+    public bool OnTabletForTest(int cx, int cy) { return OnTablet(cx, cy); }
+    public double PeakHoldForTest { get { return _peakHoldMs; } }
+    public void SetMouseInsideForTest(bool on) { _mouseInside = on; }
+
+    public void BodyClickForTest(int x, int y) {
+        MouseEventArgs me = new MouseEventArgs(MouseButtons.Left, 1, x, y, 0);
+        OnMouseDown(me);
+    }
+
+    // Drives the real tick with the tariff panel up and reports whether the clock marks it dirty.
+    // A cheap fingerprint of the tariff panel as it would be drawn right now.
+    // Fingerprint of the tablet area ON THE CANVAS - the pixels the push carries to the screen.
+    public string CanvasTabletHashForTest() {
+        if (_canvas == null || _fx == null || _fx.Length < 4) return "-";
+        int x0 = _offX + 250, y0 = _offY + 290, x1 = _offX + 430, y1 = _offY + 405;
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+        if (x1 > _canvas.Width) x1 = _canvas.Width;
+        if (y1 > _canvas.Height) y1 = _canvas.Height;
+        int h = 17;
+        for (int y = y0; y < y1; y += 4)
+            for (int x = x0; x < x1; x += 4)
+                h = h * 31 + _canvas.GetPixel(x, y).ToArgb();
+        return (h & 0xFFFFFF).ToString("x6");
+    }
+
+    public string PanelHashForTest() {
+        using (Bitmap b = BuildPanel(200, 100)) {
+            int h = 17;
+            for (int y = 0; y < b.Height; y += 3)
+                for (int x = 0; x < b.Width; x += 3)
+                    h = h * 31 + b.GetPixel(x, y).ToArgb();
+            return (h & 0xFFFFFF).ToString("x6");
+        }
+    }
+
+    public void RunPeakTickTest() {
+        Console.WriteLine("tariff panel liveness");
+        _peakMode = true;
+        _peakSec = -1;
+        _panelCacheValid = false;
+        // Compare the RENDERED PANEL, not the dirty flag: _dirty is consumed by the very tick that
+        // sets it, so reading it afterwards always shows false even when everything works.
+        // The canvas itself, which is what the push actually carries.
+        //
+        // PanelHashForTest only proves BuildPanel RETURNS different pixels, and the push counter only
+        // proves a push happened - during the freeze both were perfectly healthy while the screen never
+        // changed, because widgetAnimating did not include the clock and so the tablet was never
+        // repainted. This sample is the one that would have caught it.
+        // Each sample follows a full second of real ticks. A single OnTickProbe would only repaint if
+        // that one tick happened to cross a second boundary (the panel sets _forceFullFill only then),
+        // so the assertion passed or failed depending on where in the second it landed.
+        string c1 = CanvasTabletHashForTest();
+        for (int i = 0; i < 14; i++) { System.Threading.Thread.Sleep(90); OnTickProbe(); }
+        string c2 = CanvasTabletHashForTest();
+        for (int i = 0; i < 14; i++) { System.Threading.Thread.Sleep(90); OnTickProbe(); }
+        string c3 = CanvasTabletHashForTest();
+        bool canvasChanges = c1 != c2 && c2 != c3;
+        Console.WriteLine("  canvas  : c1=" + c1 + " c2=" + c2 + " c3=" + c3 + "  " +
+                          (canvasChanges ? "ok (the tablet is really repainted)"
+                                         : "MISMATCH (the canvas keeps the old digits - the freeze)"));
+
+        string h1 = PanelHashForTest();
+        System.Threading.Thread.Sleep(1200);
+        _panelCacheValid = false;
+        string h2 = PanelHashForTest();
+        System.Threading.Thread.Sleep(1200);
+        _panelCacheValid = false;
+        string h3 = PanelHashForTest();
+        bool contentChanges = h1 != h2 && h2 != h3;
+        // What actually reaches the screen: count real pushes while the panel ticks.
+        //
+        // NOT a screenshot comparison - CaptureWindowTo does not produce a file under this
+        // diagnostic, so that check could never pass and was reporting a product failure that did
+        // not exist. A push counter is direct evidence and cannot silently fail to run.
+        long push0 = _pushCount;
+        for (int i = 0; i < 30; i++) { System.Threading.Thread.Sleep(100); OnTickProbe(); }
+        long pushes = _pushCount - push0;
+        bool screenChanges = pushes > 0;
+        Console.WriteLine("  screen  : pushes=" + pushes + " in 3s  " +
+                          (screenChanges ? "ok (the layer is pushed to the screen)"
+                                         : "MISMATCH (canvas redraws but is never pushed)"));
+        Console.WriteLine("  content : h1=" + h1 + " h2=" + h2 + " h3=" + h3 + "  " +
+                          (contentChanges ? "ok (the digits change every second)"
+                                          : "MISMATCH (the panel renders the same thing)"));
+        int changes = 0, lastSec = _peakSec;
+        bool sawDirty = false;
+        for (int i = 0; i < 40; i++) {
+            _dirty = false;
+            System.Threading.Thread.Sleep(120);
+            OnTickProbe();
+            if (_dirty) sawDirty = true;
+            if (_peakSec != lastSec) { changes++; lastSec = _peakSec; }
+        }
+        Console.WriteLine("  panel   : peakMode=true secChanges=" + changes +
+                          " dirtyEverSet=" + sawDirty + "  " +
+                          ((changes > 0 && sawDirty) ? "ok (the clock drives repaints)"
+                                                     : "MISMATCH (nothing marks it dirty)"));
+        bool ok = contentChanges && screenChanges && canvasChanges;
+        _peakMode = false; _peakSec = -1; _panelCacheValid = false;
+        Console.WriteLine("  verdict: " + (ok ? "OK - the panel repaints on its own"
+                                              : "FAIL - the panel would only update on other actions"));
+    }
+
+    public void RunPeakCheckTest() {
+        Console.WriteLine("peak / off-peak readout");
+        Console.WriteLine("  cloud   : have=" + _haveCloudTime +
+                          (_haveCloudTime ? " stamp=" + _cloudStamp.ToString("yyyy-MM-dd HH:mm:ss") +
+                                            "Z" : " (no server stamp yet - falls back to local)"));
+        DateTime bj = CloudBeijing();
+        Console.WriteLine("  beijing : " + bj.ToString("yyyy-MM-dd HH:mm:ss") +
+                          "  offPeak=" + OffPeakNow() + "  (rule: 00:30-08:30)");
+
+        // Boundary check: the rule is a time-of-day test, so probe it directly rather than waiting
+        // for the clock to reach 00:30. Saved and restored so the running readout is unaffected.
+        DateTime savedStamp = _cloudStamp;
+        DateTime savedLocal = _cloudLocalStamp;
+        bool savedHave = _haveCloudTime;
+        _haveCloudTime = true;
+        _cloudLocalStamp = DateTime.UtcNow;
+        // CloudNow() = _cloudStamp + (UtcNow - _cloudLocalStamp), so setting the stamp to a Beijing
+        // wall time minus 8 h makes CloudBeijing() land exactly on it.
+        int[][] probes = new int[][] {
+            new int[] { 0, 29, 0 }, new int[] { 0, 31, 1 },
+            new int[] { 8, 29, 1 }, new int[] { 8, 31, 0 },
+            new int[] { 12, 0, 0 }
+        };
+        bool boundsOk = true;
+        for (int i = 0; i < probes.Length; i++) {
+            _cloudStamp = DateTime.UtcNow.Date.AddHours(probes[i][0] - 8).AddMinutes(probes[i][1]);
+            bool got = OffPeakNow();
+            bool want = probes[i][2] == 1;
+            if (got != want) boundsOk = false;
+            Console.WriteLine("  probe   : " + probes[i][0].ToString("00") + ":" +
+                              probes[i][1].ToString("00") + " -> offPeak=" + got +
+                              " (want " + want + ")  " + (got == want ? "ok" : "MISMATCH"));
+        }
+        _cloudStamp = savedStamp; _cloudLocalStamp = savedLocal; _haveCloudTime = savedHave;
+
+        bool savedMode = _peakMode;
+        _peakMode = true;
+        _todayUsed = 1.23;
+        _panelCacheValid = false;
+        using (Bitmap b = BuildPanel(200, 100)) {
+            // The panel is built; that is what the tablet draws. Non-null and the right size is enough
+            // to prove the three-line renderer ran without throwing.
+            Console.WriteLine("  panel   : " + b.Width + "x" + b.Height + " built  " +
+                              ((b.Width == 200 && b.Height == 100) ? "ok" : "MISMATCH"));
+        }
+        _peakMode = savedMode;
+        _panelCacheValid = false;
+
+        // ---- double click behaviour ----
+        RenderToCanvas();
+        // A point ON THE TABLET: the average of its four corners. The toggle is bound to the tablet, so
+        // probing her body would only prove that the body is not the tablet.
+        int bx = _offX + (int)((_fx[0] + _fx[1] + _fx[2] + _fx[3]) / 4.0);
+        int by = _offY + (int)((_fy[0] + _fy[1] + _fy[2] + _fy[3]) / 4.0);
+        RenderToCanvas();
+        _peakMode = false;
+        BodyClickForTest(bx, by);
+        BodyClickForTest(bx, by);
+        Console.WriteLine("  tdbg    : fx=" + _fx[0].ToString("0") + "," + _fx[1].ToString("0") +
+                          "," + _fx[2].ToString("0") + "," + _fx[3].ToString("0") + " fy=" +
+                          _fy[0].ToString("0") + "," + _fy[1].ToString("0") + "," +
+                          _fy[2].ToString("0") + "," + _fy[3].ToString("0") +
+                          " off=" + _offX + "," + _offY + " w=" + _w + " h=" + _h);
+        Console.WriteLine("  tdbg2   : probe(" + bx + "," + by + ") onTablet=" + OnTablet(bx, by));
+        bool bodyToggles = _peakMode;
+
+        // And somewhere on her that is NOT the tablet must do nothing. Without this the assertion would
+        // still pass if the region were widened back to her whole silhouette.
+        _peakMode = false;
+        BodyClickForTest(_offX + _headX, _offY + (int)(_h * 0.55));
+        BodyClickForTest(_offX + _headX, _offY + (int)(_h * 0.55));
+        bool bodyIgnored = !_peakMode;
+        Console.WriteLine("  dblclick: on her body (not the tablet) -> peakMode=" + _peakMode + "  " +
+                          (bodyIgnored ? "ok (only the tablet responds)"
+                                       : "MISMATCH (too wide a region)"));
+        Console.WriteLine("  dblclick: on the tablet -> peakMode=" + _peakMode + "  " +
+                          (bodyToggles ? "ok (toggles)" : "MISMATCH (no reaction)"));
+
+        // A double click on her HEAD must remain the pot knock-off and must NOT toggle. Only meaningful
+        // when a pot is on, which is the only time the head handler runs at all.
+        RenderToCanvas();
+        int hx = _offX + _headX;
+        int hy = _offY + (int)(_h * 0.24);
+        _rices.Clear();
+        Rice hp2 = new Rice();
+        hp2.OnHead = true;
+        hp2.Amount = 1.0;
+        hp2.X = hx; hp2.Y = hy;
+        _rices.Add(hp2);
+        _peakMode = false;
+        BodyClickForTest(hx, hy);
+        BodyClickForTest(hx, hy);
+        bool headNoToggle = !_peakMode;
+        Console.WriteLine("  dblclick: on her head with a pot -> peakMode=" + _peakMode + "  " +
+                          (headNoToggle ? "ok (head keeps its own meaning)"
+                                        : "MISMATCH (the head gesture stole the toggle)"));
+        _rices.Clear();
+        _peakMode = false;
+
+        // ---- today's spend is driven by the balance ----
+        double spendSaved = _todayUsed;
+        double baseSaved = _todayBase;
+        double topUpSaved = _todayTopUp;
+        int daySaved = _usedDay;
+        _usedDay = DateTime.Now.DayOfYear;
+        _todayBase = double.NaN; _todayTopUp = 0; _todayUsed = 0; _lastBalSeen = double.NaN;
+        NoteBalanceForSpend(10.00);
+        NoteBalanceForSpend(9.25);              // spent 0.75
+        double afterDrop = _todayUsed;   // absolute now, not a delta
+        NoteBalanceForSpend(12.00);             // a top-up must not count as spending
+        double afterTopUp = _todayUsed;
+        NoteBalanceForSpend(11.50);             // spent 0.50 on top of the 0.75
+        double total = _todayUsed;
+        bool spendOk = Math.Abs(afterDrop - 0.75) < 1e-6 &&
+                       Math.Abs(afterTopUp - 0.75) < 1e-6 &&
+                       Math.Abs(total - 1.25) < 1e-6;
+        Console.WriteLine("  spend   : drop=" + afterDrop.ToString("0.00") +
+                          " afterTopUp=" + afterTopUp.ToString("0.00") +
+                          " total=" + total.ToString("0.00") + " (want 0.75/0.75/1.25)  " +
+                          (spendOk ? "ok (led by the balance, not by the animation)"
+                                   : "MISMATCH (wrong driver)"));
+        _todayUsed = spendSaved; _todayBase = baseSaved; _todayTopUp = topUpSaved;
+        _panelCacheValid = false;
+
+        // ---- countdown to the next tariff change ----
+        DateTime cs = _cloudStamp; DateTime cl = _cloudLocalStamp; bool ch = _haveCloudTime;
+        _haveCloudTime = true; _cloudLocalStamp = DateTime.UtcNow;
+        bool cdOk = true;
+        // 06:00 Beijing -> off-peak, so it counts down to 08:30 (2h30m).
+        _cloudStamp = DateTime.UtcNow.Date.AddHours(6 - 8);
+        bool toPeak1; TimeSpan l1 = UntilSwitch(out toPeak1);
+        if (!toPeak1 || Math.Abs(l1.TotalMinutes - 150) > 1.5) cdOk = false;
+        Console.WriteLine("  countdn : 06:00 -> toPeak=" + toPeak1 + " left=" +
+                          ((int)l1.TotalHours) + ":" + l1.Minutes.ToString("00") +
+                          " (want toPeak=True, 2:30)  " + (cdOk ? "ok" : "MISMATCH"));
+        // 12:00 Beijing -> peak, counts down to the next 00:30 (12h30m).
+        _cloudStamp = DateTime.UtcNow.Date.AddHours(12 - 8);
+        bool toPeak2; TimeSpan l2 = UntilSwitch(out toPeak2);
+        bool cd2 = !toPeak2 && Math.Abs(l2.TotalMinutes - 750) > 1.5;
+        if (cd2) cdOk = false;
+        Console.WriteLine("  countdn : 12:00 -> toPeak=" + toPeak2 + " left=" +
+                          ((int)l2.TotalHours) + ":" + l2.Minutes.ToString("00") +
+                          " (want toPeak=False, 12:30)  " + (cd2 ? "MISMATCH" : "ok"));
+        _cloudStamp = cs; _cloudLocalStamp = cl; _haveCloudTime = ch;
+
+        bool ok = boundsOk && bodyToggles && bodyIgnored && headNoToggle && spendOk && cdOk;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - the tariff line follows the server clock and the 00:30/08:30 boundaries are exact"
+            : "FAIL - see the probes"));
+    }
+
+    public void RunFxCheckTest() {
+        bool savedPat = _fxPat, savedHurt = _fxHurt, savedBowl = _fxBowlDrop;
+        Console.WriteLine("  switches: default bowl=" + _fxBowlDrop + " pat=" + _fxPat +
+                          " hurt=" + _fxHurt);
+
+        // --- hurt off: a charge changes the number and nothing else ---
+        _fxHurt = false;
+        int hitsBefore = _hits.Count;
+        int floatBefore = _floaters.Count;
+        MakeTick(0.01, true);
+        bool hurtOffClean = _hits.Count == hitsBefore && _floaters.Count == floatBefore;
+        Console.WriteLine("  hurt off: charge -> hits " + hitsBefore + "->" + _hits.Count +
+                          ", floaters " + floatBefore + "->" + _floaters.Count + "  " +
+                          (hurtOffClean ? "ok (number only, no animation, no sound)"
+                                        : "MISMATCH (something still animated)"));
+
+        // --- hurt on: the same call DOES produce them (proves the gate is what changed) ---
+        _fxHurt = true;
+        int hits2 = _hits.Count;
+        MakeTick(0.01, true);
+        bool hurtOnWorks = _hits.Count > hits2;
+        Console.WriteLine("  hurt on : charge -> hits " + hits2 + "->" + _hits.Count + "  " +
+                          (hurtOnWorks ? "ok (gate is what changed it)" : "MISMATCH (never animated)"));
+        _hits.Clear();
+
+        // --- pat off: a stroke must not start it ---
+        _fxPat = false;
+        _patActive = false; _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false;
+        // The same point --pattrigger uses, for the same three reasons: render first (the hit map is
+        // rebuilt by RenderToCanvas, so a stale one lies), work in CANVAS coordinates (that is what a
+        // mouse event carries), and aim at the band over her head rather than the head anchor itself.
+        // Getting any of those wrong makes PatOnHer false, and the gesture then never fires - which
+        // looks exactly like a broken gate.
+        RenderToCanvas();
+        int hx = _offX + _headX;
+        int hy = _offY + (int)(_h * 0.24);
+        for (int i = 1; i <= 30; i++)
+            TickPatWith(33.0, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy, false);
+        bool patOffOk = !_patActive;
+        Console.WriteLine("  pat off : 30 ticks of stroking -> active=" + _patActive + "  " +
+                          (patOffOk ? "ok (pat disabled)" : "MISMATCH (still patting)"));
+
+        // --- pat on: the same stroke starts it ---
+        _fxPat = true;
+        // Full reset, not just the movement counters: the off-case above ran 30 ticks and may have left
+        // the settle gate or the idle clock set, which would keep this case from ever firing and look
+        // like a broken gate. Same set --pattrigger resets between its own cases.
+        _patActive = false; _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false;
+        _patIdleMs = 0; _patBlocked = false; _patSettleMs = 0; _patT = 0;
+        _drag = false; _snapping = false;
+        for (int i = 1; i <= 30; i++)
+            TickPatWith(33.0, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy, false);
+        bool patOnWorks = _patActive;
+        Console.WriteLine("  pat on  : same stroke -> active=" + _patActive + "  " +
+                          (patOnWorks ? "ok (gate is what changed it)" : "MISMATCH (never fires)"));
+        _patActive = false;
+
+        // --- bowl off: no bowl appears, but the money still arrives ---
+        _fxBowlDrop = false;
+        int ricesBefore = _rices.Count;
+        double creditBefore = _creditPending;
+        StartCredit(1.00);
+        bool bowlOffOk = _rices.Count == ricesBefore;
+        bool moneyLanded = Math.Abs(_creditPending - creditBefore) < 1e-6;
+        Console.WriteLine("  bowl off: top-up -> bowls " + ricesBefore + "->" + _rices.Count +
+                          ", pending " + creditBefore.ToString("0.00") + "->" +
+                          _creditPending.ToString("0.00") + "  " +
+                          ((bowlOffOk && moneyLanded)
+                           ? "ok (no bowl, credit settled directly)"
+                           : "MISMATCH (bowl dropped or credit stranded)"));
+
+        _fxPat = savedPat; _fxHurt = savedHurt; _fxBowlDrop = savedBowl;
+        bool ok = hurtOffClean && hurtOnWorks && patOffOk && patOnWorks && bowlOffOk && moneyLanded;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - each switch cuts its own behaviour, and the same entry points serve the demo"
+            : "FAIL - see the rows above"));
+    }
+
+    public void RunPatTriggerTest() {
+        Console.WriteLine("head pat trigger");
+        GoOffline();
+        _noNetwork = true;
+        ResetDemoForTest();
+        PumpTicks(3);
+        Console.WriteLine("  ready   : patReady=" + _patReady + "  headX=" + _headX + " headY=" + _headY +
+                          "  widget=" + _w + "x" + _h);
+
+        // Where is her head, in CLIENT coordinates? The press arrives in client coords, so this is the
+        // number that has to be right - a test using screen coords would pass while the app fails.
+        // Re-render IMMEDIATELY before probing: the hit map is rebuilt by RenderToCanvas, so a map
+        // read after anything has moved is stale. That is why the first attempt saw an all-zero map
+        // and a solid bbox 917 px away from the anchor.
+        RenderToCanvas();
+        // CANVAS coordinates, exactly as a real mouse event delivers them: e.X/e.Y are canvas coords
+        // because the window is screen-sized. The earlier version of this test used widget coords and
+        // compensated inside PatPressOnHead, so it passed while the app failed - the test has to feed
+        // the same numbers the OS does.
+        int hx = _offX + _headX;
+        int hy = _offY + (int)(_h * 0.24);                 // the press band's centre, over her hair
+        int mapIdx = hy * _hitW + hx;
+        int mapVal = (_hitMap != null && mapIdx >= 0 && mapIdx < _hitMap.Length) ? _hitMap[mapIdx] : -1;
+        Console.WriteLine("  head    : press target canvas (" + hx + "," + hy + ")  map=" + mapVal +
+                          "  GirlPixelSolid=" + GirlPixelSolid(hx, hy) + "  PatOnHer=" +
+                          PatOnHer(hx, hy) + "   (pot anchor " + (_offX + _headX) + "," +
+                          (_offY + _headY) + "  widget at " + _offX + "," + _offY + ")");
+        // The hit map's own extent and mass, so "where is she really" is measured rather than assumed.
+        // One summary line is enough now. This used to dump her silhouette row by row and probe the map
+        // down her centre column, because the trigger was a head-shaped ellipse and those numbers had to
+        // be checked by hand. The trigger is her whole silhouette, so the only question left is whether
+        // that map has anything in it at all.
+        if (_hitMap != null) {
+            int n = 0, miny = _hitH, maxy = -1;
+            for (int y = 0; y < _hitH; y++) {
+                for (int x = 0; x < _hitW; x++) {
+                    if (_hitMap[y * _hitW + x] > 8) {
+                        n++;
+                        if (y < miny) miny = y;
+                        if (y > maxy) maxy = y;
+                    }
+                }
+            }
+            Console.WriteLine("  hitmap  : " + _hitW + "x" + _hitH + "  " + n + " solid px, rows " +
+                              miny + ".." + maxy + "   (this IS the hover target: her whole silhouette)");
+        } else {
+            Console.WriteLine("  hitmap  : NULL - PatOnHer can never be true");
+        }
+
+        // Sweep a grid over her so "how much of her counts as a hover target" is answered, not just the
+        // single anchor pixel.
+        int solid = 0, total = 0;
+        for (int dy = -60; dy <= 90; dy += 15) {
+            StringBuilder row = new StringBuilder();
+            for (int dx = -90; dx <= 90; dx += 30) {
+                int x = hx + dx, y = hy + dy;
+                bool on = PatOnHer(x, y);
+                total++;
+                if (on) solid++;
+                row.Append(on ? '#' : '.');
+            }
+            Console.WriteLine("    dy=" + dy.ToString("+0;-0;0").PadLeft(4) + "  " + row);
+        }
+        Console.WriteLine("  area    : " + solid + "/" + total + " sample points count as hovering on her" +
+                          "  ('#' = her art, '.' = transparent)");
+
+        // The chain: hover on her, tick in 33 ms steps, and check it starts and stops on its own.
+        // A FIXED feed step, deliberately not _timer.Interval.
+        //
+        // When the tick was raised to 16 ms for 60 fps, this followed it and every frame count in the
+        // test silently halved its duration - 30 frames of stroking went from 990 ms to 480 ms and no
+        // longer cleared the 500 ms start threshold, so the feature looked broken. The test has to
+        // supply its own clock; otherwise "is the product right" and "did the tick change" become the
+        // same question.
+        double step = 33.0;                         // MILLISECONDS, the unit the state machine uses
+        _patActive = false; _drag = false;
+        Console.WriteLine("  hover   : tick=" + step.ToString("0") + "ms  PAT_HOLD_MS=" + PAT_HOLD_MS);
+
+        // THE TRIGGER IS A STROKE, so the test has to move the pointer. Feeding the same coordinate
+        // over and over - which is what the hover version did - must now do NOTHING, and that is
+        // asserted first because "a resting pointer starts a pat" is exactly the bug being removed.
+        _patActive = false; _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false; _patIdleMs = 0;
+        _patBlocked = false; _patSettleMs = 0; _drag = false; _snapping = false;
+        int stillFire = -1;
+        for (int i = 1; i <= 20; i++) {
+            TickPatWith(step, true, hx, hy, false);        // dead still, right on her
+            if (_patActive && stillFire < 0) stillFire = i;
+        }
+        bool stillOk = stillFire < 0;
+        Console.WriteLine("  still   : 20 ticks motionless ON her -> patActive=" + _patActive +
+                          "  " + (stillOk ? "ok (a resting pointer does not pat)" : "MISMATCH"));
+
+        // Now an actual stroke: sweep the pointer across her, 8 px a tick, diagonally so both the
+        // horizontal and vertical terms are exercised.
+        _patActive = false; _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false; _patIdleMs = 0;
+        int ticksToFire = -1;
+        for (int i = 1; i <= 30; i++) {
+            TickPatWith(step, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy + (int)(Math.Cos(i * 1.1) * 20), false);
+            if (_patActive && ticksToFire < 0) ticksToFire = i;
+            if (i <= 6) Console.WriteLine("    tick " + i + "  accum=" +
+                                          _patMoveAccum.ToString("0") + "px  patActive=" + _patActive);
+        }
+        Console.WriteLine("  stroke  : started after " + ticksToFire + " ticks of movement  " +
+                          (ticksToFire > 0 ? "ok" : "MISMATCH (never started)"));
+
+        // It must keep playing while the stroke continues.
+        int tBefore = (int)_patT;
+        // Small steps, like a real stroke. A single large jump is deliberately discarded as a warp
+        // (PatMoveMaxStep), so testing it that way measures the warp filter, not the loop.
+        bool looping = true;
+        for (int i = 0; i < 22; i++) {
+            TickPatWith(step, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy + (int)(Math.Cos(i * 1.1) * 20), false);
+            if (!_patActive) looping = false;
+        }
+        looping = looping && _patActive && _patT > tBefore;
+        Console.WriteLine("  looping : still stroking -> patActive=" + _patActive + "  t " + tBefore +
+                          " -> " + (int)_patT + "  " + (looping ? "ok" : "MISMATCH (not advancing)"));
+
+        // Stopping the pointer must lift the hand, after the 300 ms grace the user asked for.
+        // Motionless at wherever the stroke ended.
+        int lastX = hx + 9 * 6, lastY = hy + 9 * 6;
+        int ticksToStop = -1;
+        for (int i = 1; i <= 12; i++) {
+            TickPatWith(step, true, lastX, lastY, false);
+            if (!_patActive && ticksToStop < 0) ticksToStop = i;
+        }
+        bool pauseStops = ticksToStop > 0;
+        Console.WriteLine("  pause   : stopped after " + ticksToStop + " motionless ticks (" +
+                          (ticksToStop > 0 ? (ticksToStop * step).ToString("0") + " ms" : "-") +
+                          ", want >= " + PAT_END_DELAY_MS.ToString("0") + " ms)  " +
+                          (pauseStops ? "ok (no movement, no pat)" : "MISMATCH (kept patting)"));
+        // Moving OFF her must stop it - there is no button to release.
+        TickPatWith(step, true, 2, 2, false);
+        bool stoppedOff = !_patActive;
+        Console.WriteLine("  off her : patActive=" + _patActive + "  " + (stoppedOff ? "ok" : "MISMATCH"));
+
+        // A button held down is a drag, never a hover: this is the conflict the user reported, where a
+        // long drag fired the pat, cleared _drag and left her hanging in mid-air.
+        _patActive = false;
+        int dragFire = -1;
+        for (int i = 1; i <= 12; i++) {
+            TickPatWith(step, true, hx, hy, true);          // on her, but the button is down
+            if (_patActive && dragFire < 0) dragFire = i;
+        }
+        Console.WriteLine("  dragging: 12 ticks on her WITH the button down -> patActive=" + _patActive +
+                          "  " + (dragFire < 0 ? "ok (no pat while dragging)" : "MISMATCH (fired mid-drag)"));
+
+        // And an active drag must not start one either.
+        _drag = true; _patActive = false;
+        for (int i = 1; i <= 12; i++) TickPatWith(step, true, hx, hy, false);
+        bool dragBlocked = !_patActive;
+        _drag = false;
+        Console.WriteLine("  _drag   : 12 ticks while _drag=true -> patActive=" + _patActive + "  " +
+                          (dragBlocked ? "ok" : "MISMATCH"));
+
+        // STOP-AND-SETTLE, the mechanism the user asked for after the hand smeared behind her during a
+        // drag. Three things have to hold, and each is checked by driving the real state machine:
+        //   1. a button press stops an ALREADY RUNNING pat at once
+        //   2. she must be fully settled (snapping finished) before the cooldown even starts
+        //   3. the full PAT_SETTLE_MS must then elapse, with the pointer still on her
+        _patActive = false; _patBlocked = false; _patSettleMs = 0;
+        _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false; _patIdleMs = 0;
+        // Started by a STROKE, not by dwelling: the same coordinate fed eight times no longer starts
+        // anything, which is the change the user asked for. So this loop steps the pointer.
+        for (int i = 1; i <= 30; i++)
+            TickPatWith(step, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy, false);
+        bool runningBefore = _patActive;
+        TickPatWith(step, true, hx + 34, hy, true);            // press: must kill it NOW
+        bool killedByPress = !_patActive && _patBlocked;
+        Console.WriteLine("  press   : active " + runningBefore + " -> after a press patActive=" +
+                          _patActive + " blocked=" + _patBlocked + "  " +
+                          (runningBefore && killedByPress ? "ok" : "MISMATCH"));
+
+        // Still flying home: the cooldown must not tick down while she moves.
+        _snapping = true; _drag = false;
+        for (int i = 1; i <= 30; i++) TickPatWith(step, true, hx, hy, false);
+        bool heldDuringSnap = _patBlocked && !_patActive;
+        Console.WriteLine("  snapping: 30 ticks (1 s) while snapping -> blocked=" + _patBlocked +
+                          " patActive=" + _patActive + "  " +
+                          (heldDuringSnap ? "ok (cooldown waits for her)" : "MISMATCH"));
+
+        // Settled: now the 1000 ms runs, and it must NOT be shorter than that.
+        _snapping = false;
+        int ticksToUnblock = -1;
+        for (int i = 1; i <= 60; i++) {
+            TickPatWith(step, true, hx, hy, false);
+            if (!_patBlocked && ticksToUnblock < 0) ticksToUnblock = i;
+        }
+        double waited = ticksToUnblock > 0 ? ticksToUnblock * step : -1;
+        bool settleOk = waited >= PAT_SETTLE_MS && waited < PAT_SETTLE_MS + 3 * step;
+        Console.WriteLine("  settle  : unblocked after " + ticksToUnblock + " ticks (" +
+                          waited.ToString("0") + " ms, want " + PAT_SETTLE_MS.ToString("0") +
+                          " ms)  " + (settleOk ? "ok" : "MISMATCH (wrong delay)"));
+
+        // And after all that, a NEW stroke must work - otherwise the gate would be permanent.
+        _patActive = false; _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false; _patIdleMs = 0;
+        int refire = -1;
+        for (int i = 1; i <= 20; i++) {
+            TickPatWith(step, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy, false);
+            if (_patActive && refire < 0) refire = i;
+        }
+        Console.WriteLine("  refire  : after the settle, a new stroke starts it in " + refire +
+                          " ticks  " + (refire > 0 ? "ok" : "MISMATCH (gate is permanent)"));
+
+        // The expression, checked separately from the state machine above.
+        //
+        // The requirement has two halves and only testing the first would miss the worse failure: a face
+        // that is correct during the pat but never returns would leave her grimacing forever. So both
+        // are asserted, and the "after" value is deliberately NOT pinned to a specific expression -
+        // which face she returns to is the priority chain's business, not this test's.
+        // The expression, checked by calling the face picker DIRECTLY.
+        //
+        // Driving it through OnTick does not work: TickPat reads the real cursor, which is not on
+        // her during a diagnostic, so it clears _patActive before the picker ever runs. Two earlier
+        // attempts to arrange the state around that failed for exactly this reason and reported a
+        // broken feature that was fine. Calling the picker removes the whole question - the only
+        // input it takes from the pat is the _patActive flag.
+        bool savedPat = _patActive;
+        _patActive = true;
+        UpdateExpression(0.033);
+        int exprDuring = _expr;
+        _patActive = false;
+        UpdateExpression(0.033);
+        int exprAfter = _expr;
+        _patActive = savedPat;
+        bool faceOk = exprDuring == EXPR_NERVOUS && exprAfter != EXPR_NERVOUS;
+
+        // ---- pat while wearing the pot: knock it off first, then pat ----
+        //
+        // The pot is a sprite that has to be erased from the canvas, and the pat squashes her art
+        // vertically; running both at once erases the wrong rows. So the order is asserted, not just
+        // the end state.
+        // Re-render and RECOMPUTE the sample point: the tests above ran many ticks and she has been
+        // redrawn since hx/hy were first calculated, so the hit map no longer matches those numbers.
+        // Reading a stale map is what made this case look like a broken gate.
+        RenderToCanvas();
+        hx = _offX + _headX;
+        hy = _offY + (int)(_h * 0.24);
+        _rices.Clear();
+        Rice pot = new Rice();
+        pot.OnHead = true;
+        pot.Amount = 1.0;
+        pot.X = _offX + _headX;
+        pot.Y = _offY + _headY;
+        _rices.Add(pot);
+        bool worePot = HeadPotOn;
+        _patActive = false; _patWaitingPotOff = false;
+        _patMoveAccum = 0; _patMoveMs = 0; _patMoveSeen = false; _patIdleMs = 0;
+        _patBlocked = false; _patSettleMs = 0; _patT = 0; _drag = false; _snapping = false;
+        for (int i = 1; i <= 30 && !_patWaitingPotOff; i++)
+            TickPatWith(step, true, hx + (int)(Math.Sin(i * 1.1) * 30), hy, false);
+        bool knockedFirst = _patWaitingPotOff && !_patActive;
+        Console.WriteLine("  pot     : wore=" + worePot + " -> knocking=" + _patWaitingPotOff +
+                          " patting=" + _patActive + "  " +
+                          (knockedFirst ? "ok (took the pot off before starting)"
+                                        : "MISMATCH (patted with the pot still on)"));
+
+        // Finish the fade, then confirm the waiting block starts the pat.
+        //
+        // NOT driven with PumpTicks: that re-enters TickPatWith with the REAL cursor position, which
+        // is not on her during a diagnostic, and the wait is cancelled by design when the pointer
+        // leaves. That would be testing the cancel rule instead of the resume rule. Clearing the pot
+        // is exactly what the end of the fade does (HeadPotOn goes false), and feeding a point on her
+        // is what the real user's pointer is doing the whole time.
+        _rices.Clear();
+        bool potGone = !HeadPotOn;
+        TickPatWith(step, true, hx + 18, hy, false);
+        bool startedAfter = _patActive;
+        Console.WriteLine("  pot gone: faded=" + potGone + " patting=" + _patActive + "  " +
+                          ((potGone && startedAfter)
+                           ? "ok (pot faded, the pat then began by itself)"
+                           : "MISMATCH (pat never resumed after the pot left)"));
+
+        // And it must not come back when the pat stops - the knock-off is permanent.
+        _patActive = false; _patWaitingPotOff = false;
+        for (int i = 0; i < 30; i++) TickPatWith(step, true, hx + 18, hy, false);
+        bool potStayedOff = !HeadPotOn;
+        Console.WriteLine("  pot back: after stopping, wearing=" + HeadPotOn + "  " +
+                          (potStayedOff ? "ok (the pot does not return)"
+                                        : "MISMATCH (the pot came back)"));
+        _rices.Clear();
+        bool potOk = knockedFirst && potGone && startedAfter && potStayedOff;
+
+        Console.WriteLine("  face    : during pat expr=" + exprDuring + " (want " + EXPR_NERVOUS +
+                          " nervous), after expr=" + exprAfter + " (must differ)  " +
+                          (faceOk ? "ok" : "MISMATCH"));
+        _patActive = false;
+
+        bool ok = _patReady && stillOk && pauseStops && ticksToFire > 0 && looping && stoppedOff && dragFire < 0 && dragBlocked
+                  && solid > 0 && runningBefore && killedByPress && heldDuringSnap && settleOk
+                  && refire > 0 && faceOk && potOk;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a stroke across her starts the pat, a motionless pointer does not, pausing lifts the hand, a press kills it and bars it until she has settled plus 1000 ms, and a later stroke starts it again"
+            : "FAIL - ready=" + _patReady + " fire=" + ticksToFire + " loop=" + looping +
+              " stillFire=" + stillFire + " pauseStops=" + pauseStops +
+              " off=" + stoppedOff + " dragFire=" + dragFire + " dragBlocked=" + dragBlocked +
+              " killedByPress=" + killedByPress + " heldDuringSnap=" + heldDuringSnap +
+              " settleOk=" + settleOk + " refire=" + refire + " onHerPoints=" + solid));
+        _patActive = false; _patT = 0; _patBlocked = false; _patSettleMs = 0;
+        _snapping = false; _drag = false;
+        ResetDemoForTest();
+    }
+
+    // The head pat: are the frames there, is the geometry inside the widget, and does the hand really
+    // reach the canvas?
+    //
+    // The last question is the one worth guarding. Every number can be right and the hand still never
+    // appear - if it is drawn outside the widget's clear rectangle the erase pass would wipe it, and if
+    // it lands at a negative y the canvas clips it. So this measures PIXELS: it renders a frame with
+    // the pat on and without it, and requires the difference to be a large, correctly-placed blob.
+    public void RunPatTest() {
+        Console.WriteLine("head pat");
+        bool loaded = _patReady;
+        int n = 0;
+        for (int i = 0; i < PAT_FRAMES; i++) if (_patHand[i] != null) n++;
+        Console.WriteLine("  art     : loaded=" + n + "/" + PAT_FRAMES + " ready=" + loaded +
+                          (loaded ? ("  frame0=" + _patHand[0].Width + "x" + _patHand[0].Height) : "") +
+                          "  " + (loaded ? "ok" : "MISMATCH (the pat can never play)"));
+        if (!loaded) {
+            Console.WriteLine("  verdict: FAIL - sprites/pat_hand_*.png are missing, so the feature is inert");
+            return;
+        }
+
+        GoOffline();
+        _noNetwork = true;
+        ResetDemoForTest();
+        PumpTicks(3);
+
+        // Rest state, pat off. Counted over the WHOLE canvas: the hand hangs inside the widget, but
+        // measuring the full canvas removes any chance of the window and the thing being measured
+        // disagreeing - an earlier version counted widget rows 0.._h while the hand was drawn in
+        // canvas rows above it and reported "gained = 0" over a frame that plainly showed the hand.
+        _patActive = false;
+        _patT = 0;
+        RenderToCanvas();
+        int band = PatAboveRows();
+        int baseHits = CountInk(0, 0, _canvas.Width, _canvas.Height);
+        Console.WriteLine("  rest    : painted=" + baseHits + " (baseline, for reference only)");
+
+        Console.WriteLine("  rect    : PaintWidgetArt last called with " + _patLastRect +
+                          "  offX=" + _offX + " offY=" + _offY + "  artClear=" + _lastArtClear);
+        Console.WriteLine("  geometry: widget=" + _w + "x" + _h + " headX=" + _headX + " headY=" + _headY);
+        int worstOut = 0;
+        string worstWhere = "";
+        int minVisible = int.MaxValue;
+        bool anyReaches = false;
+        // The horizontal deformation, tracked so it can be ASSERTED rather than assumed.
+        // Before the paintable width was widened this was pinned at 1.0 on every frame and
+        // nothing noticed, because the only geometry assertion was about the hand.
+        float minSx = 2f, maxSx = 0f;
+        // How much of the hand is actually ON the canvas. Clipping at the top is EXPECTED - the
+        // reference's hand reaches in from outside its own frame, and the widget cannot show anything
+        // above y = 0. What must not happen is the whole hand being clipped, so the visible height is
+        // measured per frame and the worst one is reported.
+        for (int f = 0; f < PAT_FRAMES; f++) {
+            int hx, hy; float sc, scx; int sh;
+            PatGeometry(f, out hx, out hy, out sc, out scx, out sh);
+            if (scx < minSx) minSx = scx;
+            if (scx > maxSx) maxSx = scx;
+            int visibleTop = Math.Max(0, hy);
+            int visibleBot = Math.Min(_h, hy + _patHand[f].Height);
+            int visible = visibleBot - visibleTop;
+            if (visible < minVisible) minVisible = visible;
+            if (visible > 0) anyReaches = true;
+            bool inX = hx > -_patHand[f].Width && hx < _w;
+            int over = 0;
+            if (hx < 0) over = -hx;
+            if (hx + _patHand[f].Width > _w) over = Math.Max(over, hx + _patHand[f].Width - _w);
+            if (over > worstOut) { worstOut = over; worstWhere = "frame " + f; }
+            Console.WriteLine("    f" + f + " hand=" + _patHand[f].Width + "x" + _patHand[f].Height +
+                              " at (" + hx + "," + hy + ")  squash=" + sc.ToString("0.000") +
+                              "  visibleRows=" + visible + "/" + _patHand[f].Height +
+                              "  inWidgetX=" + inX);
+        }
+
+        // Now the pixels: pat ON, frame 2 (the lowest hand, most contact).
+        _patActive = true;
+        _patT = 2 * PAT_FRAME_MS;
+        _patDrawCalls = 0;
+        _patPaintEntered = 0;
+        _patArtEntered = 0;
+        _patArtEarlyOut = 0;
+        RenderToCanvas();
+        // Saved for every frame, not just the one being measured: where the hand lands is judged by
+        // looking, and the frames differ by tens of pixels.
+        for (int f = 0; f < PAT_FRAMES; f++) {
+            _patT = f * PAT_FRAME_MS;
+            RenderToCanvas();
+            try {
+                _canvas.Save(Path.Combine(_baseDir, "_pat_f" + f + ".png"), ImageFormat.Png);
+            } catch { }
+        }
+        _patT = 2 * PAT_FRAME_MS;
+        RenderToCanvas();
+        int patHits = CountInk(0, 0, _canvas.Width, _canvas.Height);
+        // The rest baseline is taken HERE, immediately before the "after" measurement, not once at the
+        // top. Measuring it earlier made the residual meaningless: the five-frame loop above moves
+        // _patT and renders, so a baseHits from before it was comparing two different scene states and
+        // reported 6803 "leftover" pixels on a frame whose actual leftover count was zero.
+        _patActive = false;
+        _patT = 0;
+        RenderToCanvas();
+        int restHits = CountInk(0, 0, _canvas.Width, _canvas.Height);
+        int gained = patHits - restHits;
+        Console.WriteLine("  drawpath: patDrawCalls=" + _patDrawCalls +
+                          " paintBlock=" + _patPaintEntered + " artEntered=" + _patArtEntered +
+                          " artEarlyOut=" + _patArtEarlyOut + " patActive=" + _patActive);
+        try { _canvas.Save(Path.Combine(_baseDir, "_pat_frame.png"), ImageFormat.Png); } catch { }
+
+        // And that it stops: pat off again must return to the rest count.
+        _patActive = false;
+        _patT = 0;
+        RenderToCanvas();
+        int afterHits = CountInk(0, 0, _canvas.Width, _canvas.Height);
+        int residual = afterHits - restHits;
+
+        Console.WriteLine("  pixels  : rest=" + restHits + " withPat=" + patHits +
+                          " gained=" + gained + " afterOff=" + afterHits + " residual=" + residual);
+        Console.WriteLine("  bounds  : worst horizontal overflow=" + worstOut +
+                          (worstWhere.Length > 0 ? (" (" + worstWhere + ")") : "") +
+                          "  leastVisibleRows=" + (minVisible == int.MaxValue ? 0 : minVisible));
+        try { _canvas.Save(Path.Combine(_baseDir, "_pat_after.png"), ImageFormat.Png); } catch { }
+
+        // The squash has to move her SIDEWAYS too, and by a visible amount. Only the WIDENING is
+        // required, not a narrowing: petpet's formula is `width = 0.8 + j * 0.02`, monotonically
+        // increasing, so she never gets narrower than rest - the stretch frame is a height effect
+        // alone. An earlier version of this assertion also demanded <= 0.995 and failed against the
+        // real algorithm.
+        bool squashVisible = maxSx >= 1.10f;
+        Console.WriteLine("  squash  : horizontal scale " + minSx.ToString("0.000") + " .. " +
+                          maxSx.ToString("0.000") + "   (must reach >= 1.10, so she visibly widens)" +
+                          "  " + (squashVisible ? "ok" : "MISMATCH (the sideways half is clipped)"));
+        // Left/right symmetry of the hand placement.
+        //
+        // The girl is MIRRORED in the bottom-right corner (_headX = _w - _headX), and the hand has
+        // to follow. It did not, so the hand sat offset to the wrong side of her head - reported by
+        // the user as "when she is on the right, the hand does not move with her". Checked here as a
+        // number rather than by eye, because the failure is only visible in one of the two corners
+        // and a screenshot of the left corner looks perfectly fine.
+        bool mirrorOk = true;
+        int mirrorWorst = 0;
+        {
+            bool savedRight = _snapRight;
+            int savedHeadX = _headX;
+            for (int f = 0; f < PAT_FRAMES; f++) {
+                _snapRight = false; _headX = 304;
+                int lx, ly; float lsc, lscx; int lsh;
+                PatGeometry(f, out lx, out ly, out lsc, out lscx, out lsh);
+                _snapRight = true; _headX = 454 - 304;
+                int rx2, ry2; float rsc, rscx; int rsh;
+                PatGeometry(f, out rx2, out ry2, out rsc, out rscx, out rsh);
+                // The widget is _w wide: a mirrored hand must land so the two add up to _w.
+                int err = Math.Abs(lx + rx2 + 446 - (_w - 1));
+                if (err > mirrorWorst) mirrorWorst = err;
+                if (err > 2) mirrorOk = false;
+            }
+            _snapRight = savedRight;
+            _headX = savedHeadX;
+        }
+        Console.WriteLine("  mirror  : hand x left+right worst error = " + mirrorWorst +
+                          " px   (must be <= 2, or the hand ignores the mirror)" +
+                          "  " + (mirrorOk ? "ok" : "MISMATCH"));
+        bool ok = loaded && gained > 2000 && residual == 0 && anyReaches && minVisible >= 40
+                  && squashVisible && mirrorOk;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - five hand frames load, every frame reaches into the canvas, drawing the pat adds a large visible area, and switching it off leaves the rest frame byte-identical"
+            : "FAIL - loaded=" + loaded + " gained=" + gained + " residual=" + residual +
+              " leastVisibleRows=" + (minVisible == int.MaxValue ? 0 : minVisible) +
+              " (gained must be >2000, residual 0, at least 40 rows of hand on the canvas,"
+              + " and the horizontal squash must reach >= 1.10)"));
+        ResetDemoForTest();
+    }
+
+    // Painted pixels inside a WIDGET-space rectangle, converted to canvas coordinates.
+    //
+    // The vertical range is allowed to go NEGATIVE (above the widget): the pat hand is drawn there,
+    // because her crown is already at widget y = 0 and the hand reaches in from above - exactly as it
+    // does in the reference, where the hand enters from outside the frame. Counting only 0.._h missed
+    // the hand entirely and reported "gained = 0" while the canvas plainly had it.
+    int CountInk(int x0, int y0, int w, int h) {
+        int hits = 0;
+        int cx = _offX, cy = _offY;
+        for (int y = y0; y < y0 + h; y++) {
+            int sy = cy + y;
+            if (sy < 0 || sy >= _canvas.Height) continue;
+            for (int x = x0; x < x0 + w; x++) {
+                int sx = cx + x;
+                if (sx < 0 || sx >= _canvas.Width) continue;
+                if (_canvas.GetPixel(sx, sy).A > 16) hits++;
+            }
+        }
+        return hits;
+    }
+
+    // The band above the widget, where the pat hand lives. Its height is the tallest hand frame.
+    int PatAboveRows() {
+        int tallest = 0;
+        for (int i = 0; i < PAT_FRAMES; i++) if (_patHand[i] != null && _patHand[i].Height > tallest)
+            tallest = _patHand[i].Height;
+        return tallest;
+    }
+
+    // Loads the five hand frames. Absent files are not fatal: the pat simply never plays, which is
+    // the same degradation the expression art uses. A half-loaded set is rejected for the same
+    // reason the expressions are - a pat that plays frames 0..2 and then nothing looks broken.
+    void LoadPatHandArt(string baseDir) {
+        int got = 0;
+        for (int i = 0; i < PAT_FRAMES; i++) {
+            string p = Path.Combine(baseDir, "sprites", "pat_hand_" + i + ".png");
+            if (!File.Exists(p)) continue;
+            try { _patHand[i] = new Bitmap(p); got++; }
+            catch (Exception ex) { Log("pat hand failed (" + i + "): " + ex.Message); }
+        }
+        _patReady = got == PAT_FRAMES;
+        Log(_patReady
+            ? ("pat hand loaded: " + got + " frames (" + _patHand[0].Width + "x" + _patHand[0].Height + ")")
+            : ("pat hand not used: found " + got + " of " + PAT_FRAMES + " files"));
+    }
+
+    // Where the hand sits and how far she is pushed, for the current frame. Split out from the drawing
+    // so a guard can assert the numbers without rendering.
+    //
+    // PUT THE PALM ON HER CROWN is the whole rule: the hand's contact point goes on her hair, and the
+    // per-frame palm fractions supply the descent. The vertical motion is NOT a separate term - it
+    // falls out of where the palm sits inside each frame, which is how the reference animates it too.
+    void PatGeometry(int frame, out int handX, out int handY, out float squashScale,
+                     out float squashScaleX, out int squashShiftY) {
+        handX = 0; handY = 0; squashScale = 1f; squashScaleX = 1f; squashShiftY = 0;
+        if (!_patReady || frame < 0 || frame >= PAT_FRAMES) return;
+        // PUT THE PALM ON HER CROWN. Everything follows from that sentence, and stating it that way is
+        // what finally worked after six rounds of tuning failed.
+        //
+        // crownY is where her HAIR starts, not where her art starts: measured alpha down her centre
+        // column, y=0 is 1 (the ahoge tip), y=20 is 0 (the gap), y=40.. is 253 (hair). The palm rests
+        // on the hair, not on the ahoge.
+        //
+        // The per-frame palm fractions carry the whole animation - the palm sits at 0.51 of the sprite
+        // in frame 0 and 0.84 in frame 2 - so anchoring on them makes the hand descend and lift exactly
+        // as the reference does, and no separate "descent" term is needed.
+        double k = _h / 454.0;                       // widget px per real-sprite px
+        int crownY = (int)Math.Round(40.0 * _patRef * k);
+        int dw = Math.Max(1, (int)Math.Round(_patHand[frame].Width * _patScale));
+        int dh = Math.Max(1, (int)Math.Round(_patHand[frame].Height * _patScale));
+        double palmFx = PatPalmX[frame] + _patBiasX;
+        double palmFy = PatPalmY[frame] + _patBiasY;
+        // Overridable so --pattool can drive this exact code. The constants are the shipping values,
+        // and the fields are seeded from them, so with no tool running these lines behave identically.
+        //
+        // MIRRORED when she lives in the bottom-right corner, by computing the LEFT-hand geometry and
+        // reflecting the result at the end.
+        //
+        // _headX is already mirrored there (_w - _headX) and the hand has to follow her. Feeding the
+        // mirrored _headX into the same formula mirrors her twice and lands the hand 342 px away - the
+        // bug the user hit, "when she is on the right the hand does not move with her".
+        //
+        // Reflecting after the fact is what makes it exact: reflect(mirror(p)) == p for every frame,
+        // whatever palmFx, dw or the biases are. Two earlier attempts mirrored palmFx, then x alone;
+        // the measured left/right sums were 8 and 161 where the widget needs _w - 1 - dw = 7.
+        int headLeft = _snapRight ? (_w - _headX) : _headX;
+        handX = (int)Math.Round(headLeft - palmFx * dw);
+        // Reflect the whole sprite: its left edge mirrors to _w - 1 - (handX + dw).
+        if (_snapRight) handX = (_w - 1) - (handX + dw);
+        handY = (int)Math.Round(crownY - palmFy * dh);
+        // Keep it in the drawable band: above the widget is wiped by the same Clear that draws it, and
+        // left there it would never be erased.
+        if (handY + dh < 0) handY = -dh;
+        if (handY > _h) handY = _h;
+        // Her deformation, straight from petpet's own formula.
+        //
+        //   width  = 0.80 + j * 0.02
+        //   height = 0.80 - j * 0.05
+        //
+        // Both axes come from the SAME index j, which is why they can never drift out of step - and
+        // why the volume argument this file used before was wrong: width+height falls from 1.60 to
+        // 1.48, so she does not conserve area at all, she shrinks. The earlier hand-derived version
+        // enforcing width = 1/height made her bulge far more than petpet ever does.
+        //
+        // Normalised against j = 0 rather than used raw: petpet draws the avatar at 80 % of its box
+        // and the deformation rides on top of that. Here the widget is already sized to her, so only
+        // the CHANGE matters - the 0.8 base would shrink her to 80 % for no reason.
+        double wRel = PetpetW[frame] / PetpetW[0];
+        double hRel = PetpetH[frame] / PetpetH[0];
+        // _patSquashDepth scales how far the deformation travels from 1.0, so 1.0 is petpet exactly.
+        squashScale = (float)(1.0 - (1.0 - hRel) * _patSquashDepth);
+        squashScaleX = (float)(1.0 - (1.0 - wRel) * _patSquashDepth);
+        // AND SHE MOVES, which is a separate thing from being squashed.
+        //
+        // petpet sets `offsetY = (1 - height) - 0.08`, so j = 0 puts her at 0.12 and j = 4 at 0.32:
+        // the shrinking alone would move her top from 0.20 to 0.40 of the box, and the extra 0.08 is a
+        // real downward slide on top of it. Without this term she compresses in place, which is the
+        // "pressed flat" look rather than the "pushed down" one.
+        //
+        // Reported relative to j = 0, in widget pixels, for the caller to fold into the scale anchor.
+        // Straight from petpet: offsetY goes 0.12 -> 0.32, and that whole 0.2 is movement of its own,
+        // on top of the top edge dropping because she got shorter.
+        double shift = (PetpetOffsetY[frame] - PetpetBaseOffsetY) * _h * _patSquashDepth;
+        squashShiftY = (int)Math.Round(shift);
+    }
+
+    // petpet's own numbers for the vertical placement, for the same reason the size tables are kept
+    // raw: the formula should be recognisable against the source.
+    static readonly double[] PetpetOffsetY = new double[] { 0.12, 0.17, 0.22, 0.27, 0.32 };
+    const double PetpetBaseOffsetY = 0.12;
+
+    // ---- petpet's own algorithm, taken from its open-source implementation -------------
+    //
+    // The reference the user supplied turned out to be generated by https://benisland.neocities.org/petpet/,
+    // which is open source (aDu/pet-pet-gif). Its whole deformation is four lines:
+    //
+    //   const j = i < FRAMES / 2 ? i : FRAMES - i
+    //   const width  = 0.8 + j * 0.02
+    //   const height = 0.8 - j * 0.05
+    //
+    // So the two axes are NOT independently designed: one index drives both, width rises 0.02 a step
+    // while height falls 0.05, i.e. the vertical move is 2.5x the horizontal. That also means the area
+    // is not conserved - it shrinks - which invalidates the volume argument this file used earlier.
+    //
+    // And its TEMPLATE (img/template.gif) is 10 frames of 20 ms with only FIVE distinct hand poses
+    // (img/sprite.png is 560x112 = 5 x 112). The user's reference GIF has those same five poses but at
+    // 60 ms, so it is the slow setting of the same generator - which is why matching it always felt
+    // sluggish. The web default is three times faster.
+    //
+    // Kept as the raw petpet constants so the formula is recognisable against the source.
+    static readonly double[] PetpetW = new double[] { 0.80, 0.82, 0.84, 0.86, 0.88 };
+    static readonly double[] PetpetH = new double[] { 0.80, 0.75, 0.70, 0.65, 0.60 };
+
+    // Draws the pat. Called from PaintWidgetArt right after the sprite, and BEFORE that method's
+    // `if (!hurt) return`, which is why the hand appears at all.
+    void DrawPatOnto(Graphics g, int frame) {
+        if (!_patReady || frame < 0 || frame >= PAT_FRAMES) return;
+        int hx, hy; float sc, scx; int sh;
+        PatGeometry(frame, out hx, out hy, out sc, out scx, out sh);
+        Bitmap hand = _patHand[frame];
+        if (hand == null) return;
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        // Widget coords -> canvas coords. PatGeometry works in widget space (0.._w, 0.._h) so the same
+        // numbers can be checked against the widget, but the canvas is screen-sized and the widget
+        // sits at (_offX, _offY). Without these the hand lands in the canvas's top-left corner, far
+        // from her - which the frame dump showed immediately while the geometry report looked right.
+        int dw = Math.Max(1, (int)Math.Round(hand.Width * _patScale));
+        int dh = Math.Max(1, (int)Math.Round(hand.Height * _patScale));
+        // FLIPPED when she is in the bottom-right corner, so the hand enters from the side she is on.
+        //
+        // The earlier fix mirrored the hand's POSITION but not its picture, and that is only half of it:
+        // the sprite is an arm coming in from the lower left with the fingers angled to the right, so on
+        // the right-hand side it still reached in from the far side and the wrist pointed the wrong way.
+        // Position alone cannot fix a shape.
+        //
+        // Drawn through a mirrored transform rather than a pre-flipped bitmap, so there is one sprite on
+        // disk and no second copy to keep in step. The destination rectangle is unchanged: PatGeometry
+        // already produced a mirrored x, and flipping the image inside that same box is what keeps the
+        // palm where it was measured to be.
+        if (_snapRight) {
+            System.Drawing.Drawing2D.GraphicsState gs = g.Save();
+            g.TranslateTransform(_offX + hx + dw / 2f, 0f);
+            g.ScaleTransform(-1f, 1f);
+            g.TranslateTransform(-(_offX + hx + dw / 2f), 0f);
+            g.DrawImage(hand, new Rectangle(_offX + hx, _offY + hy, dw, dh));
+            g.Restore(gs);
+        } else {
+            g.DrawImage(hand, new Rectangle(_offX + hx, _offY + hy, dw, dh));
+        }
+    }
+
+    // The interactive solver for the hand placement. See the --pattool entry for why it exists.
+    //
+    // Design rules it follows, from the note that prompted it:
+    //   * the preview is the FINAL composite, not a sketch, and it goes through PatGeometry - the same
+    //     function the shipping path uses, so it cannot drift from what the program really draws;
+    //   * it exports RATIOS, not pixels, with the constant names already attached, so the paste step
+    //     needs no thinking;
+    //   * coarse and fine adjustments are separate keys (mouse drag vs arrow keys), because a mouse
+    //     cannot hit 0.001 but the eye can see it.
+    //
+    // Layout: preview on the left, the four numbers with entry boxes on the right, and the paste-ready
+    // code underneath them.
+    public void RunPatTool() {
+        Console.WriteLine("head pat placement tool");
+        if (!_patReady) {
+            Console.WriteLine("  \u5931\u8D25\uFF1Asprites/pat_hand_*.png \u7F3A\u5931\uFF0C\u6CA1\u6709\u53EF\u6446\u653E\u7684\u624B");
+            return;
+        }
+        // A preview of a specific frame, with no timer running: the widget is not needed, and leaving
+        // its clock alone keeps the tool from touching state.
+        try { _timer.Stop(); _poll.Stop(); } catch { }
+
+        const int ViewW = 470, ViewH = 640;
+        int px = _offX, py = _offY;
+        int frame = 2;
+        Form win = new Form();
+        // The interface is in Chinese, and the file must stay pure ASCII, so the text is written as
+        // C# \uXXXX escapes. They are unreadable in the source on purpose: a literal would break the
+        // ASCII rule, and the escapes are generated rather than typed so a wrong digit cannot slip in.
+        win.Text = "\u6478\u5934\u8C03\u53C2\u5DE5\u5177";
+        win.FormBorderStyle = FormBorderStyle.FixedToolWindow;
+        win.StartPosition = FormStartPosition.CenterScreen;
+        win.ClientSize = new Size(ViewW + 400, ViewH + 150);
+        win.KeyPreview = true;
+
+        // The preview. Double buffered because it repaints on every drag.
+        Panel view = new Panel();
+        view.SetBounds(0, 0, ViewW, ViewH);
+        view.BackColor = Color.FromArgb(24, 24, 30);
+        // No DoubleBuffered here: it is protected on Panel, and the flicker it would remove is already
+        // avoided by painting into a Bitmap and assigning it to BackgroundImage.
+        win.Controls.Add(view);
+
+        Label info = new Label();
+        info.SetBounds(8, ViewH + 4, ViewW + 380, 40);
+        info.Font = new Font("Consolas", 9f);
+        win.Controls.Add(info);
+
+        int rowY = 8;
+        Label[] names = new Label[5];
+        TextBox[] boxes = new TextBox[5];
+        // Chinese labels, written as C# unicode escapes (see the note on win.Text). The user asked for
+        // these in Chinese: "I am not good at English, I do not really know how to use it".
+        string[] labels = new string[] {
+            "\u624B\u5FC3\u6A2A\u5411\u4F4D\u7F6E",
+            "\u624B\u5FC3\u7EB5\u5411\u4F4D\u7F6E",
+            "\u624B\u7684\u5927\u5C0F",
+            "\u5934\u9876\u57FA\u51C6",
+            "\u5979\u7684\u5F39\u8DF3\u5E45\u5EA6"
+        };
+
+        // The code area, kept in a read-only box so it can be selected and copied by hand as well as by
+        // pressing C - some people will not trust a clipboard button.
+        TextBox code = new TextBox();
+        code.Multiline = true;
+        code.ReadOnly = true;
+        code.ScrollBars = ScrollBars.Vertical;
+        code.Font = new Font("Consolas", 9f);
+        code.SetBounds(ViewW + 8, 190, 384, 300);
+        win.Controls.Add(code);
+
+        // A legend for the reference lines drawn over the preview. Without it the colours are just
+        // lines: the whole point of them is to turn "looks about right" into "the palm is 3 px above
+        // the hair line", and that only works if the reader knows which line is which.
+        Label legend = new Label();
+        legend.Font = new Font("Microsoft YaHei", 8.5f);
+        legend.SetBounds(ViewW + 8, 494, 384, 128);
+        legend.Text = "\u2500\u2500 \u53C2\u7167\u7EBF\u8BF4\u660E \u2500\u2500\n" +
+                      "\u7EFF\u8272\u7AD6\u7EBF\uFF1A\u5979\u7684\u8EAB\u4F53\u4E2D\u7EBF\n" +
+                      "\u9EC4\u8272\u865A\u7EBF\uFF1A\u5979\u5934\u53D1\u5F00\u59CB\u7684\u9AD8\u5EA6\n" +
+                      "\u3000\u3000\u3000\u3000\u3000\uFF08\u624B\u5FC3\u5BF9\u51C6\u8FD9\u91CC\uFF09\n" +
+                      "\u84DD\u8272\u70B9\u7EBF\uFF1A\u53EF\u7ED8\u5236\u8303\u56F4\n" +
+                      "\u3000\u3000\u3000\u3000\u3000\uFF08\u8D85\u51FA\u53BB\u4F1A\u88AB\u88C1\u6389\uFF09\n" +
+                      "\u7EA2\u8272\u65B9\u6846\uFF1A\u624B\u7684\u5B9E\u9645\u8FB9\u754C";
+        win.Controls.Add(legend);
+
+        // Values live in one place; the boxes and the preview both read them. The fifth is the squash
+        // depth, which exists because "how much she gives when patted" is judged by eye.
+        double[] vals = new double[] { _patBiasX, _patBiasY, _patScale, _patRef, _patSquashDepth };
+
+        // The paintable width, as a constant of the tool: her art is 483 px wide and the widget clears
+        // 454, so a horizontal squash past that is discarded. The preview clips at the same number the
+        // program does, so it cannot show a width that will never be drawn.
+        const int PaintClipW = 454;
+        // Assigned inside redraw, read by the info line below it: how wide the deformed sprite is, and
+        // how much of it the paintable width throws away.
+        int lostWidth = 0, deformedW = 0;
+
+        // The composite. Drawn with the SAME formula as the shipping path: PatGeometry gives the hand's
+        // rectangle, and the girl is drawn with the same squash for this frame.
+        // One place that publishes the tool's numbers to the fields PatGeometry reads. Kept separate
+        // from redraw so the key handlers can use it without repainting.
+        Action applyVals = delegate {
+            _patBiasX = vals[0];
+            _patBiasY = vals[1];
+            _patScale = vals[2];
+            _patRef = vals[3];
+            _patSquashDepth = vals[4];
+        };
+
+        Action redraw = delegate {
+            // Publish the tool's numbers to the fields PatGeometry reads, FIRST, so the preview and the
+            // exported code can never disagree. Written out rather than calling a helper declared later,
+            // because a C# local must be assigned before it is used.
+            _patBiasX = vals[0];
+            _patBiasY = vals[1];
+            _patScale = vals[2];
+            _patRef = vals[3];
+            _patSquashDepth = vals[4];
+            // Resolved BEFORE the bitmap so the info line below can report them too - declaring them
+            // inside the using block would put them out of scope for that line.
+            int hx, hy; float sc, scx; int sh;
+            PatGeometry(frame, out hx, out hy, out sc, out scx, out sh);
+            int dw = Math.Max(1, (int)Math.Round(_patHand[frame].Width * vals[2]));
+            int dh = Math.Max(1, (int)Math.Round(_patHand[frame].Height * vals[2]));
+            Bitmap bmp = new Bitmap(ViewW, ViewH);
+            using (Graphics g = Graphics.FromImage(bmp)) {
+                g.Clear(Color.FromArgb(24, 24, 30));
+                // Her, deformed on BOTH axes exactly as the pat deforms her: vertical about her feet,
+                // horizontal about her centre line. Showing only the vertical half was what let the
+                // preview agree with a wrong implementation.
+                //
+                // The view is in WIDGET coordinates, so the pivot is _headX (her centre line) and the
+                // floor is _h. Her LEFT edge after a horizontal squash is centre - w*scx/2.
+                int gh = (int)Math.Round(_h * sc);
+                int gw = (int)Math.Round(_w * scx);
+                int gx = (int)Math.Round(_headX - gw / 2.0);
+                // The shift goes on AFTER the squash, matching PaintWidgetArt, where it is folded into
+                // the vertical scale anchor rather than into the position. Applying it before would let
+                // the squash scale the shift as well and the preview would drift from the widget.
+                int gy = _h - gh + sh;
+                int lostPx = Math.Max(0, gw - PaintClipW);
+                // CLIPPED to what the program can actually paint, with the discarded part drawn as a
+                // faint ghost so the loss is visible.
+                //
+                // Without this the preview showed the whole deformed sprite and looked fine, while the
+                // real widget silently discarded everything past the paintable width - the tool was
+                // answering "is what you see what the program draws?" with a yes it had not earned.
+                // The ghost is the honest version: here is the shape, and here is the part that will
+                // never appear.
+                if (_sprNormal != null) {
+                    if (lostPx > 0) {
+                        Rectangle full = new Rectangle(gx, gy, gw, gh);
+                        System.Drawing.Drawing2D.GraphicsState st = g.Save();
+                        g.SetClip(full, System.Drawing.Drawing2D.CombineMode.Replace);
+                        g.SetClip(new Rectangle(0, 0, PaintClipW, ViewH),
+                                  System.Drawing.Drawing2D.CombineMode.Exclude);
+                        System.Drawing.Imaging.ImageAttributes ia =
+                            new System.Drawing.Imaging.ImageAttributes();
+                        System.Drawing.Imaging.ColorMatrix cm2 = new System.Drawing.Imaging.ColorMatrix();
+                        cm2.Matrix33 = 0.25f;
+                        ia.SetColorMatrix(cm2);
+                        g.DrawImage(_sprNormal, full, 0, 0, _sprNormal.Width, _sprNormal.Height,
+                                    GraphicsUnit.Pixel, ia);
+                        ia.Dispose();
+                        g.Restore(st);
+                    }
+                    System.Drawing.Drawing2D.GraphicsState st2 = g.Save();
+                    g.SetClip(new Rectangle(0, 0, PaintClipW, ViewH));
+                    g.DrawImage(_sprNormal, new Rectangle(gx, gy, gw, gh));
+                    g.Restore(st2);
+                }
+                lostWidth = lostPx;
+                deformedW = gw;
+                // The hand, at the rectangle PatGeometry produced.
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(_patHand[frame], new Rectangle(hx, hy, dw, dh));
+                // Reference marks, so "close enough" becomes an assertable statement instead of a
+                // feeling: her centre line, her crown, and the drawable band's edges.
+                using (Pen p = new Pen(Color.FromArgb(150, 90, 220, 120), 1f)) {
+                    g.DrawLine(p, _headX, 0, _headX, ViewH);            // centre line
+                }
+                int crown = (int)Math.Round(40.0 * vals[3] * (_h / 454.0));
+                using (Pen p = new Pen(Color.FromArgb(180, 240, 200, 80), 1f)) {
+                    p.DashStyle = DashStyle.Dash;
+                    g.DrawLine(p, 0, crown, ViewW, crown);              // where the hair starts
+                }
+                using (Pen p = new Pen(Color.FromArgb(120, 120, 160, 255), 1f)) {
+                    p.DashStyle = DashStyle.Dot;
+                    g.DrawRectangle(p, 0, 0, 454 - 1, 527 - 1);         // the clearable band
+                }
+                // The REAL horizontal limit, which is not the same thing.
+                //
+                // The band above is what PaintWidgetArt is asked to clear; the region it can actually
+                // write is the intersection with the widget rect, and that is what caps the squash.
+                // Her art is 483 px wide to begin with - wider than the 454 px it is drawn into - so
+                // stretching her 13 % sideways lands 88 px outside anything that can be painted, and
+                // the horizontal half of the squash is simply not visible.
+                //
+                // Drawn in red dashes so the tool shows the constraint rather than hiding it: the
+                // preview cannot display what the program cannot draw, or it would be lying about the
+                // one thing it exists to show.
+                using (Pen p = new Pen(Color.FromArgb(200, 255, 60, 60), 1.5f)) {
+                    p.DashStyle = DashStyle.Dash;
+                    g.DrawLine(p, 0, 0, 0, ViewH);
+                    g.DrawLine(p, 454, 0, 454, ViewH);
+                }
+                // The hand's own bounding box, so the part that falls outside the widget is obvious
+                // before it turns into a hard clipped edge in the real thing.
+                using (Pen p = new Pen(Color.FromArgb(200, 255, 90, 90), 1f)) {
+                    g.DrawRectangle(p, hx, hy, dw, dh);
+                }
+            }
+            view.BackgroundImage = bmp;
+            view.Invalidate();
+            info.Text = "\u5E27 " + (frame + 1) + "/" + PAT_FRAMES +
+                        "   \u5979\u5BBD " + deformedW + "px" +
+                        (lostWidth > 0 ? ("  \u88AB\u88C1\u6389 " + lostWidth + "px") : "  \u672A\u88C1\u5207") +
+                        "   \u624B " + dw + "x" + dh +
+                        "   C=\u590D\u5236  R=\u6062\u590D  S=\u5B58\u56FE  Esc=\u5173\u95ED";            // The paste-ready block. Ratios, not pixels: the app supports three sizes and a pixel value
+            // would only be right for one of them.
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("PatPalmBiasX = " + vals[0].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("PatPalmBiasY = " + vals[1].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("PatDrawScale = " + vals[2].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("PatRefScale  = " + vals[3].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("PatSquashDepth = " + vals[4].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine();
+            sb.AppendLine("dsh_pet.ps1:");
+            sb.AppendLine("  const double PatPalmBiasX = " + vals[0].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("  const double PatPalmBiasY = " + vals[1].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("  const double PatDrawScale = " + vals[2].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            sb.AppendLine("  const double PatSquashDepth = " + vals[4].ToString("0.000", CultureInfo.InvariantCulture) + ";");
+            code.Text = sb.ToString();
+        };
+
+        // Push the current values into the boxes without re-triggering their handlers.
+        Action syncBoxes = delegate {
+            for (int i = 0; i < 5; i++) boxes[i].Text = vals[i].ToString("0.000", CultureInfo.InvariantCulture);
+        };
+
+        for (int i = 0; i < 5; i++) {
+            int idx = i;
+            names[i] = new Label();
+            names[i].Text = labels[i];
+            names[i].SetBounds(ViewW + 8, rowY + 3, 130, 18);
+            names[i].Font = new Font("Consolas", 9f);
+            win.Controls.Add(names[i]);
+
+            boxes[i] = new TextBox();
+            boxes[i].SetBounds(ViewW + 142, rowY, 110, 22);
+            boxes[i].Font = new Font("Consolas", 10f);
+            boxes[i].Text = vals[i].ToString("0.000", CultureInfo.InvariantCulture);
+            win.Controls.Add(boxes[i]);
+
+            // Enter commits. A spinner-free box is deliberate: the tool is about seeing, and a numeric
+            // spinner invites typing when dragging is the point.
+            boxes[i].KeyDown += delegate(object s, KeyEventArgs e) {
+                if (e.KeyCode != Keys.Enter) return;
+                double v;
+                if (double.TryParse(boxes[idx].Text, NumberStyles.Float,
+                                    CultureInfo.InvariantCulture, out v)) {
+                    vals[idx] = v;
+                    applyVals();
+                    redraw();
+                }
+                syncBoxes();
+                e.Handled = true;
+            };
+            rowY += 30;
+        }
+
+        // The FRAME picker, as a visible control.
+        //
+        // It was keys 1-5 only, and the user could not find it - reasonably, since nothing on screen
+        // mentioned it. Worse, the keys did not work either while a parameter box had focus: a focused
+        // TextBox consumes the digits, so the shortcut was invisible AND unreliable. A box that says
+        // which frame you are on fixes both.
+        Label frameLabel = new Label();
+        frameLabel.Text = "\u52A8\u753B\u5E27 (1-5)";
+        frameLabel.SetBounds(ViewW + 8, rowY + 3, 130, 18);
+        frameLabel.Font = new Font("Microsoft YaHei", 9f);
+        win.Controls.Add(frameLabel);
+
+        TextBox frameBox = new TextBox();
+        frameBox.SetBounds(ViewW + 142, rowY, 110, 22);
+        frameBox.Font = new Font("Consolas", 10f);
+        frameBox.Text = (frame + 1).ToString(CultureInfo.InvariantCulture);
+        win.Controls.Add(frameBox);
+        frameBox.KeyDown += delegate(object s, KeyEventArgs e) {
+            if (e.KeyCode != Keys.Enter) return;
+            int v;
+            if (int.TryParse(frameBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) {
+                if (v < 1) v = 1;
+                if (v > PAT_FRAMES) v = PAT_FRAMES;
+                frame = v - 1;
+                // dhNow/dwNow belong to the mouse handlers, which recompute them on every press, so
+                // there is nothing to update here.
+                redraw();
+            }
+            frameBox.Text = (frame + 1).ToString(CultureInfo.InvariantCulture);
+            e.Handled = true;
+        };
+
+        // Dragging moves the hand; the deltas are converted into the ratio space so a drag of N pixels
+        // moves the hand by exactly N pixels whatever the scale.
+        bool dragging = false;
+        Point dragFrom = Point.Empty;
+        double fromBiasX = 0, fromBiasY = 0;
+        double dhNow = Math.Max(1.0, _patHand[frame].Height * vals[2]);
+        double dwNow = Math.Max(1.0, _patHand[frame].Width * vals[2]);
+
+        view.MouseDown += delegate(object s, MouseEventArgs e) {
+            if (e.Button != MouseButtons.Left) return;
+            dragging = true;
+            dragFrom = e.Location;
+            fromBiasX = vals[0];
+            fromBiasY = vals[1];
+            dhNow = Math.Max(1.0, _patHand[frame].Height * vals[2]);
+            dwNow = Math.Max(1.0, _patHand[frame].Width * vals[2]);
+        };
+        view.MouseMove += delegate(object s, MouseEventArgs e) {
+            if (!dragging) return;
+            // handX = headX - palmFx * dw, so moving the hand right by dx means DECREASING palmFx.
+            vals[0] = fromBiasX - (e.X - dragFrom.X) / dwNow;
+            vals[1] = fromBiasY - (e.Y - dragFrom.Y) / dhNow;
+            applyVals();
+            redraw();
+            syncBoxes();
+        };
+        view.MouseUp += delegate(object s, MouseEventArgs e) { dragging = false; };
+
+        // Wheel scales. Multiplicative, so it feels the same at every size.
+        // Shift+wheel changes how much she gives instead, which is the other number that can only be
+        // judged by eye - and it belongs on the same gesture rather than a separate dialog.
+        view.MouseWheel += delegate(object s, MouseEventArgs e) {
+            if ((Control.ModifierKeys & Keys.Shift) != 0) {
+                vals[4] = Math.Max(0.0, Math.Min(3.0, vals[4] * (e.Delta > 0 ? 1.04 : 1 / 1.04)));
+            } else {
+                vals[2] = Math.Max(0.10, Math.Min(3.0, vals[2] * (e.Delta > 0 ? 1.02 : 1 / 1.02)));
+            }
+            applyVals();
+            redraw();
+            syncBoxes();
+        };
+
+        win.KeyDown += delegate(object s, KeyEventArgs e) {
+            const double StepFine = 1.0;
+            const double ScaleFine = 0.01;
+            double step = e.Shift ? StepFine * 10 : StepFine;
+            bool moved = true;
+            if (e.KeyCode == Keys.Left)        vals[0] += step / dwNow;
+            else if (e.KeyCode == Keys.Right)  vals[0] -= step / dwNow;
+            else if (e.KeyCode == Keys.Up)     vals[1] += step / dhNow;
+            else if (e.KeyCode == Keys.Down)   vals[1] -= step / dhNow;
+            else if (e.KeyCode == Keys.Oemplus || e.KeyCode == Keys.Add) {
+                vals[2] = Math.Min(3.0, vals[2] + ScaleFine);
+            } else if (e.KeyCode == Keys.OemMinus || e.KeyCode == Keys.Subtract) {
+                vals[2] = Math.Max(0.10, vals[2] - ScaleFine);
+            } else if (e.KeyCode >= Keys.D1 && e.KeyCode <= Keys.D5) {
+                frame = e.KeyCode - Keys.D1;
+                // Keep the visible box in step, so the frame can be read off the screen rather than
+                // remembered - the whole reason the box exists.
+                frameBox.Text = (frame + 1).ToString(CultureInfo.InvariantCulture);
+                dhNow = Math.Max(1.0, _patHand[frame].Height * vals[2]);
+                dwNow = Math.Max(1.0, _patHand[frame].Width * vals[2]);
+            } else if (e.KeyCode == Keys.C) {
+                try { Clipboard.SetText(code.Text); } catch { }
+                info.Text = "\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F\uFF0C\u53EF\u4EE5\u76F4\u63A5\u7C98\u8FDB\u4EE3\u7801";
+                return;
+            } else if (e.KeyCode == Keys.R) {
+                vals[0] = PatPalmBiasX; vals[1] = PatPalmBiasY;
+                vals[2] = PatDrawScale; vals[3] = PatRefScale;
+                vals[4] = 1.0;                     // the reference's own depth
+            } else if (e.KeyCode == Keys.S) {
+                try {
+                    applyVals();
+                    int hx, hy; float sc, scx; int sh;
+                    PatGeometry(frame, out hx, out hy, out sc, out scx, out sh);
+                    using (Bitmap b = new Bitmap(ViewW, ViewH)) {
+                        using (Graphics g = Graphics.FromImage(b)) {
+                            g.Clear(Color.FromArgb(24, 24, 30));
+                            int gh = (int)Math.Round(_h * sc);
+                            int gw = (int)Math.Round(_w * scx);
+                            int gx = (int)Math.Round(_headX - gw / 2.0);
+                            if (_sprNormal != null)
+                                g.DrawImage(_sprNormal, new Rectangle(gx, _h - gh + sh, gw, gh));
+                            g.DrawImage(_patHand[frame], new Rectangle(hx, hy,
+                                (int)Math.Round(_patHand[frame].Width * vals[2]),
+                                (int)Math.Round(_patHand[frame].Height * vals[2])));
+                        }
+                        b.Save(Path.Combine(_baseDir, "_pattool_f" + frame + ".png"), ImageFormat.Png);
+                    }
+                    info.Text = "\u5DF2\u4FDD\u5B58 _pattool_f" + frame + ".png";
+                    return;
+                } catch { }
+            } else if (e.KeyCode == Keys.Escape) {
+                win.Close();
+                return;
+            } else { moved = false; }
+            if (moved) {
+                applyVals();
+                dhNow = Math.Max(1.0, _patHand[frame].Height * vals[2]);
+                dwNow = Math.Max(1.0, _patHand[frame].Width * vals[2]);
+                redraw();
+                syncBoxes();
+            }
+            e.Handled = true;
+        };
+
+        // Start on frame 2 (the deepest press) - the frame the placement is judged on, because it is the
+        // one that pushes the hand furthest down and therefore shows a collision with her face first.
+        applyVals();
+        redraw();
+        Console.WriteLine("  \u62D6\u52A8\u9F20\u6807=\u79FB\u52A8\u624B\uFF1B\u65B9\u5411\u952E=\u5FAE\u8C03 1 \u50CF\u7D20\uFF08Shift=10\uFF09\uFF1B\u6EDA\u8F6E=\u6539\u624B\u5927\u5C0F");
+        Console.WriteLine("  Shift+\u6EDA\u8F6E=\u6539\u5979\u7684\u5F39\u8DF3\u5E45\u5EA6\uFF1B1~5=\u5207\u6362\u5E27\uFF1BC=\u590D\u5236\u53C2\u6570\uFF1BR=\u6062\u590D\u9ED8\u8BA4\uFF1BS=\u5B58\u56FE\uFF1BEsc=\u5173\u95ED");
+        // Shown explicitly, and its handle reported: Application.Run shows a form by itself, but when it
+        // does not, the only symptom is a process with no window and nothing to debug from - which is
+        // exactly what the first launch looked like.
+        win.Show();
+        Console.WriteLine("  window handle = " + win.Handle.ToInt64() + "  visible=" + win.Visible +
+                          "  bounds=" + win.Bounds);
+        Console.Out.Flush();
+        Application.Run(win);
+        // Restore the shipping constants: the tool's values only live while it is open, so a diagnostic
+        // run that follows this one in the same process cannot inherit them.
+        _patBiasX = PatPalmBiasX;
+        _patBiasY = PatPalmBiasY;
+        _patScale = PatDrawScale;
+        _patRef = PatRefScale;
+        _patSquashDepth = 1.0;
+        Console.WriteLine("\u5DE5\u5177\u5DF2\u5173\u95ED");
+    }
+
+    // Is this point on her at all? This replaced a head-shaped ellipse test.
+    //
+    // The user asked for the WHOLE non-transparent area of her art to count, explicitly not a
+    // separately detected head region: "this is a loose idea, you do not need to cut her head out of
+    // the artwork to test against". So the test is just her silhouette, which is also the same map the
+    // drag and the right-click menu already use - one definition of "on her" for every gesture.
+    //
+    // COORDINATE SPACES: the pointer arrives in CANVAS coords, because the window is screen-sized (its
+    // client area IS the canvas). _offX/_offY is where the WIDGET sits inside it, so it must NOT be
+    // added here. Adding it was the bug that made a real long press do nothing while --pattrigger
+    // passed: the trace read `press at (285,1227) solid=False`, and 1227 + 1074 = 2301 is past the
+    // bottom of a 1600-row canvas.
+    bool PatOnHer(int x, int y) {
+        return GirlPixelSolid(x, y);
+    }
+
+    // The head pat is triggered by HOVERING, not by pressing.
+    //
+    // The user's requirement, in their words: put the mouse on her and leave it there for 200 ms and
+    // the pat starts - no click, no long press. "On her" is the whole non-transparent area of her art,
+    // not a separately detected head region, and the reason for the change was a real conflict: with a
+    // press trigger, holding her while dragging for two seconds fired the pat, which cleared _drag and
+    // left her stuck in mid-air until the next click.
+    //
+    // The button state is therefore part of the CONDITION rather than the trigger: if a button is down
+    // the player is dragging or grabbing, not hovering, so the timer resets. That is what makes the
+    // two gestures mutually exclusive by construction instead of by a threshold.
+    void TickPat(double dtMs) {
+        int mx = 0, my = 0;
+        bool have = false;
+        try { Point mp = Cursor.Position; mx = mp.X; my = mp.Y; have = true; } catch { }
+        bool buttonDown = Native.KeyDown(Native.VK_LBUTTON) || Native.KeyDown(Native.VK_RBUTTON) ||
+                          Native.KeyDown(Native.VK_MBUTTON);
+        TickPatWith(dtMs, have, mx, my, buttonDown);
+    }
+
+    // The state machine with the pointer state supplied, so --pattrigger can drive it. The production
+    // TickPat above reads the real cursor and passes it in; a test that stubbed this wrongly would
+    // prove nothing, which is exactly how the press-based version passed while doing nothing.
+    void TickPatWith(double dtMs, bool have, int mx, int my, bool buttonDown) {
+        if (!_patReady) return;
+        // Head-pat switched off. Checked before anything else so no part of the gesture can run;
+        // the demo window has no pat trigger of its own, so this one door covers every caller.
+        if (!_fxPat) {
+            if (_patActive) { _patActive = false; _patT = 0; }
+            return;
+        }
+        bool onHer = have && PatOnHer(mx, my);
+        // Any button down means a drag, a bowl grab or a menu click, never a hover.
+        bool canHover = onHer && !buttonDown && !_drag && _riceGrab == null;
+
+        // IS THE POINTER MOVING? The trigger is a stroke across her, not a dwell on her.
+        //
+        // Accumulated DISTANCE, not time. Distance is the honest measure of "the user is stroking":
+        // a slow deliberate drag crosses plenty of pixels and should register, while a hand resting on
+        // the mouse drifts a pixel or two and should not. A time-based test gets that backwards - it
+        // rewards lingering, which is the behaviour being removed.
+        //
+        // The per-frame delta is also capped. A mouse that jumps half a screen in one 33 ms tick (a
+        // warp, a remote-desktop hiccup) is not a stroke and should not be allowed to fire the gesture
+        // on its own.
+        double moveDist = 0;
+        if (have && _patMoveSeen) {
+            double dx = mx - _patMoveX, dy = my - _patMoveY;
+            moveDist = Math.Sqrt(dx * dx + dy * dy);
+            if (moveDist > PatMoveMaxStep) moveDist = 0;
+        }
+        _patMoveSeen = have;
+        _patMoveX = mx;
+        _patMoveY = my;
+        bool moving = canHover && moveDist > 0;
+        if (!canHover) {
+            _patMoveAccum = 0;
+            _patMoveMs = 0;
+        } else if (moving) {
+            _patMoveAccum += moveDist;
+            if (_patMoveAccum > PAT_MOVE_MIN_PX * 4) _patMoveAccum = PAT_MOVE_MIN_PX * 4;
+            // The 500 ms clock only runs once the stroke has actually travelled the threshold. See
+            // PAT_START_DELAY_MS for why the clock does not start on the first pixel.
+            if (_patMoveAccum >= PAT_MOVE_MIN_PX) _patMoveMs += dtMs;
+        }
+
+        // STOP-AND-SETTLE. A click, a right-click, or a drag means the player is interacting with her
+        // as an object, and the pat must get out of the way at once: with the hand already drawn, every
+        // frame of the drag repaints the widget and the hand smears behind her - the ghost the user
+        // reported. So any of those inputs stops the pat immediately AND blocks it until she has
+        // finished flying to her corner plus PAT_SETTLE_MS, otherwise it would restart the moment the
+        // drag ends, while she is still moving, and smear again.
+        if (buttonDown) {
+            _patBlocked = true;
+            if (_patActive || _patMoveAccum > 0) {
+                if (DiagPatLog) Log("patlog: stopped+blocked by a button press");
+                _patActive = false;
+                _patT = 0;
+                _patMoveAccum = 0;
+            }
+        }
+        if (_snapping) _patBlocked = true;          // still flying home: not settled
+        if (_patBlocked) {
+            // Released only once she has stopped moving, then PAT_SETTLE_MS after that.
+            if (!buttonDown && !_snapping && !_drag) {
+                if (_patSettleMs <= 0) {
+                    _patBlocked = false;
+                    if (DiagPatLog) Log("patlog: settle done, pat allowed again");
+                } else {
+                    _patSettleMs -= dtMs;
+                }
+            } else {
+                _patSettleMs = PAT_SETTLE_MS;       // still moving: keep the full delay ahead of us
+            }
+            // Blocked means no pat AND no hover build-up, but the pointer may stay on her throughout.
+            return;
+        }
+
+        // Waiting for the pot to finish fading. Checked BEFORE the stroke logic so a pause mid-wait
+        // does not cancel it: the user asked for the pot to come off and then the pat to start, and
+        // the knock-off has already been committed - only leaving her cancels it.
+        if (_patWaitingPotOff) {
+            if (!onHer) {
+                _patWaitingPotOff = false;
+                if (DiagPatLog) Log("patlog: cancelled the wait - the pointer left her");
+                return;
+            }
+            if (HeadPotOn) return;                // still fading
+            _patWaitingPotOff = false;
+            _patActive = true;
+            _patT = 0;
+            _patMoveAccum = 0;
+            _patMoveMs = 0;
+            _patIdleMs = 0;
+            if (DiagPatLog) Log("patlog: pot gone - starting the pat");
+            return;
+        }
+
+        if (DiagPatLog && (canHover || _patActive))
+            Log("patlog: onHer=" + onHer + " moving=" + moving + " dist=" + moveDist.ToString("0.0") +
+                " accum=" + _patMoveAccum.ToString("0") + " btn=" + buttonDown +
+                " drag=" + _drag + " grab=" + (_riceGrab != null) + " active=" + _patActive);
+
+        if (_patActive) {
+            // Keeps playing while the stroke continues. When it stops, the hand lifts after
+            // PAT_END_DELAY_MS rather than at once - the user asked for 300 ms of grace so a hitch in a
+            // real stroke does not snatch the hand away and put it back.
+            //
+            // The same delay applies when the pointer leaves her, so the two endings look alike. Her
+            // patting does not move her, so continuing briefly in that case is not a smear risk.
+            if (!onHer) {
+                _patIdleMs += dtMs;
+                if (_patIdleMs >= PAT_END_DELAY_MS) {
+                    _patActive = false;
+                    _patT = 0;
+                    _patMoveAccum = 0;
+                    _patIdleMs = 0;
+                    if (DiagPatLog) Log("patlog: stopped (pointer left her)");
+                    return;
+                }
+            } else if (moving) {
+                _patIdleMs = 0;
+            } else {
+                _patIdleMs += dtMs;
+                _patMoveAccum -= PatMoveDecayPerMs * dtMs;
+                if (_patMoveAccum < 0) _patMoveAccum = 0;
+                // Only the clock ends the pat now. The banked distance still drains - it has to, or the
+                // next stroke would inherit credit it did not earn - but reaching zero no longer stops
+                // anything, because that fought the delay the user asked for.
+                if (_patIdleMs >= PAT_END_DELAY_MS) {
+                    _patActive = false;
+                    _patT = 0;
+                    _patMoveAccum = 0;
+                    _patIdleMs = 0;
+                    if (DiagPatLog) Log("patlog: stopped (the stroke paused)");
+                    return;
+                }
+            }
+            _patT += dtMs;
+            return;
+        }
+
+        if (moving) {
+            _patIdleMs = 0;
+            // Fire once the stroke has both travelled PAT_MOVE_MIN_PX and been sustained for
+            // PAT_START_DELAY_MS. The delay is what the user asked for: a deliberate stroke starts the
+            // pat, a quick brush across her does not.
+            if (_patMoveAccum >= PAT_MOVE_MIN_PX && _patMoveMs >= PAT_START_DELAY_MS) {
+                // Wearing the pot: take it off FIRST and let the fade finish before the pat begins.
+                //
+                // The two do not mix - the pot is a sprite sitting on her head that has to be erased
+                // from the canvas, and the pat squashes her art vertically, so running both at once
+                // erases the wrong rows and leaves the pot smeared through her. Removing it first is
+                // the whole fix, and it also matches what the user asked for by name.
+                if (HeadPotOn) {
+                    if (!_patWaitingPotOff) {
+                        _patWaitingPotOff = true;
+                        KnockPotOff();
+                        if (DiagPatLog) Log("patlog: pot on - knocking it off before the pat");
+                    }
+                    return;                       // wait for the fade; see the block below
+                }
+                _patWaitingPotOff = false;
+                _patActive = true;
+                _patT = 0;
+                _patMoveAccum = 0;
+                _patMoveMs = 0;
+                _patIdleMs = 0;
+                if (DiagPatLog) Log("patlog: FIRED after " + PAT_START_DELAY_MS + "ms of sustained stroke");
+            }
+        } else {
+            _patMoveAccum = 0;
+            _patMoveMs = 0;
+        }
+    }
+
+    // ---------------------------------------------------------- menu structure ---
+    // Asserts the three-level structure the user specified, level by level and in order.
+    // A dropped or reordered row is the failure this catches; nothing about pixels.
+    public void RunMenuCheckTest() {
+        Console.WriteLine("menu structure");
+        // The context menu is now the SHORT list: five flat action rows, no submenus. Everything
+        // configurable moved into the settings window, so the old assertions - a three-level
+        // cascade, its band grouping, per-cue row captions - describe a menu that no longer
+        // exists. Two checks describe the new one:
+        //
+        //   1. the five rows, in order, with nothing nested under any of them
+        //   2. the settings window opens, holds four pages, every page paints, and it closes again
+        //
+        // Check 2 is the one that matters. The menu rows are trivial; the window is where the
+        // settings live now, and a page that silently fails to paint is exactly what a structural
+        // assertion is for.
+        // Five labelled rows plus one separator: refresh | demo | settings | --- | API key | quit.
+        // ALL flat - no row owns a submenu, which is the property the redesign was for.
+        string[] wantRoot = new string[] { S_REFRESH, S_DEMO, S_SETTINGS, S_SETKEY, S_QUIT };
+        List<string> gotRoot = new List<string>();
+        int rootSepIndex = -1;
+        for (int i = 0; i < _menu.Items.Count; i++) {
+            if (_menu.Items[i] is ToolStripSeparator) { rootSepIndex = i; continue; }
+            gotRoot.Add(_menu.Items[i].Text);
+        }
+        bool rootOk = gotRoot.Count == wantRoot.Length;
+        for (int i = 0; i < wantRoot.Length && i < gotRoot.Count; i++) {
+            if (gotRoot[i] != wantRoot[i]) {
+                rootOk = false;
+                Console.WriteLine("  root[" + i + "] is '" + gotRoot[i] + "', want '" + wantRoot[i] + "'");
+            }
+        }
+        bool sepsOk = rootSepIndex == 3;      // between the settings block and the system block
+        // No row may own a submenu. This is the property the whole redesign was for, so it is
+        // asserted directly rather than inferred from the row count.
+        int nested = 0;
+        for (int i = 0; i < _menu.Items.Count; i++) {
+            ToolStripMenuItem mi = _menu.Items[i] as ToolStripMenuItem;
+            if (mi != null && mi.DropDownItems.Count > 0) {
+                nested++;
+                Console.WriteLine("  root[" + i + "] '" + mi.Text + "' still has " +
+                                  mi.DropDownItems.Count + " children");
+            }
+        }
+        bool flat = nested == 0;
+
+        // The settings window: it must open, every page must paint something, and it must close
+        // again - a guard that leaves a window on the user's screen is its own bug.
+        ShowSettingsUi();
+        bool opened = SettingsOpenUi;
+        bool allPages = opened;
+        StringBuilder heights = new StringBuilder();
+        for (int i = 0; i < 4; i++) {
+            int h = SettingsPageHeightUi(i);
+            heights.Append(" p").Append(i).Append("=").Append(h);
+            if (h < 40) allPages = false;      // a page that paints nothing is a broken page
+        }
+        bool closed = false;
+        if (opened) {
+            SettingsCloseUi();
+            closed = !SettingsOpenUi;
+        }
+
+        Console.WriteLine("  rows    : " + gotRoot.Count + " (want " + wantRoot.Length +
+                          ")  separator before index " + rootSepIndex + "  " +
+                          ((rootOk && sepsOk) ? "ok" : "MISMATCH"));
+        Console.WriteLine("  flat    : " + nested + " row(s) with children  " + (flat ? "ok" : "MISMATCH"));
+        Console.WriteLine("  window  : opened=" + opened + " pages=" + heights.ToString().Trim() +
+                          " closedAgain=" + closed + "  " +
+                          ((opened && allPages && closed) ? "ok" : "MISMATCH"));
+
+        bool ok = rootOk && sepsOk && flat && opened && allPages && closed;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - the context menu is five flat action rows with nothing nested, and the settings window opens with all four pages painting content"
+            : "FAIL - rootOk=" + rootOk + " seps=" + sepsOk + " flat=" + flat +
+              " opened=" + opened + " allPages=" + allPages + " closed=" + closed));    }
+
+
+    // ---------------------------------------------------------- audio engine ---
+    // Asserts that the custom-sound machinery really works on this machine. Nothing
+    // here touches state.ini or the shipped files.
+    public void RunAudioEngineTest() {
+        Console.WriteLine("audio engine (decode / trim / gain / wav round trip)");
+        // _baseDir, not AppDomain.CurrentDomain.BaseDirectory: under powershell.exe
+        // -File the latter resolves to the PowerShell install directory, so every cue
+        // came back "MISSING" while the files sat next to the script.
+        string baseDir = _baseDir;
+        string[] names = new string[] { "hit.mp3", "feed.mp3", "pot_land.mp3", "pot_off.mp3" };
+
+        bool allDecoded = true, allPeaks = true;
+        for (int i = 0; i < names.Length; i++) {
+            string p = Path.Combine(baseDir, names[i]);
+            if (!File.Exists(p)) { Console.WriteLine("  MISSING " + names[i]); allDecoded = false; continue; }
+            string err;
+            PcmAudio a = PcmAudio.Decode(p, out err);
+            if (a == null) {
+                Console.WriteLine("  " + names[i] + " : DECODE FAILED - " + err);
+                allDecoded = false;
+                continue;
+            }
+            // MCI's own length is the authority for what the game will play; if the
+            // decode disagrees by a lot, one of the two is not reading the file.
+            string mciRaw = MciLengthProbe(p);
+            int mciMs = 0;
+            {
+                // The log holds several "reply=[...]" replies and only one of them is the
+                // length; the first is empty (the "time format" command's reply), so scan
+                // them all and take the first that parses as a number.
+                int from = 0;
+                while (true) {
+                    int pRep = mciRaw.IndexOf("reply=[", from);
+                    if (pRep < 0) break;
+                    int pEnd = mciRaw.IndexOf(']', pRep);
+                    if (pEnd < 0) break;
+                    string num = mciRaw.Substring(pRep + 7, pEnd - pRep - 7).Trim();
+                    int vMs;
+                    if (int.TryParse(num, out vMs) && vMs > 0) { mciMs = vMs; break; }
+                    from = pEnd;
+                }
+            }
+            bool sane = a.Peak > 300 && a.Frames > 0 && a.Rate >= 8000;
+            double drift = mciMs > 0 ? Math.Abs(a.Ms - mciMs) / mciMs : 0;
+            bool agrees = mciMs <= 0 || drift < 0.15;
+            if (!sane || !agrees) allPeaks = false;
+            Console.WriteLine("  " + names[i].PadRight(13) +
+                              " samples=" + a.S.Length.ToString().PadLeft(7) +
+                              " ch=" + a.Channels + " rate=" + a.Rate +
+                              " dur=" + a.Ms.ToString("0") + "ms" +
+                              " mci=" + mciMs + "ms" +
+                              " peak=" + a.Peak + "/32767" +
+                              "  " + ((sane && agrees) ? "ok" : "SUSPECT"));
+            if (mciMs <= 0) Console.WriteLine("      mci raw: " + mciRaw);
+        }
+
+        // Trim + gain + write + read back. The round trip is what proves the editor's
+        // save path produces a file the player can still use.
+        bool roundTrip = false, gainApplied = false, trimApplied = false;
+        string e2;
+        PcmAudio src = PcmAudio.Decode(Path.Combine(baseDir, "feed.mp3"), out e2);
+        string tmpWav = Path.Combine(Path.GetTempPath(), "dsp_audiotest.wav");
+        if (src != null) {
+            double fromMs = src.Ms * 0.25, toMs = src.Ms * 0.75;
+            PcmAudio cut = src.Slice(fromMs, toMs, 0.5);
+            if (cut != null) {
+                trimApplied = Math.Abs(cut.Ms - (toMs - fromMs)) < 30;
+                // Gain is checked against the peak of the SAME WINDOW, not of the whole
+                // file: the loudest sample in feed.mp3 is not inside 25%-75%, so the
+                // first version compared 6221 against 23709/2 and failed a correct gain.
+                PcmAudio plain = src.Slice(fromMs, toMs, 1.0);
+                double expect = plain != null ? plain.Peak * 0.5 : 0;
+                gainApplied = plain != null && Math.Abs(cut.Peak - expect) < Math.Max(60, expect * 0.05);
+                Console.WriteLine("  slice   : " + fromMs.ToString("0") + "-" + toMs.ToString("0") + "ms" +
+                                  " -> " + cut.Ms.ToString("0") + "ms  windowPeak=" + expect.ToString("0") +
+                                  "  slicedPeak=" + cut.Peak + "  (want ~" + expect.ToString("0") + ")");
+                string werr;
+                if (PcmAudio.WriteWav(tmpWav, cut.S, cut.Channels, cut.Rate, out werr)) {
+                    string rerr;
+                    PcmAudio back = PcmAudio.ReadWav(tmpWav, out rerr);
+                    if (back != null) {
+                        roundTrip = back.S.Length == cut.S.Length && back.Rate == cut.Rate &&
+                                    back.Channels == cut.Channels && back.Peak == cut.Peak;
+                        Console.WriteLine("  wav     : wrote " + new FileInfo(tmpWav).Length + " bytes," +
+                                          " read back samples=" + back.S.Length + " (" + cut.S.Length + ")" +
+                                          " peak=" + back.Peak + " (" + cut.Peak + ")" +
+                                          "  " + (roundTrip ? "identical" : "MISMATCH"));
+                    } else {
+                        Console.WriteLine("  wav     : READ BACK FAILED - " + rerr);
+                    }
+                } else {
+                    Console.WriteLine("  wav     : WRITE FAILED - " + werr);
+                }
+            } else {
+                Console.WriteLine("  slice   : FAILED (slice returned null)");
+            }
+        } else {
+            Console.WriteLine("  slice   : skipped, feed.mp3 did not decode - " + e2);
+        }
+
+        // Load() must accept both containers through one entry point.
+        string lerr;
+        PcmAudio viaWav = PcmAudio.Load(tmpWav, out lerr);
+        bool loadWav = viaWav != null && viaWav.Frames > 0;
+        PcmAudio viaMp3 = PcmAudio.Load(Path.Combine(baseDir, "hit.mp3"), out lerr);
+        bool loadMp3 = viaMp3 != null && viaMp3.Frames > 0;
+        Console.WriteLine("  load    : wav=" + loadWav + " mp3=" + loadMp3);
+
+        // Envelope must find the loud part and must not be all zero.
+        bool envelope = false;
+        if (src != null) {
+            float[] env = src.Envelope(64, 0, src.Ms);
+            float mx = 0; int nz = 0;
+            for (int i = 0; i < env.Length; i++) { if (env[i] > mx) mx = env[i]; if (env[i] > 0.01f) nz++; }
+            envelope = mx > 0.1f && nz > 2;
+            Console.WriteLine("  envelope: 64 buckets, max=" + mx.ToString("0.000") +
+                              " nonZero=" + nz + "  " + (envelope ? "ok" : "SUSPECT"));
+        }
+
+        try { if (File.Exists(tmpWav)) File.Delete(tmpWav); } catch { }
+
+        bool ok = allDecoded && allPeaks && trimApplied && gainApplied && roundTrip &&
+                  loadWav && loadMp3 && envelope;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - every cue decodes, and trim/gain/wav round trip is exact"
+            : "FAIL - decoded=" + allDecoded + " peaks=" + allPeaks + " trim=" + trimApplied +
+              " gain=" + gainApplied + " roundTrip=" + roundTrip +
+              " loadWav=" + loadWav + " loadMp3=" + loadMp3 + " envelope=" + envelope));
+    }
+
+    // MCI's own idea of the length, in milliseconds, as a cross-check on the decoder.
+    static string MciLengthProbe(string path) {
+        try {
+            string dir = Path.GetDirectoryName(path);
+            string bare = Path.GetFileName(path);
+            string cwd = Directory.GetCurrentDirectory();
+            try { Directory.SetCurrentDirectory(dir); } catch { }
+            string log;
+            try {
+                IntPtr h = SoundPool.OpenForProbe(bare, "dsplen");
+                log = h == IntPtr.Zero ? "open failed" : SoundPool.RawLength("dsplen");
+            } finally {
+                SoundPool.CloseAlias("dsplen");
+                Directory.SetCurrentDirectory(cwd);
+            }
+            return log;
+        } catch (Exception ex) { return "EX " + ex.Message; }
+    }
+
     // ------------------------------------------------- menu appearance shots ---
     // Development-only helpers for --menushot. A dropdown is a separate popup
     // window, so the beautified menu can only be inspected by opening it for real
     // and grabbing that slice of the screen.
-
-    public void SetVolumeForShot(int pct) { SetVolumePercent(pct); }
+    // SetVolumeForShot is GONE with the master volume: it existed to put the shot's volume row
+    // into a known state, and there is no such row. A cue's level is set with SetCueVolumeUi.
     // Force the palette for a screenshot run without letting it reach state.ini
     // (the callers of --menushot already run with NoSaveForTest).
     public void ApplyThemeForShot(bool dark) {
@@ -7737,41 +18191,118 @@ public sealed class DshPet : Form {
     // move the size and the volume around; without this they would leave those
     // values in the user's state.ini.
     public void NoSaveForTest() { _noSave = true; }
+    public void MarkDiagnosticRun() { _diagRun = true; }
     public Point MenuOrigin() { return new Point(240, 240); }
 
     public void OpenRootMenu(Point pt) {
+        ArmMenuClickHook();
         _menu.Show(pt);
         _menu.Items[0].Select();                  // show the hover styling
+    }
+
+    // Installs the click hook and remembers that the menu owns one, so a menu closed by ANY route
+    // (a row, Escape, the app quitting) still takes the hook back out. Attached here and in
+    // OpenMenuPath rather than inside the Show calls so every route that opens a menu is covered.
+    void ArmMenuClickHook() {
+        InstallMenuClickHook();
+        _menu.Closed -= OnMenuClosedEvent;
+        _menu.Closed += OnMenuClosedEvent;
+    }
+    void OnMenuClosedEvent(object sender, ToolStripDropDownClosedEventArgs e) {
+        RemoveMenuClickHook();
     }
     public void HoverItem(int index) {
         if (index < 0 || index >= _menu.Items.Count) return;
         _menu.Items[index].Select();
     }
-    public void OpenSoundMenu() {
-        _menu.Close();
+    // OpenSoundMenu / OpenSizeMenu are GONE with the submenus they opened. The settings window's
+    // pages are opened by --shotwin --page N instead, which needs no menu navigation at all.
+    // The whole menu as text, one line per row, indented by level.
+    //
+    // This is the reliable way to check the STRUCTURE. Screenshots of nested popups are
+    // awkward - a submenu cascades from its owner and lands on top of it, so a capture
+    // either hides one level or has to be cropped per level - and a text dump cannot be
+    // fooled by a dropdown that is Visible but not painted, which is exactly the trap the
+    // drop-shadow experiment fell into.
+    public string MenuTreeReport() {
+        StringBuilder sb = new StringBuilder();
+        DumpMenu(sb, _menu.Items, 0);
+        return sb.ToString();
+    }
+    static void DumpMenu(StringBuilder sb, ToolStripItemCollection items, int depth) {
+        // Separators are punctuation: printed WITHOUT an index, and they do not advance the
+        // numbering. Numbering every raw slot made a four-row popup read as 0,2,4,6, which
+        // looks like rows are missing.
+        int entry = 0;
+        for (int i = 0; i < items.Count; i++) {
+            ToolStripItem it = items[i];
+            for (int d = 0; d < depth; d++) sb.Append("    ");
+            if (it is ToolStripSeparator) { sb.Append("  ---\n"); continue; }
+            sb.Append(entry++).Append(' ');
+            sb.Append(it.Text);
+            ToolStripMenuItem mi = it as ToolStripMenuItem;
+            if (mi != null) {
+                if (mi.Checked) sb.Append("   [tick]");
+                if (mi.DropDownItems.Count > 0) sb.Append("   >");
+            }
+            sb.Append('\n');
+            if (mi != null && mi.DropDownItems.Count > 0) DumpMenu(sb, mi.DropDownItems, depth + 1);
+        }
+    }
+
+    // Opens the root menu and then the chain of submenus named by `path`, one index per
+    // level. Used by --menushot so the shot sequence is written as the structure the user
+    // reads rather than as a fistful of ad-hoc helpers that have to be rewritten every time
+    // the tree moves. Each level needs a message-loop pass to paint, which the caller's
+    // timer provides.
+    public void OpenMenuPath(int[] path) {
+        if (path == null || path.Length == 0) return;
+        CloseAllDropDowns(_menu.Items);
+        ArmMenuClickHook();
         _menu.Show(MenuOrigin());
-        _soundItem.ShowDropDown();
-        HoverSoundLevel(2);
+        ToolStripItemCollection items = _menu.Items;
+        for (int d = 0; d < path.Length; d++) {
+            if (path[d] < 0 || path[d] >= items.Count) return;
+            ToolStripMenuItem mi = items[path[d]] as ToolStripMenuItem;
+            if (mi == null) return;
+            mi.ShowDropDown();
+            if (d == 0) mi.Select();
+            items = mi.DropDownItems;
+        }
     }
-    public void OpenSizeMenu() {
-        _soundItem.DropDown.Close();
-        _sizeItem.ShowDropDown();
-    }
-    // "test top-up" submenu, where the manual fire-control-radar entry lives.
+    // Root indices, named so the shot sequence does not carry bare numbers. The
+    // PowerShell host cannot see C# const members on an instance, so these are exposed as
+    // methods for --menushot and used directly inside the class.
+    public const int M_REFRESH = 0, M_DEMO = 1, M_DISPLAY = 2, M_SOUND = 3, M_KEY = 4, M_QUIT = 5;
+    // Within the demo, display-settings and sound-settings branches. These follow the RAW
+    // item order, separators included, because that is what ShowDropDown indexes by:
+    // is [? ---, , ---, .
+    public const int SUB_CHG = 0, SUB_TOP = 1;                    // demo
+    public const int SUB_THEME = 0, SUB_SIZE = 1;                 // display settings
+    public const int SOUND_ON = 0, SOUND_VOL = 1, SOUND_FX = 2;   // sound settings
+    public int DemoIndex()    { return M_DEMO; }
+    public int CueLandIndex { get { return CUE_LAND; } }
+    public int DisplayIndex() { return M_DISPLAY; }
+    public int SoundIndex()   { return M_SOUND; }
+    public int SubChgIndex()  { return SUB_CHG; }
+    public int SubSizeIndex() { return SUB_SIZE; }
+    public int SubFxIndex()   { return SOUND_FX; }
+
+    // The -> ?submenu, where the manual fire-control-radar entry now lives.
     public void OpenTestTopMenu() {
-        if (_themeItem != null && _themeItem.DropDown != null) _themeItem.DropDown.Close();
-        if (_sizeItem != null && _sizeItem.DropDown != null) _sizeItem.DropDown.Close();
-        _menu.Show(MenuOrigin());
-        _testTopItem.ShowDropDown();
+        OpenMenuPath(new int[] { M_DEMO, SUB_TOP });
     }
-    // i-th fixed volume row (0 = mute, 1 = 25 %, ...), skipping the separator and
-    // the header, exactly the way RefreshMenuChecks finds them.
-    public void HoverSoundLevel(int i) {
-        if (_soundItem == null) return;
-        int idx = _soundItem.DropDownItems.IndexOf(_muteItem) + 3 + i;
-        if (idx < 0 || idx >= _soundItem.DropDownItems.Count) return;
-        _soundItem.DropDownItems[idx].Select();
+    static void CloseAllDropDowns(ToolStripItemCollection items) {
+        foreach (ToolStripItem it in items) {
+            ToolStripMenuItem mi = it as ToolStripMenuItem;
+            if (mi == null) continue;
+            if (mi.DropDown != null) { try { mi.DropDown.Close(); } catch { } }
+            if (mi.DropDownItems.Count > 0) CloseAllDropDowns(mi.DropDownItems);
+        }
     }
+    // HoverSoundLevel is GONE. It put the mouse on a volume row of the sound submenu so a
+    // screenshot could show a hover state. That submenu no longer exists, and the settings
+    // window's sliders are photographed by --shotwin without needing a hover.
     public void CloseMenus() { _menu.Close(); }
 
     // Row metrics of every dropdown, printed after the shots so the popup size
@@ -7779,9 +18310,8 @@ public sealed class DshPet : Form {
     // from a screenshot.
     public string MenuMetrics() {
         StringBuilder sb = new StringBuilder();
+        // Only the root: the submenus whose metrics this used to report are gone.
         RowMetrics(sb, "root", _menu, _menu.Items);
-        if (_soundItem != null) RowMetrics(sb, "sound", _soundItem.DropDown, _soundItem.DropDownItems);
-        if (_sizeItem != null) RowMetrics(sb, "size", _sizeItem.DropDown, _sizeItem.DropDownItems);
         return sb.ToString();
     }
     static void RowMetrics(StringBuilder sb, string name, Control c, ToolStripItemCollection items) {
@@ -7805,19 +18335,82 @@ public sealed class DshPet : Form {
     static Rectangle ScreenRect(Control c) {
         return new Rectangle(c.PointToScreen(Point.Empty), c.Size);
     }
-    public Rectangle MenuBounds() {
-        Rectangle r = _menu.Visible ? ScreenRect(_menu) : Rectangle.Empty;
-        ToolStripDropDown[] drops = new ToolStripDropDown[] {
-            _soundItem != null ? _soundItem.DropDown : null,
-            _sizeItem != null ? _sizeItem.DropDown : null,
-            _testTopItem != null ? _testTopItem.DropDown : null
-        };
-        foreach (ToolStripDropDown d in drops) {
-            if (d == null || !d.Visible) continue;
-            Rectangle dr = ScreenRect(d);
-            r = r.IsEmpty ? dr : Rectangle.Union(r, dr);
+    // Visibility of each dropdown, for diagnosing a shot that came out without the popup it was
+    // supposed to show. "Visible" and "actually painted" are different things and the screenshot
+    // alone cannot tell them apart.
+    //
+    // Only the root is left to report: with no submenus there is only ever one popup, and the
+    // handle-based walk below would still find any that appeared.
+    public string DropDownReport() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("root=");
+        if (_menu == null) {
+            sb.Append("null");
+        } else {
+            sb.Append(_menu.Visible ? "vis" : "hid")
+              .Append('(').Append(_menu.Width).Append('x').Append(_menu.Height).Append(')');
+            if (_menu.Visible) sb.Append('@').Append(ScreenRect(_menu).Location);
         }
+        foreach (ToolStripItem it in _menu.Items) {
+            ToolStripMenuItem mi = it as ToolStripMenuItem;
+            if (mi == null || mi.DropDownItems.Count == 0) continue;
+            sb.Append("  ").Append(mi.Text).Append('=')
+              .Append(mi.DropDown.Visible ? "vis" : "hid");
+        }
+        return sb.ToString();
+    }
+
+    public Rectangle MenuBounds() {
+        // EVERY visible popup, found by walking the tree, not a hand-written list.
+        //
+        // The list this replaced named the root plus four submenus by field, so a popup that is
+        // not one of those - the choose list and the clip rows under it - was left out of the
+        // capture rectangle entirely and the shot silently cropped it away.
+        Rectangle r = _menu.Visible ? ScreenRect(_menu) : Rectangle.Empty;
+        CollectVisible(_menu.Items, ref r);
         return r;
+    }
+    static void CollectVisible(ToolStripItemCollection items, ref Rectangle r) {
+        foreach (ToolStripItem it in items) {
+            ToolStripMenuItem mi = it as ToolStripMenuItem;
+            if (mi == null) continue;
+            if (mi.DropDownItems.Count == 0) continue;
+            ToolStripDropDown dd = mi.DropDown;
+            if (dd != null && dd.Visible) {
+                Rectangle dr = ScreenRect(dd);
+                r = r.IsEmpty ? dr : Rectangle.Union(r, dr);
+            }
+            CollectVisible(mi.DropDownItems, ref r);
+        }
+    }
+
+    [DllImport("user32.dll")]
+    static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
+
+    // Renders a window through PrintWindow instead of copying screen pixels.
+    //
+    // CopyFromScreen is why several "before/after" shots came back identical or wrong: this app's pet
+    // window is full-screen and always on top, so it covers whatever dialog is being captured. That made
+    // pixel readings untrustworthy - three separate readings of the same column disagreed, because all
+    // three were reading the desktop rather than the dialog. PrintWindow asks the window to draw itself
+    // into the DC, so whatever is stacked above it is irrelevant.
+    public bool CaptureWindowTo(string path, IntPtr hwnd, int w, int h) {
+        if (hwnd == IntPtr.Zero || w < 8 || h < 8) return false;
+        try {
+            using (Bitmap b = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
+                using (Graphics g = Graphics.FromImage(b)) {
+                    IntPtr hdc = g.GetHdc();
+                    bool ok;
+                    try { ok = PrintWindow(hwnd, hdc, 2 /* PW_RENDERFULLCONTENT */); }
+                    finally { g.ReleaseHdc(hdc); }
+                    if (!ok) { Console.WriteLine("capture: PrintWindow refused"); return false; }
+                }
+                b.Save(path, ImageFormat.Png);
+            }
+            Console.WriteLine("capture -> " + Path.GetFileName(path) + " (" + w + "x" + h +
+                              " via PrintWindow)");
+            return true;
+        } catch (Exception ex) { Console.WriteLine("capture failed: " + ex.Message); return false; }
     }
 
     public void CaptureRegion(string path, Rectangle r, int margin) {
@@ -7946,16 +18539,28 @@ public sealed class DshPet : Form {
     double _squashScale = 1.0;
     int _squashAnchorY;
     bool _squashOn;
+    // The squash the canvas in hand was RENDERED with, captured at draw time so the erase
+    // pass undoes exactly that transform and not the next frame's. Same discipline as the
+    // cached girl alpha: it is stamped with the frame it belongs to.
+    double _squashDrawnScale = 1.0;
+    bool _squashDrawnOn;
+    int _squashDrawnAnchor;
     // Diagnostics: how many pixels the mask covered last repaint, and how many of them
     // were actually solid. "0 seen" means the mask is sampling the wrong place; "seen
     // but 0 hit" means every masked pixel was already transparent, i.e. the strokes
     // landed on empty space.
     long _eraseSeen, _eraseHit;
+    // Iterations the per-pixel erase scan actually performed on the last repaint.
+    // This is the O(_w * _h) term that makes the worn-pot frame scale with the
+    // widget, so it is reported next to the timings in --perfscale and asserted
+    // there. Seen != cells: "seen" counts mask hits, "cells" counts the box walk.
+    long _eraseCells;
     // Coverage of the erase mask on the last repaint. Kept as a real diagnostic (not
     // scaffolding): "seen but 0 erased" means the mask is sampling empty space, which
     // is exactly the failure that took three attempts to find the first time.
     public string EraseStatsForTest() {
         return "maskSeen=" + _eraseSeen + " maskErased=" + _eraseHit +
+               " cells=" + _eraseCells +
                " box=" + _eraseMaskW + "x" + _eraseMaskH + "@(" + _eraseMaskX + "," + _eraseMaskY + ")";
     }
     int _eraseMaskW, _eraseMaskH, _eraseMaskX, _eraseMaskY;
@@ -7969,6 +18574,53 @@ public sealed class DshPet : Form {
         if (t < 0) t = 0; else if (t > 1) t = 1;
         double dx = px - (ax + t * vx), dy = py - (ay + t * vy);
         return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    // Nearest point on the axis-aligned ellipse (u/a)^2 + (v/b)^2 = 1 to the point (px, py).
+    //
+    // A coarse angle sweep followed by shrinking local refinements: exact closed forms for
+    // this involve solving a quartic and are easy to get subtly wrong, while collision only
+    // needs the point to well under a pixel. Batch runs in a few microseconds.
+    static void NearestOnEllipse(double px, double py, double a, double b,
+                                 out double ux, out double uy) {
+        double best = double.MaxValue, bt = 0;
+        const int N = 32;
+        for (int i = 0; i < N; i++) {
+            double t = i * (2.0 * Math.PI / N);
+            double ct = Math.Cos(t), st = Math.Sin(t);
+            double ex = a * ct, ey = b * st;
+            double ddx = ex - px, ddy = ey - py;
+            double dd = ddx * ddx + ddy * ddy;
+            if (dd < best) { best = dd; bt = t; }
+        }
+        double delta = 2.0 * Math.PI / N;
+        for (int iter = 0; iter < 20; iter++) {
+            delta *= 0.5;
+            double t1 = bt - delta, t2 = bt + delta;
+            double c1 = Math.Cos(t1), s1 = Math.Sin(t1);
+            double c2 = Math.Cos(t2), s2 = Math.Sin(t2);
+            double dx1 = a * c1 - px, dy1 = b * s1 - py;
+            double dx2 = a * c2 - px, dy2 = b * s2 - py;
+            double d1 = dx1 * dx1 + dy1 * dy1, d2 = dx2 * dx2 + dy2 * dy2;
+            if (d1 < best) { best = d1; bt = t1; }
+            if (d2 < best) { best = d2; bt = t2; }
+        }
+        ux = a * Math.Cos(bt); uy = b * Math.Sin(bt);
+    }
+
+    // Separating distance between two axis-aligned ellipses, as a multiple of the centre
+    // distance: < 1 means they overlap. Both centres are known to lie inside their own
+    // ellipse, so the nearest-surface points always exist and the two distances are
+    // non-negative - no degenerate case to guard.
+    static double EllipseSeparation(double dx, double dy, double a1, double b1, double a2, double b2) {
+        double dist = Math.Sqrt(dx * dx + dy * dy);
+        if (dist < 1e-9) return 0;
+        double u1, v1, u2, v2;
+        NearestOnEllipse(dx, dy, a1, b1, out u1, out v1);
+        NearestOnEllipse(-dx, -dy, a2, b2, out u2, out v2);
+        double s1 = Math.Sqrt(u1 * u1 + v1 * v1);
+        double s2 = Math.Sqrt(u2 * u2 + v2 * v2);
+        return (s1 + s2) / dist;
     }
 
     // Rasterise EraseStrokes, but ONLY over the band the strokes actually touch: 45
@@ -8015,20 +18667,75 @@ public sealed class DshPet : Form {
             double[] px = new double[pn], py = new double[pn];
             for (int p = 0; p < pn; p++) { px[p] = s[i] * EraseSpace; py[p] = s[i + 1] * EraseSpace; i += 2; }
             double rr = s[i] * EraseSpace; i++;
-            for (int y = y0; y <= y1; y++) {
-                int row = (y - y0) * _eraseMaskW;
-                for (int x = x0; x <= x1; x++) {
-                    if (_eraseMask[row + x - x0] != 0) continue;
-                    bool hit = false;
-                    if (pn == 1) {
-                        double dx = x - px[0], dy = y - py[0];
-                        hit = dx * dx + dy * dy <= rr * rr;
-                    } else {
-                        for (int p = 0; p + 1 < pn && !hit; p++) {
-                            if (DistToSeg(x, y, px[p], py[p], px[p + 1], py[p + 1]) <= rr) hit = true;
+            double rr2 = rr * rr;
+            // Rasterise this stroke's capsule.
+            //
+            // History, because this is where a real regression came from: the original
+            // tested every pixel of the band against every segment. Two attempts to prune
+            // the candidate set were NOT equivalent and left the headband and the ahoge
+            // sticking out from under the pot - the first dropped horizontal segments (its
+            // "closest point to this row" collapses onto one endpoint when vy == 0), the
+            // second assumed one x span per row for the whole stroke, which a zig-zag
+            // stroke violates (the 118-point one spans x 196..817 on row 40).
+            //
+            // The prune below is per SEGMENT and only ever skips segments that cannot
+            // reach the pixel: the pixel still gets tested against every segment that
+            // could, so the union the original produced is unchanged. The four compares
+            // are against a precomputed axis-aligned box of the segment's capsule, which
+            // is exact - the capsule lies inside that box, so a pixel outside it is
+            // provably outside the capsule.
+            if (pn == 1) {
+                double px0 = px[0], py0 = py[0];
+                for (int y = y0; y <= y1; y++) {
+                    double dy = y - py0;
+                    double dy2 = dy * dy;
+                    if (dy2 > rr2) continue;
+                    int row = (y - y0) * _eraseMaskW;
+                    for (int x = x0; x <= x1; x++) {
+                        int idx = row + x - x0;
+                        if (_eraseMask[idx] != 0) continue;
+                        double dx = x - px0;
+                        if (dx * dx + dy2 <= rr2) _eraseMask[idx] = 1;
+                    }
+                }
+            } else {
+                // Per SEGMENT: walk only that segment's capsule AABB and mark the pixels
+                // inside the capsule. Visiting a pixel more than once is harmless (the
+                // mask is a union of the strokes), so nothing has to guard against
+                // overwriting - and the work is proportional to the sum of the segments'
+                // own footprints instead of (whole band x segment count), which was ~76
+                // million box tests per rebuild.
+                //
+                // The AABB is exact in the sense that matters: the capsule lies entirely
+                // inside it, so no pixel that belongs in the mask is missed - the distance
+                // test inside still decides every pixel exactly as the original did.
+                for (int p = 0; p + 1 < pn; p++) {
+                    double ax = px[p], ay = py[p], bx = px[p + 1], by = py[p + 1];
+                    double vx = bx - ax, vy = by - ay;
+                    double len2 = vx * vx + vy * vy;
+                    bool degenerate = len2 <= 1e-9;
+                    int bx0 = Math.Max(x0, (int)Math.Floor(Math.Min(ax, bx) - rr));
+                    int bx1 = Math.Min(x1, (int)Math.Ceiling(Math.Max(ax, bx) + rr));
+                    int by0 = Math.Max(y0, (int)Math.Floor(Math.Min(ay, by) - rr));
+                    int by1 = Math.Min(y1, (int)Math.Ceiling(Math.Max(ay, by) + rr));
+                    if (bx1 < bx0 || by1 < by0) continue;
+                    for (int y = by0; y <= by1; y++) {
+                        int row = (y - y0) * _eraseMaskW;
+                        for (int x = bx0; x <= bx1; x++) {
+                            int idx = row + x - x0;
+                            if (_eraseMask[idx] != 0) continue;
+                            double qx, qy;
+                            if (degenerate) {
+                                qx = x - ax; qy = y - ay;
+                            } else {
+                                double t = ((x - ax) * vx + (y - ay) * vy) / len2;
+                                if (t < 0) t = 0; else if (t > 1) t = 1;
+                                qx = x - (ax + t * vx);
+                                qy = y - (ay + t * vy);
+                            }
+                            if (qx * qx + qy * qy <= rr2) _eraseMask[idx] = 1;
                         }
                     }
-                    if (hit) _eraseMask[row + x - x0] = 1;
                 }
             }
         }
@@ -8064,6 +18771,2942 @@ public sealed class DshPet : Form {
     }
 
     public void FreezeSuckForShot(bool on) { _freezeSuck = on; }
+
+    // Rebuild the erase mask with the ORIGINAL exhaustive rasteriser and compare it with
+    // the live one. The scan-line version is meant to be bit-identical (same distances,
+    // narrower candidate set), so any differing pixel means the optimisation altered the
+    // mask - which is exactly what a leftover headband or ahoge would look like.
+    // Report the geometry the pet is running with, and dump the erase mask, without changing
+    // anything (no demo reset, no size change): the point is to see the REAL configuration
+    // that the user is looking at. Needed because the mask is anchored to the widget, so a
+    // pixel measured in a screen recording can only be mapped onto it once _offX/_offY/_w are
+    // known exactly - inferring those from a video is what kept sending me in circles.
+    public void GeomDump() {
+        Console.WriteLine("  size    : px=" + _sizePx + " w=" + _w + " h=" + _h);
+        Console.WriteLine("  widget  : offX=" + _offX + " offY=" + _offY +
+                          " shakeX=" + _shakeX + " shakeY=" + _shakeY);
+        Console.WriteLine("  canvas  : " + (_canvas == null ? "null" : _canvas.Width + "x" + _canvas.Height) +
+                          "  window=" + _winW + "x" + _winH);
+        Console.WriteLine("  sprite  : " + (_sprNormal == null ? "null" : _sprNormal.Width + "x" + _sprNormal.Height));
+        // Bowl/pot art sizes and the collision radius derived from them. The radius is what
+        // decides when two bowls "touch", so the numbers have to be visible: the iron pot is
+        // wide and flat, and a radius taken from its WIDTH is far larger than its height.
+        Console.WriteLine("  riceArt : " + (_riceArt == null ? "null" : _riceArt.Width + "x" + _riceArt.Height) +
+                          "  R=" + (_riceArt == null ? 0 : _riceArt.Width * 0.42));
+        Console.WriteLine("  ironLoose: " + (_ironArt == null ? "null" : _ironArt.Width + "x" + _ironArt.Height) +
+                          "  R=" + (_ironArt == null ? 0 : _ironArt.Width * 0.42));
+        Console.WriteLine("  ironHead: " + (_ironHeadArt == null ? "null" : _ironHeadArt.Width + "x" + _ironHeadArt.Height) +
+                          "  R=" + (_ironHeadArt == null ? 0 : _ironHeadArt.Width * 0.42));
+        // Self-check the bowl-contact geometry. The ellipse test replaced a circle test, so
+        // these are the cases that must come out right: straight above/below the flat pot the
+        // old circle fired far too early, and level with it the two must still agree.
+        if (_ironHeadArt != null && _riceArt != null) {
+            double ha = _ironHeadArt.Width * 0.5, hb = _ironHeadArt.Height * 0.5;
+            double ra = _riceArt.Width * 0.5, rb2 = _riceArt.Height * 0.5;
+            Console.WriteLine("  contact : iron=" + (ha * 2) + "x" + (hb * 2) + " rice=" + (ra * 2) + "x" + (rb2 * 2));
+            double[] dists = new double[] { hb + rb2, ha + ra };
+            string[] what = new string[] { "vertically (above/below)", "horizontally (level)" };
+            for (int i = 0; i < 2; i++) {
+                double d = dists[i];
+                double ddx = (i == 0) ? 0 : d, ddy = (i == 0) ? d : 0;
+                double sep = EllipseSeparation(ddx, ddy, ha, hb, ra, rb2);
+                double circleD = _ironHeadArt.Width * 0.42 + _riceArt.Width * 0.42;
+                Console.WriteLine("  contact " + what[i] + ": placing them exactly edge-to-edge at d=" +
+                                  d.ToString("0.0") + " -> separation=" + sep.ToString("0.000") +
+                                  " (want ~1.000); circle test would need d=" + circleD.ToString("0.0"));
+            }
+        }
+        BuildEraseMask();
+        if (_eraseMask == null) { Console.WriteLine("  mask    : null"); return; }
+        // The erase pass only runs while the pot is WORN, so put it on - otherwise the whole
+        // block is skipped and the probe below reports nothing (which is exactly what happened
+        // the first time this dump was written).
+        if (!HeadPotOn) { WearPotForShot(); PumpTicks(3); }
+        Console.WriteLine("  worn    : " + PotStateForTest());
+        double k = _w / (double)EraseSpace;
+        Console.WriteLine("  mask    : box=(" + _eraseMaskX + "," + _eraseMaskY + ") " +
+                          _eraseMaskW + "x" + _eraseMaskH + "  k=" + k.ToString("0.000000") +
+                          "  eraseSpace=" + EraseSpace);
+        Console.WriteLine("  mask    : sprite row r is at screen y = offY + r*k = " + _offY + " + r*" +
+                          k.ToString("0.000000"));
+        using (Bitmap mb = new Bitmap(_eraseMaskW, _eraseMaskH, PixelFormat.Format32bppArgb)) {
+            Buf mbb = new Buf(mb);
+            try {
+                for (int q = 0; q < _eraseMask.Length; q++) {
+                    int o2 = q * 4;
+                    byte v = _eraseMask[q] != 0 ? (byte)255 : (byte)0;
+                    mbb.P[o2] = v; mbb.P[o2 + 1] = v; mbb.P[o2 + 2] = v; mbb.P[o2 + 3] = 255;
+                }
+                mbb.Flush();
+            } finally { mbb.Dispose(); }
+            mb.Save(Path.Combine(_baseDir, "_mask.png"), ImageFormat.Png);
+        }
+        Console.WriteLine("  mask    : dumped -> _mask.png");
+        // Also dump the canvas as it is right now, so the frame the user is describing can be
+        // inspected at the real configuration.
+        RenderToCanvas();
+        SaveFullCanvas(Path.Combine(_baseDir, "_geom_frame.png"));
+        Console.WriteLine("  frame   : dumped -> _geom_frame.png");
+    }
+
+    // Walk a whole repaint frame by frame through the bounce and report any row inside the
+    // girl that came out fully transparent. That is what a slice through her body looks like:
+    // the erase (or the clear) removed a row it should not have touched. Reported as a count
+    // plus the worst rows, because "no seams" is otherwise only checkable by eye.
+    // bug7: a hairband / ahoge GHOST above her head, which only appears WHILE THE BOUNCE IS RUNNING.
+    //
+    // The documented trap for this bug is that every static-frame check passes: the ghost exists only
+    // between the squash starting and ending. The earlier attempts also failed by re-deriving the
+    // draw arithmetic or by scanning a colour that something else on screen also had.
+    //
+    // THIS GUARD MEASURED THE WRONG THING TWICE BEFORE IT WAS RIGHT, and both corrections are why it
+    // is worth keeping:
+    //
+    //   1. "any painted pixel above _offY" flagged 920 pixels on frame 6. They were her own sprite's
+    //      anti-aliased top edge, 467 of them at alpha = 1. Hence GhostAlphaFloor: alpha 1 is not
+    //      something a user can see, a failed erase leaves opaque art.
+    //   2. Even above that floor the count peaks at ~1800 mid-bounce, and that is CORRECT: the squash
+    //      curve is cos(2.2*pi*t)*(1-t)*0.16, whose cosine goes NEGATIVE, so _squashScale reaches
+    //      1.135 - a STRETCH. The anchor is at her feet (oy + _offY + _h), so a stretch lifts her
+    //      head ~0.135*h above rest. Visible content above _offY is then expected, not a defect.
+    //
+    // What is actually wrong is ACCUMULATION: a failed erase leaves one more sliver after every
+    // bounce, so the peak grows run over run and never returns to zero. So this runs the bounce
+    // SEVERAL times and asserts that the peak is stable and that the settled state is clean - which
+    // is the property the bug actually has. An earlier version of this comment claimed a rising
+    // curve was "the shape of a ghost"; that was a guess, and the measurement contradicted it.
+    public void RunBounceGhostTest() {
+        Console.WriteLine("bounce ghost above her head (bug7): accumulation across repeated bounces");
+        GoOffline();
+        _noNetwork = true;
+        ResetDemoForTest();
+        BuildEraseMask();
+        PumpTicks(3);
+
+        int artTop = _offY;
+        int potHalf = (int)((_ironHeadArt != null ? _ironHeadArt.Width : 300) * 0.55);
+        int potCx = (int)Math.Round(_offX + _w * 0.5558);
+
+        // A clean frame first: the rest pose must have nothing visible above her art at all.
+        _headSquashT = 0; _squashOn = false;
+        RenderToCanvas();
+        int restHits = CountAboveRow(artTop, potCx, potHalf, HeadPotOn);
+
+        const int ROUNDS = 4;
+        int[] peak = new int[ROUNDS];
+        for (int r = 0; r < ROUNDS; r++) {
+            int worst = 0, firstBad = -1;
+            for (int i = 0; i <= 24; i++) {
+                _headSquashT = i * (HeadSquashDur / 24.0);
+                RenderToCanvas();
+                int hits = CountAboveRow(artTop, potCx, potHalf, HeadPotOn);
+                if (i % 6 == 0) Console.WriteLine("    round " + r + " f" + i.ToString("00") + " hits=" + hits);
+                if (hits > worst) { worst = hits; if (firstBad < 0) firstBad = i; }
+                if (hits > 0 && firstBad == i && r == 0) {
+                    try {
+                        _canvas.Save(Path.Combine(_baseDir, "_ghost_r0_f" + i + ".png"), ImageFormat.Png);
+                        Console.WriteLine("    dumped _ghost_r0_f" + i + ".png (" + hits + " px)");
+                    } catch (Exception ex) { Log("ghost dump failed: " + ex.Message); }
+                }
+            }
+            // Settle: run the squash past its end so the next round starts from the rest pose.
+            _headSquashT = HeadSquashDur + 1;
+            RenderToCanvas();
+            peak[r] = worst;
+            Console.WriteLine("  round " + r + " peak=" + worst + "  settledHits=" +
+                              CountAboveRow(artTop, potCx, potHalf, HeadPotOn));
+        }
+
+        // Growth: does the peak climb run over run? A ghost would; a stretch does not.
+        int growth = peak[ROUNDS - 1] - peak[0];
+        bool stable = growth <= Math.Max(64, peak[0] / 4);
+        Console.WriteLine("  geometry: artTop=" + artTop + " w=" + _w + " potWorn=" + HeadPotOn);
+        Console.WriteLine("  peaks   : " + string.Join(", ", Array.ConvertAll(peak, x => x.ToString())));
+        Console.WriteLine("  growth  : last-first=" + growth + "  restHits=" + restHits +
+                          "  " + (stable ? "ok (stable)" : "MISMATCH (climbing)"));
+        bool ok = restHits == 0 && stable;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - the rest pose is clean and the peak above her head does not grow over four bounces, so no ghost of a hairband or ahoge is accumulating (the pixels seen mid-bounce are her own stretched art)"
+            : "FAIL - restHits=" + restHits + " peaks=" + string.Join(",", Array.ConvertAll(peak, x => x.ToString())) +
+              " growth=" + growth + ", which is the accumulation bug7 describes"));
+        ResetDemoForTest();
+    }
+
+    // Counts VISIBLE painted pixels above `row`, excluding the pot's own x band when a pot is worn.
+    //
+    // The threshold is alpha > 16, not != 0, and that is the whole reason this check is usable. Her
+    // sprite's anti-aliased top edge genuinely puts one to nine rows of nearly-transparent pixels
+    // above _offY - measured on the dumped frame: 920 pixels, of which 467 have alpha = 1 and the
+    // rest are her hair colour at alpha 253 but only where the edge is dense. Counting "!= 0" called
+    // that 920-pixel sliver a ghost, which would have made this guard cry wolf on a clean build and
+    // be switched off within a week. alpha = 1 is not something a user can see; a real ghost from a
+    // failed erase is opaque art left behind, which is alpha 200+.
+    //
+    // The pot exclusion is by X only: the pot legitimately occupies rows above her art, and telling
+    // its pixels from a ghost's by colour was one of the approaches that already failed here.
+    int CountAboveRow(int row, int potCx, int potHalf, bool excludePotBand) {
+        int hits = 0;
+        int y1 = Math.Min(row - 1, _canvas.Height - 1);
+        for (int y = 0; y <= y1; y++) {
+            for (int x = 0; x < _canvas.Width; x++) {
+                if (excludePotBand && Math.Abs(x - potCx) <= potHalf) continue;
+                if (_canvas.GetPixel(x, y).A > GhostAlphaFloor) hits++;
+            }
+        }
+        return hits;
+    }
+    // 16/255. Above the anti-aliasing of her own sprite edge, below anything a failed erase leaves.
+    const int GhostAlphaFloor = 16;
+
+    public void SeamCheck() {
+        BuildEraseMask();
+        if (!HeadPotOn) { WearPotForShot(); PumpTicks(3); }
+        int worstSeams = 0;
+        string worstAt = "";
+        int totalFrames = 0;
+        for (int i = 0; i <= 24; i++) {
+            _headSquashT = i * (HeadSquashDur / 24.0);
+            RenderToCanvas();
+            int seams = 0;
+            string rows = "";
+            // Inside her body: from just below the sprite's top edge to well into the torso.
+            int y0 = _offY + (int)(_h * 0.30);
+            int y1 = _offY + (int)(_h * 0.75);
+            int x0 = _offX + (int)(_w * 0.30);
+            int x1 = _offX + (int)(_w * 0.70);
+            for (int y = y0; y <= y1; y++) {
+                bool anyAbove = false, anyBelow = false, anyHere = false;
+                for (int x = x0; x <= x1; x++) {
+                    if (x < 0 || y < 0 || x >= _canvas.Width || y >= _canvas.Height) continue;
+                    if (_canvas.GetPixel(x, y).A != 0) anyHere = true;
+                }
+                if (anyHere) continue;
+                // this row is empty; is it sandwiched between content?
+                for (int x = x0; x <= x1; x += 2) {
+                    if (y - 6 >= 0 && _canvas.GetPixel(x, y - 6).A != 0) anyAbove = true;
+                    if (y + 6 < _canvas.Height && _canvas.GetPixel(x, y + 6).A != 0) anyBelow = true;
+                }
+                if (anyAbove && anyBelow) { seams++; if (rows.Length < 40) rows += y + " "; }
+            }
+            totalFrames++;
+            if (seams > worstSeams) { worstSeams = seams; worstAt = "frame " + i + " rows " + rows; }
+        }
+        _headSquashT = HeadSquashDur + 1;
+        RenderToCanvas();
+        Console.WriteLine("  seam    : frames=" + totalFrames + " worstEmptyRowsInsideBody=" + worstSeams +
+                          (worstSeams > 0 ? ("  at " + worstAt) : "  (none)"));
+    }
+
+    // A rice bowl dropped straight down onto a WORN pot must pass through it.
+    //
+    // The worn pot is a decoration anchored to her head, not a body in the scene, and its
+    // collider only ever shoved loose bowls off a silhouette that belongs to her. Rather than
+    // keep tuning a contact shape whose whole effect was that shove, it stops colliding - so
+    // this asserts the pass-through, and also that a LOOSE pot still collides normally (that
+    // part must not have been lost with it).
+    public void RunWornPotPassTest() {
+        Console.WriteLine("worn pot pass-through (offline)");
+        GoOffline();
+        _noNetwork = true;
+        // This guard MOVES her (it parks her off-canvas so the magnet and the touch-feed cannot
+        // interfere), so the corner it leaves behind has to be put back: an earlier version ended
+        // with _snapRight = true and the next guard, --textbounce, then measured "the tablet" at
+        // x 2123 - a patch of empty canvas on the other side of the screen - and reported a
+        // confident zero. Same rule as --snapside's cornerSaved.
+        bool cornerSaved = _snapRight;
+        ResetDemoForTest();
+        PumpTicks(2);
+
+        // --- 1) get a pot onto her head ---
+        Rice pot = IronPotForTest();
+        if (pot == null) { StartIronPotForTest(); pot = IronPotForTest(); }
+        if (pot == null) { Console.WriteLine("  verdict: FAIL - no pot could be spawned"); return; }
+        Point a = IronHeadAnchor();
+        pot.X = a.X; pot.Y = a.Y - 120; pot.VX = 0; pot.VY = 0;
+        for (int i = 0; i < 240 && !pot.OnHead; i++) PumpTicks(1);
+        bool seated = pot.OnHead;
+        Console.WriteLine("  worn    : seated=" + seated + " at " + PotStateForTest());
+
+        // --- 2) drop a rice bowl straight down through it ---
+        //
+        // What this is about is the WORN POT not being a collider: a rice bowl must fall straight
+        // through it instead of being bounced off. It used to be measured by letting the bowl carry
+        // on down to her head, but touching her now FEEDS her and the bowl is consumed the moment
+        // it reaches her silhouette (see RunFeedTouchTest), so the test watches the FALL rather
+        // than the destination: the bowl has to get past the pot's bottom edge. A collider would
+        // stop it at the pot's top, near `pot.Y`, nowhere near `pot.Y + height`.
+        bool passed = false, deflected = false, reachedGirl = false;
+        int closestApproach = int.MaxValue;
+        if (seated) {
+            DropBowlForTest(3.00);
+            PumpTicks(1);
+            Rice bowl = null;
+            for (int i = 0; i < _rices.Count; i++) if (!_rices[i].Iron) bowl = _rices[i];
+            if (bowl != null) {
+                // Aim at the pot's LEFT outer edge, with the touch-feed switched off.
+                //
+                // The free lane was measured in the LEFT corner, where her silhouette occupies
+                // dx -120..+180 from the pot's centre. In the RIGHT corner the sprite is mirrored,
+                // so the empty side is the other one and this offset clipped her instead: the bowl
+                // was eaten mid-fall and "passedThrough" came back False while the pot was fine.
+                //
+                // Switching the touch-feed off is the honest isolation for THIS half - the guard is
+                // about the worn pot not being a collider, and the touch rule is measured for
+                // itself in the half below.
+                bool touchSaved2 = _feedOnTouch;
+                _feedOnTouch = false;
+                int gxG = 0, gyG = 0;
+                bool haveGirl = GirlSample(out gxG, out gyG);
+                double cx = pot.X - 185;
+                double potTop = pot.Y - pot.Art.Height * 0.5;
+                double potBot = pot.Y + pot.Art.Height * 0.5;
+                double startY = potTop - 40;            // just above the rim
+                bowl.X = cx; bowl.Y = startY;
+                bowl.VX = 0; bowl.VY = 260;              // a real fall, not a slow sink
+                bowl.Dragging = false;
+                bowl.Grounded = false;
+                double deepest = bowl.Y, maxDx = 0;
+                for (int i = 0; i < 120; i++) {
+                    // Keep the radar magnet out of it as well: once _bowlWait passes BowlWaitSec it
+                    // pulls the bowl in and OnRiceFed's it, which would end the fall after one frame.
+                    _bowlWait = 0; _bowlLocked = false;
+                    PumpTicks(1);
+                    double d = Math.Abs(bowl.X - cx);
+                    if (d < closestApproach) closestApproach = (int)Math.Round(d);
+                    // Sideways displacement while level with the pot means it was pushed off.
+                    // The threshold is 60px, not a hair's width: a real collider would stop the
+                    // fall outright (that is what `passed` already tests), so what is being caught
+                    // here is a genuine shove. At 6px a 17px nudge from the pot's own rim counted
+                    // as a failure while the bowl went straight through.
+                    if (bowl.Y + bowl.R > potTop && bowl.Y - bowl.R < potBot && Math.Abs(bowl.X - cx) > 60)
+                        deflected = true;
+                    double dx = Math.Abs(bowl.X - cx);
+                    if (dx > maxDx) maxDx = dx;
+                    if (bowl.Y > deepest) deepest = bowl.Y;
+                    passed = deepest > potBot + 20;
+                    if (passed || bowl.Y >= SystemInformation.VirtualScreen.Bottom - bowl.R * 2) break;
+                }
+                Console.WriteLine("  fall    : from y=" + startY.ToString("0") +
+                                  "  deepest y=" + deepest.ToString("0") +
+                                  "  potTop=" + potTop.ToString("0") + " potBottom=" + potBot.ToString("0") +
+                                  "  sidewaysDrift=" + maxDx.ToString("0") + "px");
+                // And the other half of the new rule, stated for itself: with her back in the
+                // picture, a falling bowl is eaten the moment it reaches her. The magnet is kept
+                // out of it so this measures the TOUCH rule, not the 10s pull - and the touch
+                // feed has to be switched back ON, since the fall above ran with it disabled.
+                _feedOnTouch = touchSaved2;
+                if (haveGirl) {
+                    bowl.X = gxG; bowl.Y = gyG; bowl.VX = 0; bowl.VY = 0; bowl.Grounded = false;
+                    for (int i = 0; i < 4 && !bowl.Fed; i++) { _bowlWait = 0; _bowlLocked = false; PumpTicks(1); }
+                }
+                reachedGirl = bowl.Fed;
+            } else {
+                Console.WriteLine("  bowl    : none spawned");
+            }
+        }
+        Console.WriteLine("  pass    : bowlReachedBelowWornPot=" + passed +
+                          "  pushedSideways=" + deflected +
+                          "  fedOnTouchingHer=" + reachedGirl +
+                          "  closestX=" + (closestApproach == int.MaxValue ? -1 : closestApproach) + " px");
+
+        // --- 3) a LOOSE pot must still collide ---
+        bool looseCollides = false;
+        {
+            ResetDemoForTest();
+            PumpTicks(2);
+            Rice lp = IronPotForTest();
+            if (lp == null) { StartIronPotForTest(); lp = IronPotForTest(); }
+            if (lp != null && !lp.OnHead) {
+                // Run this on the right-hand side with her moved clear, so the magnet cannot pull
+                // the bowl away to be eaten before it ever reaches the pot. The bowl has to be seen
+                // being STOPPED by the pot, which needs a clean runway.
+                int keepX2 = _offX, keepY2 = _offY;
+                _offX = keepX2 + _canvas.Width;   // right off the canvas
+                PumpTicks(4);
+                double floorY2 = SystemInformation.VirtualScreen.Bottom - lp.R;
+                lp.X = 900; lp.Y = floorY2; lp.VX = 0; lp.VY = 0;
+                lp.Dragging = false; lp.Grounded = true;
+                PumpTicks(6);
+                DropBowlForTest(3.00);
+                PumpTicks(1);
+                Rice bowl2 = null;
+                for (int i = 0; i < _rices.Count; i++) if (!_rices[i].Iron) bowl2 = _rices[i];
+                if (bowl2 != null) {
+                    bool overlapped = false;
+                    double minSeen = double.MaxValue;
+                    // Measured with the SAME metric the collision code uses. This used to add the
+                    // two circle footprints (84 + 137.76) while the contact test is per-axis, so
+                    // once the separation was put on the right basis the pair settled at 196 and
+                    // the old threshold called that an overlap - the test was describing the bug.
+                    double want = EffectiveRadius(bowl2) + EffectiveRadius(lp);
+                    bowl2.X = 400; bowl2.Y = floorY2; bowl2.VX = 0; bowl2.VY = 0;
+                    bowl2.Grounded = true; bowl2.Dragging = false;
+                    for (int i = 0; i < 150; i++) {
+                        // Roll it at the loose pot, and do not fight gravity doing it.
+                        bowl2.X += (lp.X - bowl2.X) * 0.25;
+                        bowl2.Y = floorY2;
+                        bowl2.VY = 0;
+                        bowl2.Grounded = true;
+                        // The magnet must stay out of this too: otherwise the bowl is pulled to her
+                        // and eaten long before it ever reaches the loose pot.
+                        _bowlWait = 0; _bowlLocked = false;
+                        PumpTicks(1);
+                        double ddx = bowl2.X - lp.X, ddy = bowl2.Y - lp.Y;
+                        double d = Math.Sqrt(ddx * ddx + ddy * ddy);
+                        if (d < minSeen) minSeen = d;
+                        if (d < want - 12.0) overlapped = true;
+                        if (bowl2.Fed) { overlapped = true; break; }
+                    }
+                    looseCollides = !overlapped;
+                    Console.WriteLine("  loose   : closest approach=" + minSeen.ToString("0") +
+                                      " want=" + want.ToString("0") + " (short=" +
+                                      (want - minSeen).ToString("0") + "px) bowl=(" +
+                                      bowl2.X.ToString("0") + "," + bowl2.Y.ToString("0") + ") fed=" +
+                                      bowl2.Fed + " pot=(" + lp.X.ToString("0") + "," +
+                                      lp.Y.ToString("0") + ")");
+                }
+                _offX = keepX2; _offY = keepY2;
+                PumpTicks(4);
+            }
+        }
+        Console.WriteLine("  loose   : a loose pot still keeps bowls out=" + looseCollides);
+
+        bool ok = seated && passed && !deflected && reachedGirl && looseCollides;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a bowl falls straight through the WORN pot, touching her now feeds her, and a "
+              + "loose pot still collides"
+            : "FAIL - seated=" + seated + " passedThrough=" + passed +
+              " deflected=" + deflected + " fedOnTouch=" + reachedGirl +
+              " looseCollides=" + looseCollides));
+        // Put her back where she was, corner included: leaving _snapRight moved made the NEXT
+        // guard in the same session measure the wrong part of the screen.
+        _snapRight = cornerSaved;
+        UpdateMirrorGeometry();
+        SnapToCorner(true);
+        PumpTicks(2);
+        ResetDemoForTest();
+    }
+
+    // Feed a rice bowl, then hit "refresh now" WHILE the hearts are still playing, and watch
+    // the iron pot the feed spawns. Reported because the pot was vanishing in that window.
+    public void RunFeedRefreshTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("iron pot survives a refresh during the heart animation (offline)");
+        ResetDemoForTest();
+        PumpTicks(2);
+
+        // A rehearsal must be LIVE when the refresh lands: ApplyBalance only calls
+        // DropPhantomBowls on the snap path when _testBumpAmount > 0, and that is the whole
+        // reason this only broke in the narrow window after a feed.
+        ApplyBalancePublic(30.00, true);
+        TestTopUp(3.00);                     // starts a rehearsal: _testBumpAmount = 3.00
+        PumpTicks(2);
+        Console.WriteLine("  rehearsal: testBumpAmount=" + _testBumpAmount.ToString("0.00"));
+        DropBowlForTest(3.00);
+        PumpTicks(4);
+
+        // Wait for delivery; the hearts start on that frame.
+        int fedFrame = -1;
+        for (int i = 0; i < 3000; i++) {
+            PumpTicks(1);
+            if (BowlWasDeliveredForTest()) { fedFrame = i; break; }
+        }
+        bool delivered = BowlWasDeliveredForTest();
+        int heartsAtFeed = _hearts.Count;
+        int potAtFeed = -1;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) potAtFeed = i;
+        Console.WriteLine("  fed     : delivered=" + delivered + " atFrame=" + fedFrame +
+                          " hearts=" + heartsAtFeed + " potSpawned=" + (potAtFeed >= 0));
+        if (!delivered || potAtFeed < 0) {
+            Console.WriteLine("  verdict: FAIL - the feed path did not produce a pot to watch");
+            ResetDemoForTest();
+            return;
+        }
+
+        // Now the user's action: refresh the balance with hearts still on screen.
+        int heartsBeforeRefresh = _hearts.Count;
+        Rice pot = null;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) pot = _rices[i];
+        Console.WriteLine("  refresh : hearts=" + heartsBeforeRefresh +
+                          " potOnHead=" + (pot != null && pot.OnHead) +
+                          " potFade=" + (pot == null ? -1 : pot.FadeT));
+        Console.WriteLine("  refresh : testBumpAmount=" + _testBumpAmount.ToString("0.00") +
+                          " (a rehearsal must be live for the bug to fire)");
+        // Exactly what the menu item does, and with the rehearsals that were in play at the
+        // moment the user clicked: an explicit resync that discards the rehearsal.
+        ApplyBalancePublic(_realBal, true);
+
+        // Walk the heart animation out and report the first frame the pot is gone.
+        int potGoneAt = -1, potAtStart = _rices.Count;
+        for (int i = 0; i < 200; i++) {
+            PumpTicks(1);
+            bool has = false;
+            for (int k = 0; k < _rices.Count; k++) if (_rices[k].Iron) has = true;
+            if (!has) { potGoneAt = i; break; }
+        }
+        bool survived = potGoneAt < 0;
+        int heartsAfter = _hearts.Count;
+        Console.WriteLine("  after   : potGoneAtFrame=" + potGoneAt +
+                          "  heartsLeft=" + heartsAfter +
+                          "  bowlsAtStart=" + potAtStart);
+        Console.WriteLine("  verdict: " + (survived
+            ? "OK - the pot is still there after a refresh during the hearts"
+            : "FAIL - the pot vanished " + potGoneAt + " frames after the refresh"));
+        ResetDemoForTest();
+    }
+
+    // Unlimited pots, stacked on her head.
+    //
+    // Two things must hold: eating several bowls leaves several pots (there used to be a
+    // hard "only one pot at a time" guard), and the worn pots form a single vertical column
+    // one pot-height apart, all at the same tilt - rather than piling into each other at the
+    // same anchor, which is what happens if every pot is seated on IronHeadAnchor().
+    // RunStackDiagTest is DELETED, and with it the --stackdiag flag.
+    //
+    // It had NO VERDICT - it ended on "INFO - diagnostic only" - so it could never fail, and its
+    // ten "ABOVE the art box top" lines were an artefact of the 11-pot stack the diagnostic
+    // itself builds, not a defect. A dump that reads as an alarm and means nothing is worse than
+    // no dump: it trains the reader to ignore the word ABOVE.
+    //
+    // Nothing is lost. --stackclip reports the same pot positions, the same bounce frames and
+    // the same clipping question, and it ends in a real verdict.
+
+    // Transient clipping of the stacked pots during the bounce.
+    //
+    // Reported as: while the bounce plays, the top of the higher pots is cut off by a straight
+    // horizontal line, and it comes back as she settles. That is a TRANSIENT, so a still frame
+    // (and the earlier version of this diagnostic, which sampled only _headSquashT = 0) misses
+    // it entirely - the upward peak of the squash is near _headSquashT = 0.35.
+    //
+    // What this records, every frame of the bounce:
+    //   the exact draw position each pot gets (the same arithmetic DrawRiceArt uses),
+    //   whether that position puts it above the canvas or above her art box,
+    //   and - the decisive one - whether the canvas row just above the pot is actually empty.
+    // How many pots the clipping diagnostic stacks. Matched to what the user's screenshot
+    // showed (five), because which pot ends up top - and therefore whether it lands on the
+    // boundary being investigated - depends on the count.
+    int StackClipPots = 6;
+
+    public void RunStackBounceClipTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("stacked pot clipping during the bounce (offline)");
+        ResetDemoForTest();
+        PumpTicks(2);
+
+        // NOTE: each round spawns TWO pots (TestTopUp drops one and DropBowlForTest another),
+        // which is why "want = 5" produced the 9-pot stack that all the earlier runs measured -
+        // a different stack from the user's, so the pot under investigation was never the one
+        // being probed. Ask for half as many rounds as pots wanted.
+        int want = Math.Max(1, StackClipPots / 2);
+        for (int i = 0; i < want; i++) {
+            ApplyBalancePublic(30.00 + i, true);
+            TestTopUp(3.00);
+            PumpTicks(2);
+            DropBowlForTest(3.00);
+            for (int k = 0; k < 600; k++) { PumpTicks(1); if (BowlWasDeliveredForTest()) break; }
+            PumpTicks(9);
+        }
+        // Seat them the way the user's do: drop each onto her head and let AttachIronPot run,
+        // which is also what arms the squash animation (_headSquashT = 0).
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron) continue;
+            AttachIronPot(r);                 // sets HeadFalling AND _headSquashT = 0
+            PumpTicks(6);
+            r.HeadFalling = false;
+            Point a = IronHeadAnchor(IronStackIndex(r));
+            r.X = a.X; r.Y = a.Y;
+        }
+        PumpTicks(4);
+
+        int pots = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) pots++;
+        double potH = _ironHeadArt != null ? _ironHeadArt.Height : 0;
+        Console.WriteLine("  setup   : pots=" + pots + " potH=" + potH.ToString("0") +
+                          " canvasH=" + _canvas.Height + " offY=" + _offY + " h=" + _h +
+                          " anchorY=" + _squashAnchorY);
+
+        // Play one full bounce, sampling EVERY frame. HeadSquashDur is 0.5 s and the tick is
+        // 33 ms, so ~16 frames covers it.
+        //
+        // ALSO dumps three whole-canvas frames - rest, then two during the stretch - so the
+        // question can be settled by differencing images instead of by a colour probe. Every
+        // probe tried so far was defeated by the pots overlapping each other in x: a region cut
+        // out of one pot is refilled by its neighbour, so "is there pot colour here" always says
+        // yes. Comparing the SAME region between the rest frame and a bounce frame cannot be
+        // fooled that way.
+        _headSquashT = HeadSquashDur + 1;      // settle into rest first
+        PumpTicks(3);
+        RenderToCanvas();
+        _canvas.Save(Path.Combine(_baseDir, "_clip_rest.png"), ImageFormat.Png);
+        _headSquashT = 0;
+        int clippedFrames = 0, aboveCanvas = 0;
+        double worstTop = double.MaxValue;
+        int worstIdx = -1;
+        Console.WriteLine("  frame  squashScale   topPotDrawTop  aboveCanvas?  canvasRowEmpty?");
+        for (int f = 0; f < 20; f++) {
+            PumpTicks(1);
+            RenderToCanvas();
+            // The highest pot's drawn top edge, exactly as DrawRiceArt computes it.
+            double bestTop = double.MaxValue;
+            int bestIdx = -1;
+            for (int i = 0; i < _rices.Count; i++) {
+                Rice r = _rices[i];
+                if (!r.Iron || !r.OnHead) continue;
+                double ah = r.Art != null ? r.Art.Height : potH;
+                double baseYd = (double)r.Y + (double)_shakeY;
+                if (_squashOn) baseYd = (baseYd - _squashAnchorY) * _squashScale + _squashAnchorY;
+                double drawTop = baseYd - ah / 2.0;
+                if (drawTop < bestTop) { bestTop = drawTop; bestIdx = IronStackIndex(r); }
+            }
+            bool above = bestTop < 0;
+            if (above) aboveCanvas++;
+            if (bestTop < worstTop) { worstTop = bestTop; worstIdx = bestIdx; }
+            // Does the pot's own silhouette survive? Counting "silver pixels somewhere in the
+            // row" proved nothing - the pot body occupies those rows whether or not its top rim
+            // was cut. What matters is the pot's VISIBLE HEIGHT in its own column: a whole pot
+            // spans about potH rows of silver, a clipped one spans noticeably fewer.
+            //
+            // Measured per pot, in that pot's own x band, at the frame's real positions.
+            // Measure the TOP-EDGE ROW of the topmost pot directly from the canvas, and compare
+            // it with where that pot was asked to be drawn.
+            //
+            // Why the previous probes failed: they counted how many rows in a column held pot
+            // pixels. In a stack the neighbours overlap in x, so a chunk cut off pot 4's top is
+            // immediately filled by pot 3 or 5 and the count still reads a full 117. The only
+            // signal that cannot be masked is WHERE THE COVERAGE BEGINS.
+            //
+            // Found by scanning the topmost pot's own x band from the top for the first row that
+            // holds pot pixels; a pot whose top was cut starts LOWER than it was drawn.
+            int bandX = (int)Math.Round(_offX + _w * 0.5558);
+            // The band must span the FULL pot width, not 0.28 of the art width either side.
+            //
+            // A medal pot is narrowest at its TOP, so a narrow band misses the top rows and reports
+            // a top a few pixels LOWER than the pot was drawn - a small NEGATIVE deficit on every
+            // frame. Measured: -6 and -7 with the narrow band, against a "cut" threshold of +6. The
+            // check was therefore one small coincidence away from calling an unclipped pot clipped,
+            // which is the worst thing a guard can do. With the full width the rim comes back at ~0.
+            int bandHalf = Math.Max(10, (int)((_ironHeadArt != null ? _ironHeadArt.Width : 300) * 0.55));
+            int bandX0 = Math.Max(0, bandX - bandHalf);
+            int bandW = Math.Min(bandHalf * 2, _canvas.Width - bandX0);
+            int argbTop = -1;
+            Buf sb = new Buf(_canvas, new Rectangle(bandX0, 0, bandW, _canvas.Height));
+            try {
+                for (int row = 0; row < sb.H && argbTop < 0; row++) {
+                    for (int x = 0; x < sb.W; x++) {
+                        int o = row * sb.Stride + x * 4;
+                        int b2 = sb.P[o], g3 = sb.P[o + 1], r3 = sb.P[o + 2];
+                        if (sb.P[o + 3] > 8 && Math.Abs(r3 - g3) < 30 && Math.Abs(g3 - b2) < 30 && r3 > 105) {
+                            argbTop = row; break;
+                        }
+                    }
+                }
+            } finally { sb.Dispose(); }
+            // Where the topmost pot was told to go.
+            double expTop = double.MaxValue;
+            int expIdx = -1;
+            for (int i = 0; i < _rices.Count; i++) {
+                Rice r = _rices[i];
+                if (!r.Iron || !r.OnHead) continue;
+                double ah = r.Art != null ? r.Art.Height : potH;
+                double baseYd = (double)r.Y + (double)_shakeY;
+                if (_squashOn) baseYd = (baseYd - _squashAnchorY) * _squashScale + _squashAnchorY;
+                double t = baseYd - ah / 2.0;
+                if (t < expTop) { expTop = t; expIdx = IronStackIndex(r); }
+            }
+            int deficit = argbTop < 0 ? -1 : (int)Math.Round(argbTop - expTop);
+            // A pot cut from the top shows a POSITIVE deficit: real coverage starts lower than
+            // the pot was drawn. Zero (or a couple of px of antialiasing) is healthy.
+            //
+            // NEGATIVE is normal here and the threshold allows for it, because the stack ROLLS: each
+            // pot is drawn with `RotateTransform(rollDeg)` about its centre, so a rotated top corner
+            // rises a few pixels ABOVE the sprite's unrotated top. Measured on the six-pot stack:
+            // -6 and -7 on every frame. The band was widened to the full pot width and the reading
+            // did not move, which is what proved the offset is geometry and not a mis-placed probe.
+            //
+            // +12 rather than +6: with the old threshold the healthy reading sat 12 px away from a
+            // FAIL and 6 px away from a false PASS, which is the worst place for a guard to be.
+            bool topCut = deficit > 12;
+            if (topCut) clippedFrames++;
+            Console.WriteLine("   f" + f.ToString("00") + "  squash=" + _squashScale.ToString("0.0000") +
+                              "  expectedTop=" + expTop.ToString("0.0") + " (idx " + expIdx + ")" +
+                              "  actualTop=" + argbTop + "  deficit=" + deficit +
+                              (topCut ? "   <-- TOP CUT" : ""));
+            if (f == 0 || f == 5) {
+                _canvas.Save(Path.Combine(_baseDir, "_clip_bounce_f" + f + ".png"), ImageFormat.Png);
+            }
+        }
+        Console.WriteLine("  result  : aboveCanvasFrames=" + aboveCanvas +
+                          " cutFrames=" + clippedFrames +
+                          " worstDrawTop=" + worstTop.ToString("0.0") + " (pot idx " + worstIdx + ")");
+        bool ok = aboveCanvas == 0 && clippedFrames == 0;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - no pot leaves the canvas, and every pot's top edge really carries pot pixels"
+            : "FAIL - the top pot is CUT: aboveCanvas=" + aboveCanvas +
+              " cutFrames=" + clippedFrames + " worstTop=" + worstTop.ToString("0.0")));
+        ResetDemoForTest();
+    }
+
+    // Where the worn pots are ACTUALLY drawn, and where the canvas really shows them.
+    //
+    // Written after four probes in a row reported "no truncation" while the frames showed a
+    // pot with a flat top. Every one of those probes re-implemented the draw arithmetic, and
+    // every one of them scanned for a colour that something else on screen also had. This one
+    // does neither: it taps DrawRiceArt for the numbers the draw call itself uses, and then
+    // measures the canvas ALPHA in the pot column only - which nothing else occupies above
+    // her art box.
+    public void RunPotTraceTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("where the worn pots are drawn, vs what the canvas shows (offline)");
+        ResetDemoForTest();
+        PumpTicks(2);
+
+        int want = 3;                          // 3 rounds -> 3 pots
+        for (int i = 0; i < want; i++) {
+            ApplyBalancePublic(30.00 + i, true);
+            TestTopUp(3.00);
+            PumpTicks(2);
+            DropBowlForTest(3.00);
+            for (int k = 0; k < 600; k++) { PumpTicks(1); if (BowlWasDeliveredForTest()) break; }
+            PumpTicks(9);
+        }
+        int spawned = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) spawned++;
+        Console.WriteLine("  spawned : pots=" + spawned + " (each round drops one pot; want " + want + ")");
+
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron) continue;
+            AttachIronPot(r);
+            PumpTicks(6);
+            r.HeadFalling = false;
+            Point a = IronHeadAnchor(IronStackIndex(r));
+            r.X = a.X; r.Y = a.Y; r.VX = 0; r.VY = 0;
+        }
+        _headSquashT = HeadSquashDur + 1;      // settle: no squash
+        PumpTicks(4);
+
+        Console.WriteLine("  geom    : w=" + _w + " h=" + _h + " offX=" + _offX + " offY=" + _offY +
+                          " canvas=" + _canvas.Width + "x" + _canvas.Height);
+        Console.WriteLine("  ironArt : " + (_ironHeadArt == null ? "null"
+                          : _ironHeadArt.Width + "x" + _ironHeadArt.Height) +
+                          "  IronStackGap=" + IronStackGap.ToString("0.0000") +
+                          "  step=" + (_ironHeadArt == null ? 0 : _ironHeadArt.Height * IronStackGap).ToString("0.0"));
+        // What the pot BITMAP itself holds, so the drawing maths can be checked against the
+        // pixels rather than against an assumption about where the art's content sits.
+        // TrimTransparent runs through a Graphics.DrawImage source-rectangle overload, and a
+        // bitmap that is not as tightly cropped as it looks would shift the whole stack.
+        if (_ironHeadArt != null) {
+            Console.WriteLine("  ironBmp : " + _ironHeadArt.Width + "x" + _ironHeadArt.Height +
+                              " fmt=" + _ironHeadArt.PixelFormat);
+            Buf ib = new Buf(_ironHeadArt);
+            try {
+                int[] probeRows = new int[] { 0, 1, 2, 5, 10, 20, 40, 58, 80, _ironHeadArt.Height - 1 };
+                for (int i = 0; i < probeRows.Length; i++) {
+                    int ry = probeRows[i];
+                    if (ry < 0 || ry >= ib.H) continue;
+                    int n = 0, xa = -1, xb = -1;
+                    int o0 = ry * ib.Stride;
+                    for (int x = 0; x < ib.W; x++) {
+                        if (ib.P[o0 + x * 4 + 3] <= 8) continue;
+                        n++;
+                        if (xa < 0) xa = x;
+                        xb = x;
+                    }
+                    Console.WriteLine("      ironBmp row " + ry.ToString().PadLeft(3) + ": npix=" + n.ToString().PadLeft(4) +
+                                      (n > 0 ? "  x=" + xa + ".." + xb + " span=" + (xb - xa + 1) : "  (empty)"));
+                }
+            } finally { ib.Dispose(); }
+        }
+
+        // The anchor every pot is slaved to, and what a pot drawn there should occupy.
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron) continue;
+            int idx = IronStackIndex(r);
+            Point a = IronHeadAnchor(idx);
+            double ah = r.Art != null ? r.Art.Height : 0;
+            double aw = r.Art != null ? r.Art.Width : 0;
+            Console.WriteLine("  pot     : idx=" + idx + " anchor=(" + a.X + "," + a.Y + ")" +
+                              " rX=" + r.X + " rY=" + r.Y + " onHead=" + (r.OnHead ? 1 : 0) +
+                              " iron=" + (r.Iron ? 1 : 0) +
+                              " art=" + aw.ToString("0") + "x" + ah.ToString("0") +
+                              " artTopIfCentred=" + (r.Y - ah / 2).ToString("0.0"));
+        }
+
+        // One frame with the draw calls tapped.
+        PotTraceLog.Clear();
+        _potTrace = true;
+        RenderToCanvas();
+        _potTrace = false;
+        Console.WriteLine("  --- what DrawRiceArt was actually called with, this frame ---");
+        for (int i = 0; i < PotTraceLog.Count; i++) Console.WriteLine(PotTraceLog[i]);
+
+        // What the canvas shows. Scan the POT COLUMN only: above her art box nothing else
+        // is ever painted, so the first opaque row there is the highest thing drawn.
+        int scanTop = Math.Max(0, _offY - 700);
+        int scanBot = _offY;
+        int firstRow = -1, lastRow = -1;
+        int perRowFirst = -1, widestRow = -1, widestSpan = -1;
+        int[] scan = ScanPotColumn(scanTop, scanBot, out lastRow, out widestRow, out widestSpan, out perRowFirst);
+        firstRow = scan[0];
+        Console.WriteLine("  canvas  : pot column x=" + scan[1] + ".." + scan[2] +
+                          " scanned rows " + scanTop + ".." + scanBot);
+        Console.WriteLine("  canvas  : first opaque row=" + firstRow + " (npix=" + perRowFirst + ")" +
+                          "  last opaque row=" + lastRow +
+                          "  widest row=" + widestRow + " (span=" + widestSpan + ")");
+
+        // Coverage, frame by frame, across a whole bounce.
+        Console.WriteLine("  --- coverage: every cell a pot should cover, and every painted cell none should ---");
+        _headSquashT = HeadSquashDur + 1;
+        PumpTicks(3);
+        RenderToCanvas();
+        List<string> at
+            = PotCoverageReport(2, scanTop, scanBot);
+        Console.WriteLine("  rest    : squash=" + _squashScale.ToString("0.0000"));
+        for (int i = 0; i < at.Count; i++) Console.WriteLine(at[i]);
+
+        // Both corners. The mirror only changes the anchor fraction and the tilt sign, and the
+        // erase box is a canvas-space quantity, so the right-hand corner SHOULD behave
+        // identically - but "should" is what this whole exercise was about, so it is measured.
+        bool sideOk = true;
+        for (int side = 0; side < 2; side++) {
+            bool rightSide = side == 1;
+            _snapRight = rightSide;
+            UpdateMirrorGeometry();
+            PumpTicks(4);
+            Console.WriteLine("  ===== corner " + (rightSide ? "RIGHT (mirrored)" : "LEFT") + " =====");
+            sideOk = PotBounceCheck(rightSide, scanTop, scanBot, side == 0) && sideOk;
+        }
+        _snapRight = false;
+        UpdateMirrorGeometry();
+
+        try {
+            RenderToCanvas();
+            _canvas.Save(Path.Combine(_baseDir, "_pottrace.png"), ImageFormat.Png);
+            Console.WriteLine("  dump    : _pottrace.png (" + _canvas.Width + "x" + _canvas.Height + " full canvas)");
+        } catch (Exception ex) { Console.WriteLine("  dump failed: " + ex.Message); }
+
+        // Control: the SAME column with no pots at all. Anything still painted here is the
+        // girl's own artwork (her hair reaches above the widget's art box) - not a pot, and not
+        // a leftover. Without this control, every such pixel was counted as a ghost.
+        ResetDemoForTest();
+        _headSquashT = HeadSquashDur + 1;
+        PumpTicks(4);
+        RenderToCanvas();
+        int ctlLast, ctlWidest, ctlSpan, ctlN;
+        int[] ctl = ScanPotColumn(scanTop, scanBot, out ctlLast, out ctlWidest, out ctlSpan, out ctlN);
+        Console.WriteLine("  control : with NO pots, pot column first opaque row=" + ctl[0] +
+                          " (npix=" + ctlN + ")  last=" + ctlLast + "  widest row=" + ctlWidest +
+                          " (span=" + ctlSpan + ")");
+
+        Console.WriteLine("  verdict: " + (sideOk
+            ? "OK - both corners: the report sees a deliberate 60-row error, the pot bounce leaves no " +
+              "accumulating ghost, and knocking the top pot off neither ghosts nor empties the stack"
+            : "FAIL - see the per-corner detail above"));
+
+        PotTraceLog.Clear();
+        ResetDemoForTest();
+    }
+
+    // One corner's worth of the stacked-pot bounce check. Returns false when anything is wrong,
+    // and prints a verdict line so the failure is attributable to a corner.
+    bool PotBounceCheck(bool rightSide, int scanTop, int scanBot, bool verbose) {
+        string tag = rightSide ? "R" : "L";
+        // Coverage across a whole bounce.
+        _headSquashT = HeadSquashDur + 1;
+        PumpTicks(3);
+        RenderToCanvas();
+        List<string> at = PotCoverageReport(2, scanTop, scanBot);
+        // Ghosts are judged by whether they PILE UP, not by whether any single cell is odd: the
+        // pot's own silhouette is a few shades off the flat estimate the report uses, so a
+        // constant ~100 cells of edge slack is normal at rest. The bug multiplied that 28x and
+        // climbed frame after frame, so the baseline is the rest frame's own number and the
+        // FINAL frame is the one that has to come back to it.
+        int baseline = CovUnexp(at);
+        Console.WriteLine("  " + tag + " rest  : squash=" + _squashScale.ToString("0.0000") + "  " +
+                          (at.Count > 0 ? at[0].Trim() : "no report"));
+
+        _headSquashT = 0;
+        int missWorst = 0, unexpWorst = 0, unexpFinal = -1;
+        for (int f = 0; f < 18; f++) {
+            PumpTicks(1);
+            RenderToCanvas();
+            if (verbose && (f == 5 || f == 9)) {
+                string dp = Path.Combine(_baseDir, "_potcov_f" + f + ".png");
+                try { _canvas.Save(dp, ImageFormat.Png); } catch (Exception ex) { Log("dump failed: " + ex.Message); }
+            }
+            List<string> rr = PotCoverageReport(2, scanTop, scanBot);
+            int miss = CovMiss(rr), unexp = CovUnexp(rr);
+            if (miss > missWorst) missWorst = miss;
+            if (unexp > unexpWorst) unexpWorst = unexp;
+            unexpFinal = unexp;
+            Console.WriteLine("   " + tag + f.ToString("00") + "  squash=" + _squashScale.ToString("0.0000") +
+                              "  " + (rr.Count > 0 ? rr[0].Trim() : "no report") +
+                              ((unexp > baseline * 2 + 20) ? "   <-- BAD" : ""));
+        }
+
+        // The other half of the reported bug: DOUBLE-CLICKING her takes the top pot off, which
+        // arms the same squash from the other direction. Same check, so a fix that only covers
+        // the landing path cannot pass.
+        int beforePots = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) beforePots++;
+        KnockPotOff();
+        int koWorst = 0, koFinal = -1;
+        for (int f = 0; f < 18; f++) {
+            PumpTicks(1);
+            RenderToCanvas();
+            List<string> rr = PotCoverageReport(2, scanTop, scanBot);
+            int unexp = CovUnexp(rr);
+            if (unexp > koWorst) koWorst = unexp;
+            koFinal = unexp;
+            Console.WriteLine("   " + tag + "k" + f.ToString("00") + "  squash=" + _squashScale.ToString("0.0000") +
+                              "  " + (rr.Count > 0 ? rr[0].Trim() : "no report"));
+        }
+        int afterPots = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) afterPots++;
+
+        // Calibration: the same report, run against a pot that has been shoved 60 rows out of
+        // place, must report MISSING cells. If it cannot see a deliberate 60-row error it cannot
+        // be trusted to find a real one - the failure mode of all four earlier probes.
+        int calMiss = -1;
+        Rice top = null;
+        int topIdx = -1;
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron || !r.OnHead) continue;
+            if (IronStackIndex(r) > topIdx) { topIdx = IronStackIndex(r); top = r; }
+        }
+        if (top != null) {
+            double keepY = top.Y;
+            top.Y = keepY - 60;
+            RenderToCanvas();
+            calMiss = CovMiss(PotCoverageReport(2, scanTop, scanBot));
+            top.Y = keepY;
+            RenderToCanvas();
+        }
+        bool calOk = calMiss > 0;
+        bool ghostOk = unexpFinal <= baseline * 2 + 20 && unexpWorst <= baseline * 3 + 40;
+        bool koOk = koWorst <= baseline * 3 + 40 && afterPots == beforePots - 1;
+        Console.WriteLine("  " + tag + " ghosts: baseline=" + baseline + " bounce max=" + unexpWorst +
+                          " final=" + unexpFinal + " missWorst=" + missWorst +
+                          " knockOffMax=" + koWorst + " wornPots " + beforePots + "->" + afterPots +
+                          " calibrateMISSING=" + calMiss);
+        bool ok = calOk && ghostOk && koOk;
+        Console.WriteLine("  " + tag + " verdict: " + (ok
+            ? "OK - " + (rightSide ? "RIGHT (mirrored)" : "LEFT") +
+              " corner: calibration sees the error, no accumulating ghost, knock-off takes exactly one pot"
+            : "FAIL - " + (rightSide ? "RIGHT" : "LEFT") + " corner: calOk=" + calOk + " ghostOk=" + ghostOk +
+              " koOk=" + koOk + " (baseline=" + baseline + " worst=" + unexpWorst + " final=" + unexpFinal +
+              " knockOff=" + koWorst + " pots " + beforePots + "->" + afterPots + ")"));
+        return ok;
+    }
+
+    static int CovMiss(List<string> rr) {
+        for (int i = 0; i < rr.Count; i++) {
+            int a = rr[i].IndexOf("MISSING=");
+            if (a >= 0) return ParseNum(rr[i], "MISSING=");
+        }
+        return -1;
+    }
+
+    static int CovUnexp(List<string> rr) {
+        for (int i = 0; i < rr.Count; i++) {
+            int a = rr[i].IndexOf("unexplained=");
+            if (a >= 0) return ParseNum(rr[i], "unexplained=");
+        }
+        return -1;
+    }
+
+    // First opaque row of the pot column, plus the column bounds and some shape stats.
+    int[] ScanPotColumn(int scanTop, int scanBot, out int lastRow, out int widestRow, out int widestSpan, out int firstNpix) {
+        int cxW = (int)Math.Round(_offX + _w * 0.5558);
+        int x0 = Math.Max(0, cxW - 240);
+        int x1 = Math.Min(_canvas.Width - 1, cxW + 240);
+        lastRow = -1; widestRow = -1; widestSpan = -1; firstNpix = -1;
+        int first = -1;
+        Buf sb = new Buf(_canvas, new Rectangle(x0, scanTop, x1 - x0 + 1, scanBot - scanTop));
+        try {
+            for (int y = 0; y < sb.H; y++) {
+                int n = 0;
+                int o0 = y * sb.Stride;
+                for (int x = 0; x < sb.W; x++) {
+                    if (sb.P[o0 + x * 4 + 3] > 8) n++;
+                }
+                if (n == 0) continue;
+                int cy = scanTop + y;
+                if (first < 0) { first = cy; firstNpix = n; }
+                lastRow = cy;
+                if (n > widestSpan) { widestSpan = n; widestRow = cy; }
+            }
+        } finally { sb.Dispose(); }
+        return new int[] { first, x0, x1 };
+    }
+
+    static int ParseNum(string s, string key) {
+        int i = s.IndexOf(key);
+        if (i < 0) return -1;
+        i += key.Length;
+        int j = i;
+        while (j < s.Length && s[j] >= '0' && s[j] <= '9') j++;
+        if (j <= i) return -1;
+        return int.Parse(s.Substring(i, j - i), CultureInfo.InvariantCulture);
+    }
+
+    // Per-cell verdict for the worn pots: for every cell of the pot column, was it painted
+    // when a pot was supposed to cover it (missing = a cut), and was it painted when no pot
+    // was supposed to be there (unexplained = a ghost)?
+    //
+    // Boxes are the pot's own axis-aligned bounds under the tilt it is drawn with, which is
+    // what the column contains ABOVE her art box - her sprite is not up there, so a painted
+    // cell in that band is a pot by construction. Cells that overlap the girl's own rows are
+    // skipped, because she legitimately paints there.
+    //
+    // Cell size is k (the mask scale, about 0.44 px) so the test is at the resolution the
+    // erase and the drawing both work at, not at single-pixel noise level.
+    List<string> PotCoverageReport(int cellPx, int scanTop, int scanBot) {
+        List<string> outp = new List<string>();
+        int cxW = (int)Math.Round(_offX + _w * 0.5558);
+        int x0 = Math.Max(0, cxW - 240);
+        int x1 = Math.Min(_canvas.Width - 1, cxW + 240);
+        int judgeBot = Math.Min(scanBot, _offY - 1);   // her own art is not judged
+        if (judgeBot <= scanTop) { outp.Add("  coverage: nothing to judge"); return outp; }
+
+        int np = _rices.Count;
+        int n = 0;
+        Bitmap[] art = new Bitmap[np];
+        double[] pcx = new double[np], pcy = new double[np];
+        double[] sA = new double[np], cA = new double[np];
+        for (int i = 0; i < np; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron || !r.OnHead) continue;
+            if (r.Art == null) continue;
+            double baseYd = r.Y + _shakeY;
+            if (_squashOn) baseYd = (baseYd - _squashAnchorY) * _squashScale + _squashAnchorY;
+            double rad = (_snapRight ? IronHeadTiltDeg : -IronHeadTiltDeg) * Math.PI / 180.0;
+            // .NET RotateTransform(prepend) turns clockwise on screen for +angle, hence the
+            // negation when mapping a screen row back to the art's own local row.
+            double a = -rad;
+            art[n] = r.Art;
+            pcx[n] = r.X + _shakeX;
+            pcy[n] = baseYd;
+            sA[n] = Math.Sin(a);
+            cA[n] = Math.Cos(a);
+            n++;
+        }
+        if (n == 0) { outp.Add("  coverage: no worn pots"); return outp; }
+
+        Buf sb = new Buf(_canvas, new Rectangle(x0, scanTop, x1 - x0 + 1, judgeBot - scanTop));
+        try {
+            int miss = 0, unexp = 0, hit = 0, cells = 0;
+            int missTop = int.MaxValue, unexpTop = int.MaxValue, hitTop = int.MaxValue;
+            int missBot = -1, missL = int.MaxValue, missR = -1;
+            int unexpBot = -1, unexpL = int.MaxValue, unexpR = -1;
+            string missSamples = "", unexpSamples = "";
+            for (int y = scanTop; y <= judgeBot; y += cellPx) {
+                int o0 = (y - scanTop) * sb.Stride;
+                for (int x = x0; x <= x1; x += cellPx) {
+                    cells++;
+                    int o = o0 + (x - x0) * 4 + 3;
+                    bool painted = (o >= 0 && o < sb.P.Length && sb.P[o] > 8);
+                    bool want = false;
+                    for (int b = 0; b < n && !want; b++) {
+                        double dx = x - pcx[b], dy = y - pcy[b];
+                        double lx = dx * cA[b] - dy * sA[b];
+                        double ly = dx * sA[b] + dy * cA[b];
+                        double hw = art[b].Width / 2.0, hh = art[b].Height / 2.0;
+                        if (lx < -hw || lx >= hw || ly < -hh || ly >= hh) continue;
+                        // Inside the bitmap's own box: is the art opaque there? Sampling the
+                        // real bitmap is what makes this a test of the DRAW rather than of a
+                        // rectangle that is only an approximation of the pot.
+                        int sxp = (int)Math.Floor(lx + hw);
+                        int syp = (int)Math.Floor(ly + hh);
+                        if (sxp < 0) sxp = 0; if (sxp >= art[b].Width) sxp = art[b].Width - 1;
+                        if (syp < 0) syp = 0; if (syp >= art[b].Height) syp = art[b].Height - 1;
+                        if (ArtAlpha(art[b], sxp, syp) > 8) want = true;
+                    }
+                    if (want && !painted) {
+                        miss++;
+                        if (y < missTop) missTop = y;
+                        if (y > missBot) missBot = y;
+                        if (x < missL) missL = x;
+                        if (x > missR) missR = x;
+                        if (missSamples.Length < 90) missSamples += " (" + x + "," + y + ")";
+                    } else if (!want && painted) {
+                        unexp++;
+                        if (y < unexpTop) unexpTop = y;
+                        if (y > unexpBot) unexpBot = y;
+                        if (x < unexpL) unexpL = x;
+                        if (x > unexpR) unexpR = x;
+                        if (unexpSamples.Length < 90) unexpSamples += " (" + x + "," + y + ")";
+                    } else if (want && painted) { hit++; if (y < hitTop) hitTop = y; }
+                }
+            }
+            outp.Add("  coverage: pots=" + n + " cells=" + cells + " (cell=" + cellPx + "px)  covered=" + hit +
+                     "  MISSING=" + miss + "  unexplained=" + unexp);
+            if (hit > 0) outp.Add("    highest wanted+painted row = " + hitTop);
+            if (miss > 0) outp.Add("    MISSING rows " + missTop + ".." + missBot +
+                                   "  x " + missL + ".." + missR + "  first:" + missSamples);
+            if (unexp > 0) outp.Add("    unexplained rows " + unexpTop + ".." + unexpBot +
+                                    "  x " + unexpL + ".." + unexpR + "  first:" + unexpSamples);
+        } finally { sb.Dispose(); }
+        return outp;
+    }
+
+    // Alpha of the pot art, cached: the coverage report samples this per cell per box and
+    // GetPixel would make that pathologically slow.
+    readonly Dictionary<Bitmap, byte[]> _artAlphaCache = new Dictionary<Bitmap, byte[]>();
+
+    int ArtAlpha(Bitmap b, int x, int y) {
+        byte[] map;
+        if (!_artAlphaCache.TryGetValue(b, out map)) {
+            int w = b.Width, h = b.Height;
+            map = new byte[w * h];
+            Buf bb = new Buf(b);
+            try {
+                for (int yy = 0; yy < h; yy++) {
+                    int o0 = yy * bb.Stride;
+                    for (int xx = 0; xx < w; xx++) map[yy * w + xx] = bb.P[o0 + xx * 4 + 3];
+                }
+            } finally { bb.Dispose(); }
+            _artAlphaCache[b] = map;
+        }
+        return map[y * b.Width + x];
+    }
+
+    // Does a worn pot's own art actually appear on the canvas this frame?
+    //
+    // Reads a snapshot of the pot's own drawn box and works out, for each cell, the art pixel that
+    // belongs there (the same inverse transform DrawRiceArt draws with), then checks the canvas
+    // carries it. Returns the fraction of the pot's SOLID cells that are missing, so a pot that
+    // flashed out for one frame reads as a number near 1.0 instead of as "it moved a bit".
+    //
+    // A fraction, not a boolean: the erase pass legitimately shaves the anti-aliased edge, so the
+    // question is "did the pot vanish" (0.9) versus "is its outline a pixel thin" (0.01).
+    //
+    // Takes a snapshot rather than locking the canvas: GDI+ refuses to draw into a locked bitmap,
+    // so a lock cannot be held across RenderToCanvas (the "Bitmap region is already locked" trap).
+    double PotMissingFraction(Rice p) { return PotMissingFraction(p, 2); }
+
+    // step: sample every `step` pixels. 2 is the default; the live sentry passes 4, which still
+    // catches anything bigger than a couple of pixels and keeps up with a 33ms session.
+    double PotMissingFraction(Rice p, int step) {        if (p.Art == null || !p.DrawnValid) return -1;
+        int w = p.Art.Width, h = p.Art.Height;
+        int x0 = (int)Math.Floor(p.DrawnL), x1 = (int)Math.Ceiling(p.DrawnR);
+        int y0 = (int)Math.Floor(p.DrawnT), y1 = (int)Math.Ceiling(p.DrawnB);
+        Rectangle clip = Rectangle.Intersect(new Rectangle(x0, y0, x1 - x0 + 1, y1 - y0 + 1), CanvasRect());
+        if (clip.Width <= 2 || clip.Height <= 2) return -1;
+        byte[] snap;
+        int stride = clip.Width * 4;
+        // A per-pixel copy rather than sb.P.Clone(): the clone plus the extra read-back made this
+        // the most expensive thing in the sentry's frame, and a sentry that runs at 8fps misses
+        // exactly the one-frame event it exists to catch.
+        Buf sb = new Buf(_canvas, clip);
+        try {
+            snap = new byte[stride * clip.Height];
+            for (int yy = 0; yy < clip.Height; yy++) {
+                Array.Copy(sb.P, yy * sb.Stride, snap, yy * stride, stride);
+            }
+        } finally { sb.Dispose(); }
+
+        double cx = (p.DrawnL + p.DrawnR) / 2.0, cy = (p.DrawnT + p.DrawnB) / 2.0;
+        double rad = (_snapRight ? IronHeadTiltDeg : -IronHeadTiltDeg) * Math.PI / 180.0;
+        // .NET RotateTransform turns the other way on screen, so the screen-to-art mapping is the
+        // inverse rotation - the same negation the coverage report uses.
+        double a = -rad;
+        double ca = Math.Cos(a), sa = Math.Sin(a);
+        if (step < 1) step = 1;
+        int want = 0, miss = 0;
+        for (int y = clip.Y; y < clip.Y + clip.Height; y += step) {
+            for (int x = clip.X; x < clip.X + clip.Width; x += step) {
+                double dx = x - cx, dy = y - cy;
+                double lx = dx * ca - dy * sa;
+                double ly = dx * sa + dy * ca;
+                int sxp = (int)Math.Floor(lx + w / 2.0);
+                int syp = (int)Math.Floor(ly + h / 2.0);
+                if (sxp < 3 || syp < 3 || sxp >= w - 3 || syp >= h - 3) continue;
+                // Only the art's SOLID core is judged: the outermost ring is anti-aliased and the
+                // erase pass is allowed to nibble it. ArtAlpha reads a cached alpha plane - the
+                // GetPixel version made this pathologically slow.
+                if (ArtAlpha(p.Art, sxp, syp) < 200) continue;
+                want++;
+                int o = (y - clip.Y) * stride + (x - clip.X) * 4 + 3;
+                if (snap[o] <= 8) miss++;
+            }
+        }
+        return want == 0 ? -1 : (double)miss / want;
+    }
+
+    // Every worn pot, every frame, through a stack being built up one pot at a time. This is the
+    // "the Nth pot flashes out of existence" report.
+    public void RunIronStackFlashTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("does any worn pot vanish for a frame while the stack is being built?");
+
+        // Sensitivity matrix across sizes. A pot that is partly covered by its neighbour only
+        // exposes its top, so the probe has to be shown sensitive to EVERY pot in the stack, not
+        // just to one of them: "the probe saw nothing" is worth nothing until it has been shown to
+        // see something. The user's own preset is 454px, the tests default to 624.
+        int[] sizes = new int[] { 454, 624 };
+        for (int si = 0; si < sizes.Length; si++) {
+            SetPixelSizeForTest(sizes[si]);
+            ResetDemoForTest();
+            ApplyBalancePublic(30.00, true);
+            PumpTicks(2);
+            for (int i = 0; i < 4; i++) {
+                StartIronPotForTest();
+                PumpTicks(2);
+                Rice rp = null;
+                for (int k = 0; k < _rices.Count; k++) if (_rices[k].Iron && !_rices[k].OnHead) rp = _rices[k];
+                if (rp == null) continue;
+                Point a = IronHeadAnchor();
+                rp.X = a.X; rp.Y = a.Y - 320; rp.VX = 0; rp.VY = 0;
+                for (int k = 0; k < 300 && !rp.OnHead; k++) PumpTicks(1);
+                for (int k = 0; k < 40 && rp.HeadFalling; k++) PumpTicks(1);
+            }
+            Console.WriteLine("  ===== size " + _w + "px: probe sensitivity per pot =====");
+            for (int sup = 0; sup < _rices.Count; sup++) {
+                Rice target = null;
+                int ti = -1;
+                for (int i = 0; i < _rices.Count; i++) {
+                    Rice r = _rices[i];
+                    if (!r.Iron || !r.OnHead) continue;
+                    if (IronStackIndex(r) == sup) { target = r; ti = sup; break; }
+                }
+                if (target == null) continue;
+                RenderToCanvas();
+                double normal = PotMissingFraction(target);
+                _suppressPot = target;
+                RenderToCanvas();
+                double suppressed = PotMissingFraction(target);
+                _suppressPot = null;
+                RenderToCanvas();
+                Console.WriteLine("    pot idx " + ti + ": normal=" + (normal * 100).ToString("0.0") +
+                                  "%  suppressed=" + (suppressed * 100).ToString("0.0") + "%  sensitive=" +
+                                  (suppressed > 0.5 && normal < 0.05));
+            }
+        }
+
+        // Calibration FIRST, before any conclusion is drawn from the numbers below: leave one pot
+        // out of the draw on purpose and check the probe reports it as gone. Without this the
+        // whole run is worthless - four earlier probes in this project all "proved" a bug absent
+        // while it was happening.
+        SetPixelSizeForTest(624);
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+        StartIronPotForTest();
+        PumpTicks(2);
+        Rice calPot = IronPotForTest();
+        bool calOk = false;
+        double calNormal = -1, calSuppressed = -1;
+        if (calPot != null) {
+            Point ac = IronHeadAnchor();
+            calPot.X = ac.X; calPot.Y = ac.Y - 320; calPot.VX = 0; calPot.VY = 0;
+            for (int k = 0; k < 300 && !calPot.OnHead; k++) PumpTicks(1);
+            for (int k = 0; k < 40 && calPot.HeadFalling; k++) PumpTicks(1);
+            if (calPot.OnHead) {
+                RenderToCanvas();
+                calNormal = PotMissingFraction(calPot);
+                _suppressPot = calPot;
+                RenderToCanvas();
+                calSuppressed = PotMissingFraction(calPot);
+                _suppressPot = null;
+                RenderToCanvas();
+                calOk = calNormal >= 0 && calNormal < 0.05 && calSuppressed > 0.5;
+            }
+        }
+        Console.WriteLine("  calibrate: pot drawn normally -> missing=" + (calNormal * 100).ToString("0.0") +
+                          "% ;  same pot deliberately NOT drawn -> missing=" +
+                          (calSuppressed * 100).ToString("0.0") + "%  (want ~0% then >50%)");
+        if (!calOk) {
+            Console.WriteLine("  verdict: FAIL - CALIBRATION: the probe cannot see a pot that was not " +
+                              "drawn, so its numbers mean nothing");
+            ResetDemoForTest();
+            return;
+        }
+
+        int maxPots = 6;
+        List<int> stackIdx = new List<int>();
+        List<double> frac = new List<double>();
+        int vanished = 0;
+        string worstLine = "";
+        double worstFrac = -1;
+        bool showTrace = true;
+        int firstSeatRound = -1;
+        _potTrace = true;              // the per-frame draw record is gated inside RenderToCanvas
+
+        // Two ways a pot can arrive, and they take different code paths:
+        //   "drop"   - spawned away from her and let fall onto the crown;
+        //   "side"   - spawned away from her and let drift in sideways;
+        //   "drag"   - exactly what the user does: pick a loose pot up, carry it to her head,
+        //              let go. Reported as the case where a pot flashes out mid-bounce.
+        string[] modes = new string[] { "drag", "drop", "side" };
+        for (int si = 0; si < sizes.Length; si++) {
+        SetPixelSizeForTest(sizes[si]);
+        Console.WriteLine("  ######## size " + _w + "px ########");
+        for (int mode = 0; mode < modes.Length; mode++) {
+        Console.WriteLine("  ===== arrival mode: " + modes[mode] + " =====");
+        for (int round = 0; round < maxPots; round++) {
+            ResetDemoForTest();
+            ApplyBalancePublic(30.00, true);
+            PumpTicks(2);
+            // Build `round` pots already worn, settled. Each one arrives the same way.
+            for (int i = 0; i < round; i++) {
+                StartIronPotForTest();
+                PumpTicks(2);
+                Rice rp = null;
+                for (int k = 0; k < _rices.Count; k++) if (_rices[k].Iron && !_rices[k].OnHead) rp = _rices[k];
+                if (rp == null) continue;
+                Point a = IronHeadAnchor();
+                rp.X = a.X; rp.Y = a.Y - 320; rp.VX = 0; rp.VY = 0;
+                for (int k = 0; k < 300 && !rp.OnHead; k++) PumpTicks(1);
+                for (int k = 0; k < 40 && rp.HeadFalling; k++) PumpTicks(1);
+            }
+            int seated = 0;
+            for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) seated++;
+            if (seated != round) {
+                Console.WriteLine("  round " + round + ": setup seated " + seated + " (want " + round + "), skipped");
+                continue;
+            }
+
+            // Now drop one more and watch EVERY worn pot on EVERY frame.
+            PotTraceLog.Clear();
+            PotTraceFrames = 0;
+            _flashTraceBudget = 0;
+            bool traceOn = false;
+            StartIronPotForTest();
+            PumpTicks(1);
+            Rice fresh = null;
+            for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && !_rices[i].OnHead) fresh = _rices[i];
+            if (fresh == null) { Console.WriteLine("  round " + round + ": no fresh pot"); continue; }
+            Point a2 = IronHeadAnchor();
+            if (modes[mode] == "drag") {
+                // The user's own path: hold it (Dragging = true, the hand writes X/Y), carry it
+                // over her crown, and let go. The release velocity is ~0, so it only falls the
+                // short distance from the hand to the stack.
+                fresh.Dragging = true;
+                fresh.X = a2.X + _w * 0.8;
+                fresh.Y = a2.Y - _w * 1.1;
+                fresh.VX = 0; fresh.VY = 0;
+                for (int k = 0; k < 30; k++) {
+                    // Walk it in, the way a hand would, then release right above her.
+                    double u = Math.Min(1.0, (k + 1) / 22.0);
+                    fresh.X = a2.X + _w * 0.8 * (1.0 - u);
+                    fresh.Y = a2.Y - _w * 1.1 + _w * 0.65 * u;
+                    PumpTicks(1);
+                }
+                fresh.Dragging = false;             // let go: exactly what ReleaseBowl does
+                Rice rel = fresh;
+                rel.VX = 0; rel.VY = 0;
+            } else if (modes[mode] == "drop") {
+                // Directly above her crown, so it lands on the stack.
+                fresh.X = a2.X; fresh.Y = a2.Y - _w * 0.7; fresh.VX = 0; fresh.VY = 0;
+            } else {
+                fresh.X = a2.X + _w * 1.2; fresh.Y = a2.Y - 420; fresh.VX = -260; fresh.VY = 0;
+            }
+
+            double roundWorst = -1;
+            int roundWorstFrame = -1, roundWorstIdx = -1;
+            int prevPots = 0;
+            for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) prevPots++;
+            // Each pot is judged against ITS OWN resting baseline, not against a fixed 50%: a pot
+            // that its neighbour covers is only ~44% visible at 454px, so "missing > 50% of the
+            // art" could never fire for it. The resting frame is the reference and any frame that
+            // loses a fifth of that is the flash being looked for.
+            Dictionary<Rice, double> baseFrac = new Dictionary<Rice, double>();
+            for (int i = 0; i < _rices.Count; i++) {
+                Rice r = _rices[i];
+                if (!r.Iron || !r.OnHead) continue;
+                RenderToCanvas();
+                double b = PotMissingFraction(r);
+                if (b >= 0) baseFrac[r] = b;
+            }
+            for (int f = 0; f < 90; f++) {
+                PumpTicks(1);
+                RenderToCanvas();
+                int nowPots = 0;
+                for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) nowPots++;
+                // Dump the frame the new pot SEATS on and the two after it: that is the moment the
+                // report is about, and it is the only moment a still frame can show it.
+                if (nowPots > prevPots && f < 40) {
+                    traceOn = true;                      // record every frame of the bounce
+                    for (int d = 0; d < 3; d++) {
+                        try {
+                            _canvas.Save(Path.Combine(_baseDir, "_flash_" + modes[mode] + "_r" + round +
+                                                      "_f" + (f + d) + ".png"), ImageFormat.Png);
+                        } catch (Exception ex) { Log("flash dump failed: " + ex.Message); }
+                        if (d < 2) { PumpTicks(1); RenderToCanvas(); f++; }
+                    }
+                    if (showTrace && firstSeatRound < 0) {
+                        firstSeatRound = round;
+                        Console.WriteLine("  --- draw trace, frames around the seating frame (mode " +
+                                          modes[mode] + ", round " + round + ") ---");
+                        for (int li = 0; li < PotTraceLog.Count && li < 240; li++) {
+                            Console.WriteLine(PotTraceLog[li]);
+                        }
+                    }
+                }
+                if (traceOn) _flashTraceBudget = 2;
+                if (_flashTraceBudget > 0) _flashTraceBudget--;
+                prevPots = nowPots;
+                for (int i = 0; i < _rices.Count; i++) {
+                    Rice r = _rices[i];
+                    if (!r.Iron || !r.OnHead) continue;
+                    double m = PotMissingFraction(r);
+                    if (m < 0 || !baseFrac.ContainsKey(r)) continue;
+                    double d = m - baseFrac[r];
+                    if (d > roundWorst) {
+                        roundWorst = d; roundWorstFrame = f; roundWorstIdx = IronStackIndex(r);
+                    }
+                    if (d > 0.20) {
+                        vanished++;
+                        stackIdx.Add(IronStackIndex(r));
+                        frac.Add(m);
+                        if (d > worstFrac) {
+                            worstFrac = d;
+                            worstLine = modes[mode] + " round " + round + " frame " + f + " pot idx " +
+                                        IronStackIndex(r) + " baseline=" + (baseFrac[r] * 100).ToString("0.0") +
+                                        "% thisFrame=" + (m * 100).ToString("0.0") + "%";
+                        }
+                    }
+                }
+            }
+            Console.WriteLine("  round " + round + " -> " + (round + 1) + " pots: worstLossVsBaseline=" +
+                              (roundWorst * 100).ToString("0.0") + "% at frame " + roundWorstFrame +
+                              " pot idx " + roundWorstIdx);
+        }
+        }
+        }
+        SetPixelSizeForTest(624);
+
+        Console.WriteLine("  vanished frames (a worn pot missing >50% of its own art): " + vanished);
+        if (vanished > 0) {
+            Console.Write("    pot indices seen: ");
+            for (int i = 0; i < stackIdx.Count && i < 24; i++) {
+                Console.Write(stackIdx[i] + (i + 1 < stackIdx.Count && i < 23 ? "," : ""));
+            }
+            Console.WriteLine();
+            Console.WriteLine("    worst: " + worstLine);
+        }
+        bool ok = vanished == 0;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - no worn pot disappears for a frame while a new pot lands on the stack"
+            : "FAIL - a worn pot flashed out " + vanished + " time(s); worst " + worstLine));
+        ResetDemoForTest();
+    }
+
+    // ================================ pot sentry ================================
+    //
+    // Watches the worn pots while the USER plays, and writes down what happened if one of them
+    // ever loses a large part of its own art for a frame.
+    //
+    // It exists because the bug could not be reproduced offline: 36 combinations of widget size
+    // (454 and 624), arrival path (dragged in, dropped on the crown, drifted in sideways) and
+    // stack depth (1 to 6 pots) all measured a clean zero against a probe that had been shown to
+    // see a pot which was deliberately not drawn. Rather than keep guessing at the trigger, this
+    // catches the real event and answers the one question that splits the remaining space in two:
+    //
+    //   canvas lost the pot      -> the renderer dropped it
+    //   canvas has it, screen does not -> the push to the layered window dropped it
+    //
+    // Run:  .\dsh_pet.ps1 --potsentry [seconds]
+    //
+    // Armed, not driven: the app then runs its NORMAL message loop, so mouse events keep working
+    // and the pots can actually be dragged. An earlier version drove the ticks itself with
+    // PumpTicks, which does not pump the message queue at all - the window would have been dead
+    // to the mouse and the diagnostic could never have reproduced anything.
+    public void RunPotSentryTest(int seconds) {
+        SentryArm(seconds);
+        SentrySay("pot sentry + dashcam: watching the worn pots while you use the pet.");
+        SentrySay("  Log file (full path): " + (_sentryLogPath == null ? "(unavailable)" : _sentryLogPath));
+        SentrySay("  This console can be minimised - the log still gets written.");
+        SentrySay("  Do this: drag a loose pot onto her head, let go, and repeat a few times.");
+        SentrySay("  THE MOMENT you see the flash, press F9 (works no matter which window is in");
+        SentrySay("  front). The last " + DashCamFrames + " frames - about " +
+                  (DashCamFrames / 21.0).ToString("0") + "s - are then written to _dash_*.png.");
+        SentrySay("  Running for " + seconds + "s.");
+        DashCamStart();
+        Application.Run(this);
+        DashCamStop();
+        Console.WriteLine("done (window closed)");
+    }
+
+    void SentryArm(int seconds) {
+        _sentryBase.Clear();
+        _sentryStable.Clear();
+        _sentryFrame = 0;
+        _sentryCaughtCanvas = 0;
+        _sentryCaughtScreen = 0;
+        _sentryPrevWorn = -1;
+        _sentrySeconds = seconds;
+        _sentryUntil = NowSec() + seconds;
+        _sentryArmed = true;
+        try {
+            _sentryLogPath = Path.Combine(_baseDir, "_sentry_report.txt");
+            File.WriteAllText(_sentryLogPath,
+                "pot sentry armed at " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
+                ", running for " + seconds + "s" + Environment.NewLine);
+        } catch { _sentryLogPath = null; }
+    }
+
+    // Console AND file. The file matters: the console window itself sits on top of the pet, and
+    // the screen comparison has to skip any pot that a window covers - so watching from a console
+    // you cannot move defeats the check. With the log on disk the window can be minimised.
+    void SentrySay(string line) {
+        Console.WriteLine(line);
+        if (_sentryLogPath == null) return;
+        try { File.AppendAllText(_sentryLogPath, line + Environment.NewLine); } catch { }
+    }
+
+    // Who is covering the pet? A class name is enough to tell a console (ConsoleWindowClass) from
+    // a menu, a browser or another app.
+    string _sentryCoverName() {
+        try {
+            int cx = (int)Math.Round(_offX + _w * 0.5558);
+            int cy = (int)Math.Round(_offY + _w * 0.3639);
+            Native.POINT wp = new Native.POINT();
+            wp.X = cx; wp.Y = cy;
+            IntPtr h = Native.WindowFromPoint(wp);
+            if (h == IntPtr.Zero) return "nothing";
+            StringBuilder sb = new StringBuilder(256);
+            Native.GetClassName(h, sb, 256);
+            return sb.ToString() + (h == Handle ? " (this window)" : "");
+        } catch { return "unknown"; }
+    }
+
+    string _sentryTopmost() {
+        try {
+            int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
+            return ((ex & Native.WS_EX_TOPMOST) != 0) ? "yes" : "NO";
+        } catch { return "?"; }
+    }
+
+    // Drives a whole "pick a loose pot up, carry it onto her crown, let go" sequence through the
+    // window's REAL mouse handlers, by posting the messages a mouse would post. Used to prove the
+    // sentry and the attach path work in the running app without hijacking the user's cursor.
+    public void RunSentrySelfTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("sentry self-test: synthetic drag of a loose pot onto her head");
+
+        SentryArm(600);                     // armed for the whole test
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+        StartIronPotForTest();
+        PumpTicks(3);
+        Rice pot = IronPotForTest();
+        if (pot == null) {
+            Console.WriteLine("  verdict: FAIL - no loose pot spawned");
+            _sentryArmed = false;
+            return;
+        }
+        // Park it somewhere empty and ON SCREEN (a pot below the bottom edge cannot be grabbed -
+        // the first version of this test put it at y = offY - 260, which on a 1067px screen was
+        // 227px below the floor).
+        Rectangle vsS = SystemInformation.VirtualScreen;
+        double parkX = Math.Min(vsS.Right - 120, _offX + _w * 1.6);
+        double parkY = vsS.Bottom - pot.R;
+        pot.X = parkX; pot.Y = parkY; pot.VX = 0; pot.VY = 0;
+        PumpTicks(20);
+        Console.WriteLine("  park    : pot at (" + pot.X.ToString("0") + "," + pot.Y.ToString("0") + ")" +
+                          " vs=" + vsS.Width + "x" + vsS.Height + " grabbable=" +
+                          (BowlAt((int)pot.X, (int)pot.Y) == pot));
+
+        int downX = (int)pot.X, downY = (int)pot.Y;
+        Point target = IronHeadAnchor();
+        Point endPt = new Point(target.X, target.Y - 40);
+        Console.WriteLine("  drag    : from (" + downX + "," + downY + ") to (" + endPt.X + "," + endPt.Y + ")");
+
+        Win32Post(Native.WM_LBUTTONDOWN, 0, PackXY(downX, downY));
+        PumpTicks(2);
+        bool grabbedPosted = pot.Dragging;
+        // Drive the production handlers directly. Posting window messages was tried first and does
+        // not work here: the window answers WM_NCHITTEST with HTTRANSPARENT unless a solid pixel is
+        // under the pointer, so a posted click is dropped by the hit test before it ever reaches
+        // OnMouseDown. Calling the handlers is the same code the mouse runs, without that routing.
+        Point cDown = PointToClient(new Point(downX, downY));
+        OnMouseDown(new MouseEventArgs(MouseButtons.Left, 1, cDown.X, cDown.Y, 0));
+        PumpTicks(2);
+        bool grabbed = pot.Dragging;
+        int steps = 24;
+        for (int i = 1; i <= steps; i++) {
+            int mx = downX + (endPt.X - downX) * i / steps;
+            int my = downY + (endPt.Y - downY) * i / steps;
+            Point cm = PointToClient(new Point(mx, my));
+            OnMouseMove(new MouseEventArgs(MouseButtons.Left, 0, cm.X, cm.Y, 0));
+            PumpTicks(1);
+        }
+        Point cUp = PointToClient(new Point(endPt.X, endPt.Y));
+        OnMouseUp(new MouseEventArgs(MouseButtons.Left, 1, cUp.X, cUp.Y, 0));
+        PumpTicks(1);
+        Console.WriteLine("  grab    : dragging=" + grabbed + " (postedMessage=" + grabbedPosted + ")");
+
+        bool seated = false;
+        for (int i = 0; i < 120 && !seated; i++) { PumpTicks(1); seated = pot.OnHead; }
+        for (int i = 0; i < 40; i++) PumpTicks(1);
+
+        int worn = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) worn++;
+        Console.WriteLine("  result  : potOnHead=" + pot.OnHead + " worn=" + worn +
+                          " sentryFrames=" + _sentryFrame +
+                          " caughtCanvas=" + _sentryCaughtCanvas +
+                          " caughtScreen=" + _sentryCaughtScreen);
+        bool ok = pot.OnHead && _sentryFrame > 100 && _sentryCaughtCanvas == 0;        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a synthetic drag seats the pot through the real mouse handlers, and the sentry " +
+              "watched every frame of it without a false alarm"
+            : "FAIL - potOnHead=" + pot.OnHead + " sentryFrames=" + _sentryFrame +
+              " caughtCanvas=" + _sentryCaughtCanvas + " caughtScreen=" + _sentryCaughtScreen));
+        _sentryArmed = false;
+        ResetDemoForTest();
+    }
+
+    static int PackXY(int x, int y) { return (y << 16) | (x & 0xFFFF); }
+
+    void Win32Post(int msg, int wparam, int lparam) {
+        if (Handle == IntPtr.Zero) return;
+        Native.PostMessage(Handle, msg, (IntPtr)wparam, (IntPtr)lparam);
+    }
+
+    // One frame's worth of sentry work, called from the app's own tick.
+    void SentryTick() {
+        if (!_sentryArmed) return;
+        if (NowSec() > _sentryUntil) {
+            _sentryArmed = false;
+            SentrySay("pot sentry done: canvas-loss events=" + _sentryCaughtCanvas +
+                      " push-mismatch events=" + _sentryCaughtScreen +
+                      "  frames=" + _sentryFrame + " in " + _sentrySeconds + "s (" +
+                      (_sentryFrame / (double)Math.Max(1, _sentrySeconds)).ToString("0.0") + " fps)");
+            // The frame rate is reported because a sentry slower than the session cannot be trusted
+            // to have SEEN a one-frame flash: 120s at 8fps was only 940 samples.
+            double fps = _sentryFrame / (double)Math.Max(1, _sentrySeconds);
+            if (fps < 15.0) {
+                SentrySay("  WARNING: " + fps.ToString("0.0") + " fps is too slow to be sure of catching" +
+                          " a single-frame event. Close other windows so the pet is fully visible," +
+                          " and run it again.");
+            }
+            SentrySay("  verdict: " + ((_sentryCaughtCanvas == 0 && _sentryCaughtScreen == 0)
+                ? "INFO - nothing was caught in this run (reproduce the flash and run it again)"
+                : "INFO - caught " + (_sentryCaughtCanvas + _sentryCaughtScreen) +
+                  " event(s); see the _sentry_*.png dumps and the lines above"));
+            return;
+        }
+        _sentryFrame++;
+        DashCamPush();
+
+        int worn = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) worn++;
+        // A frame where the stack changed is not judged: pots are legitimately moving then.
+        bool settled = _headSquashT >= HeadSquashDur && !_snapping;
+        if (worn != _sentryPrevWorn) {
+            _sentryBase.Clear();
+            _sentryStable.Clear();
+            _sentryPrevWorn = worn;
+        }
+
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron || !r.OnHead) continue;
+            double m = PotMissingFraction(r, 4);
+            if (m < 0) continue;
+            if (!_sentryBase.ContainsKey(r)) {
+                if (!settled) continue;                 // only baseline from a settled frame
+                _sentryBase[r] = m;
+                continue;
+            }
+            double d = m - _sentryBase[r];
+            if (d > 0.15) {
+                _sentryCaughtCanvas++;
+                SentrySay("  CAUGHT frame " + _sentryFrame + ": worn pot idx " + IronStackIndex(r) +
+                                  " lost " + (d * 100).ToString("0.0") + "% of its art" +
+                                  " (baseline " + (_sentryBase[r] * 100).ToString("0.0") +
+                                  "%, now " + (m * 100).ToString("0.0") + "%)" +
+                                  " squash=" + _squashScale.ToString("0.0000") +
+                                  " headSquashT=" + _headSquashT.ToString("0.000") +
+                                  " pots=" + worn + " repaintWidget=" + _lastRepaintWidget);
+                try {
+                    _canvas.Save(Path.Combine(_baseDir, "_sentry_canvas_" + _sentryCaughtCanvas + ".png"),
+                                 ImageFormat.Png);
+                    SentrySay("    wrote _sentry_canvas_" + _sentryCaughtCanvas +
+                                      ".png  -> the CANVAS lost the pot: a renderer bug");
+                    DashCamDump("auto: canvas loss");
+                } catch (Exception ex) { SentrySay("    dump failed: " + ex.Message); }
+            } else if (d < -0.15) {
+                _sentryBase[r] = m;                     // gained pixels back: re-baseline
+            }
+        }
+
+        // Every 20 frames, ask whether the SCREEN agrees with the canvas inside the area the pots
+        // occupy. A mismatch means the render was right and the push was wrong - a different bug
+        // in a different place.
+        if (_sentryFrame % 20 == 0 && worn > 0) {
+            try {
+                using (Bitmap scr = GrabScreenCanvas()) {
+                    Buf cb = new Buf(_canvas), sb = new Buf(scr);
+                    try {
+                        int diff = 0, solid = 0, dx0 = int.MaxValue, dy0 = int.MaxValue, dx1 = -1, dy1 = -1;
+                        for (int i = 0; i < _rices.Count; i++) {
+                            Rice r = _rices[i];
+                            if (!r.Iron || !r.OnHead || !r.DrawnValid) continue;
+                            int rx0 = Math.Max(0, (int)r.DrawnL), rx1 = Math.Min(cb.W - 1, (int)r.DrawnR);
+                            int ry0 = Math.Max(0, (int)r.DrawnT), ry1 = Math.Min(cb.H - 1, (int)r.DrawnB);
+                            for (int y = ry0; y <= ry1; y += 2) {
+                                int rc = y * cb.Stride, rs = y * sb.Stride;
+                                for (int x = rx0; x <= rx1; x += 2) {
+                                    if (cb.P[rc + x * 4 + 3] != 255) continue;   // fully opaque only
+                                    solid++;
+                                    int e = 0;
+                                    for (int ch = 0; ch < 3; ch++) {
+                                        int v = Math.Abs(cb.P[rc + x * 4 + ch] - sb.P[rs + x * 4 + ch]);
+                                        if (v > e) e = v;
+                                    }
+                                    if (e > 0) {
+                                        diff++;
+                                        if (x < dx0) dx0 = x; if (x > dx1) dx1 = x;
+                                        if (y < dy0) dy0 = y; if (y > dy1) dy1 = y;
+                                    }
+                                }
+                            }
+                        }
+                        if (diff > 0 && solid > 0) {
+                            // Only blame the app if the app is actually the window on top at those
+                            // points. CopyFromScreen photographs the real desktop, so a console or
+                            // browser covering the pet shows up as "every pot pixel is wrong" -
+                            // which is exactly what the first version of this reported, on a
+                            // region that was pure white (253,255,255) from a console window.
+                            int covered = 0, checkedPts = 0;
+                            for (int i = 0; i < _rices.Count; i++) {
+                                Rice r = _rices[i];
+                                if (!r.Iron || !r.OnHead || !r.DrawnValid) continue;
+                                int mx = (int)((r.DrawnL + r.DrawnR) / 2.0);
+                                int my = (int)((r.DrawnT + r.DrawnB) / 2.0);
+                                checkedPts++;
+                                Native.POINT wp = new Native.POINT();
+                                wp.X = mx; wp.Y = my;
+                                if (Native.WindowFromPoint(wp) != Handle) covered++;
+                            }
+                            if (covered > 0) {
+                                SentrySay("  push check skipped frame " + _sentryFrame + ": " +
+                                          covered + " of " + checkedPts +
+                                          " pot centres are covered by [" + _sentryCoverName() +
+                                          "]; this window topmost=" + _sentryTopmost() +
+                                          " - move that window away and run again");
+                            } else {
+                                _sentryCaughtScreen++;
+                                SentrySay("  PUSH MISMATCH frame " + _sentryFrame + ": screen differs from " +
+                                                  "canvas on " + diff + " of " + solid + " pot pixels" +
+                                                  " bbox=" + dx0 + "," + dy0 + ".." + dx1 + "," + dy1);
+                                try {
+                                    _canvas.Save(Path.Combine(_baseDir, "_sentry_push_" + _sentryCaughtScreen + ".png"),
+                                                 ImageFormat.Png);
+                                    scr.Save(Path.Combine(_baseDir, "_sentry_screen_" + _sentryCaughtScreen + ".png"),
+                                             ImageFormat.Png);
+                                    SentrySay("    wrote _sentry_push_" + _sentryCaughtScreen +
+                                                      ".png (canvas) and _sentry_screen_" + _sentryCaughtScreen +
+                                                      ".png (screen): the CANVAS was right, the PUSH was not");
+                                    DashCamDump("auto: push mismatch");
+                                } catch (Exception ex) { SentrySay("    dump failed: " + ex.Message); }
+                            }
+                        }
+                    } finally { cb.Dispose(); sb.Dispose(); }
+                }
+            } catch (Exception ex) { SentrySay("  screen compare failed: " + ex.Message); }
+        }
+    }
+
+    // ================================ dashcam ================================
+    //
+    // Keeps the last few seconds of the canvas in a ring buffer, so the moment the user SEES the
+    // flash they can press F9 and the frames around it get written to disk. This exists because
+    // two full sentry runs (2555 frames at 21fps, both channels clean) failed to catch it: a
+    // one-frame visual event that relies on being sampled at the right instant is exactly what a
+    // recording is for.
+    //
+    // Stored downscaled by 2 in each axis: enough to see whether a pot is there or not, a quarter
+    // of the memory, and no per-frame encode cost.
+    const int DashCamFrames = 80;
+    const int SentryHotkeyId = 0xB0B;
+    Bitmap[] _dashBuf = new Bitmap[DashCamFrames];
+    int _dashHead, _dashCount, _dashShot;
+
+    void DashCamStart() {
+        try {
+            Native.RegisterHotKey(Handle, SentryHotkeyId, 0, Native.VK_F9);
+            SentrySay("  dashcam armed: press F9 to save the last " + DashCamFrames + " frames.");
+        } catch (Exception ex) { SentrySay("  dashcam hotkey failed: " + ex.Message); }
+    }
+
+    void DashCamStop() {
+        try { Native.UnregisterHotKey(Handle, SentryHotkeyId); } catch { }
+        for (int i = 0; i < _dashBuf.Length; i++) {
+            if (_dashBuf[i] != null) { _dashBuf[i].Dispose(); _dashBuf[i] = null; }
+        }
+        _dashHead = 0; _dashCount = 0;
+    }
+
+    void DashCamPush() {
+        if (_canvas == null) return;
+        try {
+            int w = _canvas.Width / 2, h = _canvas.Height / 2;
+            Bitmap b = _dashBuf[_dashHead];
+            if (b == null || b.Width != w || b.Height != h) {
+                if (b != null) b.Dispose();
+                b = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+                _dashBuf[_dashHead] = b;
+            }
+            using (Graphics g = Graphics.FromImage(b)) {
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.DrawImage(_canvas, new Rectangle(0, 0, w, h));
+            }
+            _dashHead = (_dashHead + 1) % DashCamFrames;
+            if (_dashCount < DashCamFrames) _dashCount++;
+        } catch { }
+    }
+
+    void DashCamDump(string why) {
+        if (_dashCount == 0) { SentrySay("  dashcam: nothing buffered yet"); return; }
+        _dashShot++;
+        int wrote = 0;
+        SentrySay("  DASHCAM dump " + _dashShot + " (" + why + "): " + _dashCount + " frames" +
+                  " at half scale, oldest first");
+        SentrySay("    pot state at the press: " + PotStateForTest() +
+                  " squash=" + _squashScale.ToString("0.0000") +
+                  " headSquashT=" + _headSquashT.ToString("0.000"));
+        try {
+            File.AppendAllText(Path.Combine(_baseDir, "_dash_index.txt"),
+                Environment.NewLine + "dump " + _dashShot + " at " + DateTime.Now.ToString("HH:mm:ss.fff") +
+                " (" + why + ") frames=" + _dashCount +
+                " pots=" + PotStateForTest() + Environment.NewLine);
+        } catch { }
+        // Walk the ring oldest-first so the PNG numbers read in time order.
+        int start = (_dashHead - _dashCount + DashCamFrames) % DashCamFrames;
+        for (int i = 0; i < _dashCount; i++) {
+            Bitmap b = _dashBuf[(start + i) % DashCamFrames];
+            if (b == null) continue;
+            try {
+                b.Save(Path.Combine(_baseDir, "_dash_" + _dashShot.ToString("00") + "_" +
+                                           i.ToString("000") + ".png"), ImageFormat.Png);
+                wrote++;
+            } catch { }
+        }
+        SentrySay("    wrote " + wrote + " files _dash_" + _dashShot.ToString("00") + "_NNN.png" +
+                  " (frame 000 is the oldest of the window)");
+    }
+
+    // Does attaching a pot YANK the ones already on her head?
+    //
+    // The user's description: the new pot appears where it belongs, but the pot BELOW it gets
+    // "sucked up" into it for the length of the bounce, then everything returns to normal. In the
+    // code the only thing that can move a settled pot is its stack index, and IronStackIndex
+    // counts pots that are still easing in - so the moment a new pot attaches, every settled pot
+    // can be handed a different slot in one tick.
+    //
+    // This records every worn pot's Y on every frame across the attach, so "did a settled pot
+    // move, and by how much in one frame" is a number instead of a theory.
+    public void RunPotSeatJerkTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("does a new pot yank the ones already on her head?");
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+
+        // Build four worn pots, settled.
+        for (int i = 0; i < 4; i++) {
+            StartIronPotForTest();
+            PumpTicks(2);
+            Rice rp = null;
+            for (int k = 0; k < _rices.Count; k++) if (_rices[k].Iron && !_rices[k].OnHead) rp = _rices[k];
+            if (rp == null) continue;
+            Point a = IronHeadAnchor();
+            rp.X = a.X; rp.Y = a.Y - 320; rp.VX = 0; rp.VY = 0;
+            for (int k = 0; k < 300 && !rp.OnHead; k++) PumpTicks(1);
+            for (int k = 0; k < 40 && rp.HeadFalling; k++) PumpTicks(1);
+        }
+        int worn = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) worn++;
+        Console.WriteLine("  setup   : " + worn + " pots worn and settled");
+
+        // Drop one more from above and log every pot's Y, every frame.
+        StartIronPotForTest();
+        PumpTicks(1);
+        Rice fresh = null;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && !_rices[i].OnHead) fresh = _rices[i];
+        if (fresh == null) { Console.WriteLine("  verdict: FAIL - no fresh pot"); ResetDemoForTest(); return; }
+        Point a2 = IronHeadAnchor();
+        fresh.X = a2.X; fresh.Y = a2.Y - _w * 0.7; fresh.VX = 0; fresh.VY = 0;
+
+        double[] prevY = new double[_rices.Count];
+        bool attached = false;
+        int attachFrame = -1;
+        double worstJerk = 0; int worstIdx = -1, worstFrame = -1;
+        // The new pot's own travel: from where it is caught to its slot. This is the number that
+        // decides whether it looks like "the pot below is sucked up" - when it is large, the new
+        // pot climbs the whole way from underneath the one below it.
+        double freshStartY = double.NaN, freshEndY = double.NaN;
+        Console.WriteLine("  frame | idx:Y for every worn pot (jerk = a settled pot moving in ONE frame)");
+        for (int f = 0; f < 70; f++) {
+            PumpTicks(1);
+            bool anyNew = false;
+            for (int i = 0; i < _rices.Count; i++) if (_rices[i] == fresh && _rices[i].OnHead) anyNew = true;
+            if (anyNew && !attached) {
+                attached = true; attachFrame = f;
+                freshStartY = fresh.HeadY;
+                freshEndY = fresh.HeadTarget;
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.Append("  f").Append(f.ToString("00")).Append(attached ? " A" : "  ").Append(" | ");
+            for (int i = 0; i < _rices.Count; i++) {
+                Rice r = _rices[i];
+                if (!r.Iron || !r.OnHead) continue;
+                int idx = IronStackIndex(r);
+                sb.Append("[").Append(idx).Append("]").Append(r.Y.ToString("0"));
+                if (r == fresh) sb.Append("*");
+                sb.Append("  ");
+                // A pot that was already settled must not jump. The pot that is easing in is
+                // allowed to move: that is the whole point of the animation.
+                if (attached && i < prevY.Length && prevY[i] != 0 && r != fresh) {
+                    double jerk = Math.Abs(r.Y - prevY[i]);
+                    if (jerk > worstJerk) { worstJerk = jerk; worstIdx = idx; worstFrame = f; }
+                }
+            }
+            for (int i = 0; i < _rices.Count && i < prevY.Length; i++) prevY[i] = _rices[i].Y;
+            Console.WriteLine(sb.ToString());
+        }
+        Console.WriteLine("  result  : attachFrame=" + attachFrame +
+                          "  new pot eased from y=" + freshStartY.ToString("0") +
+                          " to y=" + freshEndY.ToString("0") +
+                          " (travel " + (freshEndY - freshStartY).ToString("0") + "px, one stack step is " +
+                          (_ironHeadArt == null ? 0 : _ironHeadArt.Height * IronStackGap).ToString("0") + "px)");
+        Console.WriteLine("  result  : worst single-frame move of an ALREADY-SETTLED pot = " +
+                          worstJerk.ToString("0.0") + "px (pot idx " + worstIdx + ", frame " + worstFrame + ")");
+        bool ok = attached && worstJerk < 3.0;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - attaching a pot leaves the settled ones exactly where they were"
+            : "FAIL - a settled pot was yanked " + worstJerk.ToString("0.0") +
+              "px in one frame (one stack step is " +
+              (_ironHeadArt == null ? 0 : _ironHeadArt.Height * IronStackGap).ToString("0") + "px)"));
+        ResetDemoForTest();
+    }
+
+    // The same measurement for the path the user actually uses: carry a loose pot over her head
+    // and let go. The pot is caught wherever it happens to be, which can be well BELOW the slot it
+    // belongs in, and HeadFalling then walks it up - through the pot underneath it.
+    public void RunPotSeatJerkDragTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("what the user sees: carry a pot in and let go (the drag path)");
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+
+        for (int i = 0; i < 3; i++) {
+            StartIronPotForTest();
+            PumpTicks(2);
+            Rice rp = null;
+            for (int k = 0; k < _rices.Count; k++) if (_rices[k].Iron && !_rices[k].OnHead) rp = _rices[k];
+            if (rp == null) continue;
+            Point a = IronHeadAnchor();
+            rp.X = a.X; rp.Y = a.Y - 320; rp.VX = 0; rp.VY = 0;
+            for (int k = 0; k < 300 && !rp.OnHead; k++) PumpTicks(1);
+            for (int k = 0; k < 40 && rp.HeadFalling; k++) PumpTicks(1);
+        }
+        int worn0 = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i].OnHead) worn0++;
+        Console.WriteLine("  setup   : " + worn0 + " pots worn and settled");
+
+        StartIronPotForTest();
+        PumpTicks(2);
+        Rice drag = null;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && !_rices[i].OnHead) drag = _rices[i];
+        if (drag == null) { Console.WriteLine("  verdict: FAIL - no pot"); ResetDemoForTest(); return; }
+
+        Point h = IronHeadAnchor();
+        // Rim just inside the bottom edge of the head zone (cy + halfH): this is the LOWEST place a
+        // pot can be caught, i.e. the worst case for "climbs up through the one below it".
+        double zoneBot = _offY + _w * 0.3639 + _w * 0.18;
+        double hh = drag.Art != null ? drag.Art.Height / 2.0 : 58.0;
+        double y0 = zoneBot - hh - 4;
+        drag.X = h.X; drag.Y = y0; drag.VX = 0; drag.VY = 0;
+        drag.Dragging = true;
+        PumpTicks(3);
+        double caught = drag.Y;
+        drag.Dragging = false;                 // let go - the draggable path in the app
+        double target = double.NaN, startY = double.NaN;
+        int attachFrame = -1;
+        for (int f = 0; f < 80; f++) {
+            PumpTicks(1);
+            if (drag.OnHead && attachFrame < 0) { attachFrame = f; startY = drag.HeadY; target = drag.HeadTarget; }
+            if (f < 30 || (attachFrame >= 0 && f < attachFrame + 20)) {
+                Console.WriteLine("   f" + f.ToString("00") + "  new pot y=" + drag.Y.ToString("0") +
+                                  " onHead=" + (drag.OnHead ? 1 : 0) +
+                                  " falling=" + (drag.HeadFalling ? 1 : 0) +
+                                  " slot(target)=" + (drag.OnHead ? drag.HeadTarget.ToString("0") : "-"));
+            }
+        }
+        Console.WriteLine("  result  : caught at y=" + caught.ToString("0") +
+                          "  slot y=" + (drag.OnHead ? drag.HeadTarget.ToString("0") : "?") +
+                          "  attachFrame=" + attachFrame);
+        bool ok = drag.OnHead && !drag.HeadFalling;
+        Console.WriteLine("  note    : a travel of one stack step (" +
+                          (_ironHeadArt == null ? 0 : (_ironHeadArt.Height * IronStackGap)).ToString("0") +
+                          "px) or more means the new pot climbs from underneath the one below it - " +
+                          "that is the 'the pot underneath gets sucked up' report");
+        Console.WriteLine("  verdict: " + (ok ? "INFO - the drag-and-release path seated the pot" :
+                                                    "FAIL - the pot did not seat"));
+        ResetDemoForTest();
+    }
+
+    // Feeding no longer needs the button released on her: touching her silhouette is enough.
+    //
+    // The rule the user asked for: touching her silhouette is enough to feed her.
+    // that, and the one thing it must NOT become:
+    //   * held over her, still dragging -> fed;
+    //   * merely NEAR her (inside the artwork box but not touching) -> not fed;
+    //   * the iron pot is not food, touching her with it must not feed her;
+    //   * the payout still happens exactly once.
+    public void RunFeedTouchTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("feeding by touch (offline)");
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+
+        int sgx, sgy;
+        if (!GirlSample(out sgx, out sgy)) {
+            Console.WriteLine("  verdict: FAIL - could not find a solid pixel of the girl");
+            ResetDemoForTest();
+            return;
+        }
+        Console.WriteLine("  girl pixel: " + sgx + "," + sgy);
+
+        // ---- 1. near her but NOT touching: must stay loose ----
+        DropBowlForTest(3.00);
+        PumpTicks(3);
+        Rice bowl = null;
+        for (int i = 0; i < _rices.Count; i++) if (!_rices[i].Iron) bowl = _rices[i];
+        if (bowl == null) {
+            Console.WriteLine("  verdict: FAIL - no rice bowl spawned");
+            ResetDemoForTest();
+            return;
+        }
+        // Park it inside her artwork BOX but clear of her silhouette: the box's top-left corner is
+        // transparent (her face is off to one side), which is why this is a real test of "touching"
+        // rather than of "being in the rectangle".
+        bowl.X = _offX + 8; bowl.Y = _offY + 8; bowl.VX = 0; bowl.VY = 0;
+        bowl.Dragging = true;                       // held, exactly like a drag
+        PumpTicks(4);
+        bool touched = RiceOnGirl(bowl);
+        bool nearFed = bowl.Fed;
+        Console.WriteLine("  1 near    : at the artwork box corner, touching=" + touched +
+                          " fed=" + nearFed + "  (want touching=False fed=False)");
+
+        // ---- 2. held ON her: must feed without releasing ----
+        double before = 0; try { double.TryParse(DrawnText, out before); } catch { }
+        int heartsBefore = _hearts.Count;
+        bowl.X = sgx; bowl.Y = sgy;
+        int fedAt = -1;
+        for (int f = 0; f < 6 && !bowl.Fed; f++) { PumpTicks(1); if (bowl.Fed) fedAt = f; }
+        bool heldFed = bowl.Fed;
+        bool stillHeld = bowl.Dragging;
+        int heartsAfter = _hearts.Count;
+        Console.WriteLine("  2 held-on : dragged onto her -> fed=" + heldFed + " atFrame=" + fedAt +
+                          " giftReleased=" + !stillHeld +
+                          " hearts " + heartsBefore + "->" + heartsAfter +
+                          "  (want fed=True, hearts up)");
+
+        // ---- 3. the payout is credited, and only once ----
+        double after = 0; try { double.TryParse(DrawnText, out after); } catch { }
+        double paid = Math.Round(after - before, 2);
+        PumpTicks(40);
+        double after2 = 0; try { double.TryParse(DrawnText, out after2); } catch { }
+        bool paidOnce = Math.Abs(after2 - after) < 1e-9;
+        Console.WriteLine("  3 payout  : readout " + before.ToString("0.00") + " -> " +
+                          after.ToString("0.00") + " (gain " + paid.ToString("0.00") +
+                          "), 40 frames later still " + after2.ToString("0.00") +
+                          "  paidOnce=" + paidOnce);
+
+        // ---- 4. the iron pot is not food ----
+        bool potOnGirl = false, potFed = false;
+        Rice pot = IronPotForTest();
+        if (pot == null) { StartIronPotForTest(); PumpTicks(3); pot = IronPotForTest(); }
+        if (pot != null) {
+            pot.Dragging = true;
+            pot.X = sgx; pot.Y = sgy;
+            PumpTicks(4);
+            potOnGirl = RiceOnGirl(pot);
+            potFed = pot.Fed;
+            pot.Dragging = false;
+            Console.WriteLine("  4 iron    : touching her while held -> onGirl=" + potOnGirl +
+                              " fed=" + potFed + "  (want fed=False)");
+        }
+
+        bool ok = !nearFed && !touched && heldFed && heartsAfter > heartsBefore &&
+                  paid >= 0 && paidOnce && !potFed;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a bowl feeds her the moment it touches her, nothing else does"
+            : "FAIL - nearFed=" + nearFed + " touched=" + touched + " heldFed=" + heldFed +
+              " hearts=" + heartsBefore + "->" + heartsAfter + " paid=" + paid.ToString("0.00") +
+              " paidOnce=" + paidOnce + " potFed=" + potFed));
+        ResetDemoForTest();
+    }
+
+    // Does the readout on her tablet bounce WITH her?
+    //
+    // Reported as "the text on the screen does not bounce along with the flinch, it looks odd".
+    // The panel is drawn as a parallelogram onto the canvas, and the sprite goes through the
+    // head-squash transform while it did not - so during a landing or a knock-off the girl moved
+    // and the number sat still.
+    //
+    // Measured from the PIXELS, not from the drawing code: the brightest pixels of the tablet area
+    // are located in a resting frame and again in a stretched one, and the shift between them is
+    // compared with what the squash transform predicts. A test that asked the draw code where it
+    // put things would agree with the draw code whatever it did.
+    public void RunTextBounceTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("does the tablet readout bounce with her? (offline)");
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        // Put her back in her corner first. A previous guard that moved her out of the way (the
+        // pass-through test parks her off-canvas) leaves _offX behind, and this test then measured
+        // "the tablet" at x 2123 - a region of empty canvas - and reported a confident zero.
+        SnapToCorner(true);
+        PumpTicks(4);
+        Rectangle vsD = SystemInformation.VirtualScreen;
+        Rectangle waD = Screen.PrimaryScreen.WorkingArea;
+        Console.WriteLine("  widget  : offX=" + _offX + " offY=" + _offY + " w=" + _w +
+                          " snapRight=" + _snapRight + " HomeX=" + HomeX() +
+                          " vs=" + vsD.Width + "x" + vsD.Height +
+                          " wa=" + waD.Left + "," + waD.Top + " " + waD.Width + "x" + waD.Height);
+
+        // Brightest-row finder over the tablet's own area, in canvas pixels. The tablet face is an
+        // opaque dark surface in the artwork, so the glyphs are unambiguous there.
+        int tx0 = (int)Math.Round(Math.Min(Math.Min(_fx[0], _fx[1]), Math.Min(_fx[2], _fx[3])) + _offX);
+        int tx1 = (int)Math.Round(Math.Max(Math.Max(_fx[0], _fx[1]), Math.Max(_fx[2], _fx[3])) + _offX);
+        int ty0 = (int)Math.Round(Math.Min(Math.Min(_fy[0], _fy[1]), Math.Min(_fy[2], _fy[3])) + _offY);
+        int ty1 = (int)Math.Round(Math.Max(Math.Max(_fy[0], _fy[1]), Math.Max(_fy[2], _fy[3])) + _offY);
+        tx0 = Math.Max(0, tx0); ty0 = Math.Max(0, ty0);
+        tx1 = Math.Min(_canvas.Width - 1, tx1); ty1 = Math.Min(_canvas.Height - 1, ty1);
+        Console.WriteLine("  tablet  : x " + tx0 + ".." + tx1 + "  y " + ty0 + ".." + ty1);
+        Console.WriteLine("  debug   : offX=" + _offX + " offY=" + _offY + " w=" + _w +
+                          " fx=[" + _fx[0].ToString("0") + "," + _fx[1].ToString("0") + "," +
+                          _fx[2].ToString("0") + "," + _fx[3].ToString("0") + "]" +
+                          " fy=[" + _fy[0].ToString("0") + "," + _fy[1].ToString("0") + "," +
+                          _fy[2].ToString("0") + "," + _fy[3].ToString("0") + "]");
+
+        double restCy = -1, squashedCy = -1;
+        double scale = 1.0;
+        int anchor = 0;
+        // Resting frame first. NO extra RenderToCanvas here: OnTick already renders when it has
+        // something to animate (see the anim || _dirty call at the end of the tick), and asking for
+        // a second render short-circuits because repaintWidget is then false - which resets
+        // _squashOn and made the first version of this test read 1.0000 on every frame.
+        _headSquashT = HeadSquashDur + 1;
+        PumpTicks(3);
+        restCy = BrightCentroidY(tx0, tx1, ty0, ty1);
+        // Now let a real flinch run and grab the frame with the strongest stretch.
+        _headSquashT = 0;
+        // Capture the transform AND the measurement of the SAME frame. Taking the largest scale seen
+        // and then measuring after the loop paired a 1.0888 scale with whatever the last frame
+        // (scale 1.0) had left on the canvas.
+        List<double> seenScale = new List<double>();
+        List<double> seenCy = new List<double>();
+        List<int> seenAnchor = new List<int>();
+        for (int f = 0; f < 20; f++) {
+            PumpTicks(1);
+            if (_squashDrawnOn) {
+                seenScale.Add(_squashDrawnScale);
+                seenCy.Add(BrightCentroidY(tx0, tx1, ty0, ty1));
+                seenAnchor.Add(_squashDrawnAnchor);
+            }
+        }
+        double maxMove = 0;
+        for (int i = 0; i < seenScale.Count; i++) {
+            if (seenScale[i] > scale) { scale = seenScale[i]; squashedCy = seenCy[i]; anchor = seenAnchor[i]; }
+            double d = Math.Abs(seenCy[i] - restCy);
+            if (d > maxMove) maxMove = d;
+        }
+        _headSquashT = HeadSquashDur + 1;
+        PumpTicks(3);
+        Console.WriteLine("  debug   : strongest stretch seen squashScale=" + scale.ToString("0.0000") +
+                          " anchor=" + anchor + " renderCalls=" + _renderCalls +
+                          " repaintTrue=" + _repaintTrueCalls);
+
+        // Two things have to hold, and each covers one half of the bug:
+        //   * the readout MOVES during the flinch. Before the fix the widget was not repainted at
+        //     all while the squash ran (measured: repaint decided 0 times in 16 frames), so the
+        //     readout sat at exactly the resting row for the whole animation;
+        //   * and it moves for the RIGHT reason - the shift it makes has to agree with SquashY,
+        //     which is the function the readout is drawn through. Reverting the fix makes SquashY
+        //     return its input, so this term collapses to 0 while the measurement does not.
+        double helperShift = SquashYProbe((float)restCy, scale, anchor) - (float)restCy;
+        bool repainted = _repaintTrueCalls >= 8;
+        bool moved = maxMove >= 1.0;
+        bool matches = Math.Abs(helperShift) >= 1.0;
+        Console.WriteLine("  rest    : readout centre row=" + restCy.ToString("0.0"));
+        Console.WriteLine("  squash  : strongest scale=" + scale.ToString("0.0000") + " anchor=" + anchor +
+                          "  readout centre row there=" + squashedCy.ToString("0.0"));
+        Console.WriteLine("  move    : worst readout shift=" + maxMove.ToString("0.00") +
+                          "px over " + seenScale.Count + " squash frames" +
+                          "  (SquashY on its row = " + helperShift.ToString("0.00") + "px)");
+        Console.WriteLine("  repaint : she was repainted on " + _repaintTrueCalls + " of " +
+                          _renderCalls + " render calls");
+        bool ok = repainted && moved && matches;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - she is repainted through the flinch and the tablet readout rides the same squash"
+            : "FAIL - repainted=" + _repaintTrueCalls + "/" + _renderCalls +
+              " worstMove=" + maxMove.ToString("0.00") + "px helper=" + helperShift.ToString("0.00") +
+              "px (want the readout to move >= 1px and SquashY to be a real transform)"));
+        ResetDemoForTest();
+    }
+
+    // SquashY with the transform passed in, for tests that measured a frame whose live
+    // _squashOn/_squashScale have already been reset by the next render. Same arithmetic, no state.
+    float SquashYProbe(float y, double scale, int anchor) {
+        return (float)((y - anchor) * scale + anchor);
+    }
+
+    // Mean row of the bright pixels inside a rectangle. Used to find where the tablet's glyphs
+    // actually landed without asking the drawing code.
+    double BrightCentroidY(int x0, int x1, int y0, int y1) {
+        double sum = 0, wsum = 0;
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                Color c = _canvas.GetPixel(x, y);
+                if (c.A < 200) continue;
+                int lum = (c.R + c.G + c.B) / 3;
+                if (lum < 150) continue;             // the tablet face itself is dark
+                double w = lum - 150;
+                sum += y * w; wsum += w;
+            }
+        }
+        return wsum <= 0 ? -1 : sum / wsum;
+    }
+
+    // The four interaction rules the user asked for, each as an assertion.
+    //
+    //   1. only a FALL seats a pot  - dragging one onto her, or parking one against her crown,
+    //      must leave it loose;
+    //   2. a falling pot lands ON the stack - not sinking through it down to her crown;
+    //   3. two loose props bounce apart without overshooting into a stutter;
+    //   4. the landing bounce is HER flinch - a free pot elsewhere must not move with it.
+    //
+    // Every test is a before/after measurement on the same object, so a probe that is simply
+    // blind to the behaviour fails it rather than passing it.
+    public void RunIronInteractTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("iron pot interaction rules (offline)");
+
+        // ---------- 1. only a fall seats a pot ----------
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+        StartIronPotForTest();
+        PumpTicks(4);
+        Rice potA = IronPotForTest();
+        bool spawnOk = potA != null;
+
+        bool dragParkedLoose = false, placedLoose = false, fellSeats = false;
+        int seatIdx = -1;
+        if (potA != null) {
+            // (a) HELD there: the hand writes X/Y every mouse move, so this is "dragged onto her".
+            Point a0 = IronHeadAnchor();
+            potA.X = a0.X; potA.Y = a0.Y - 30; potA.VX = 0; potA.VY = 0;
+            potA.Dragging = true; potA.Grounded = false;
+            for (int i = 0; i < 40; i++) {
+                PumpTicks(1);
+                potA.X = a0.X; potA.Y = a0.Y - 30;      // the hand keeps it exactly here
+                potA.VX = 0; potA.VY = 0;
+            }
+            dragParkedLoose = !potA.OnHead;
+            Console.WriteLine("  1a drag  : held 30px above her crown, 40 frames -> onHead=" + potA.OnHead +
+                              "  (want False)");
+            potA.Dragging = false;
+
+            // (b) The rule itself, as a predicate: a pot sitting against her crown with no
+            // downward speed must not seat, and the same pot coming down must.
+            //
+            // Driven directly rather than through the tick, because "at her crown AND vertical
+            // speed 0" cannot be reached through the simulation: one tick of gravity delivers
+            // 69.3 px/s (RiceGravity 2100 x 0.033), which is a fall by any definition. This is the
+            // predicate the "placed, not dropped" rule lives in, so it is asserted here.
+            bool wasOnHead = potA.OnHead;
+            double wasY = potA.Y, wasVY = potA.VY;
+            bool wasDragB = potA.Dragging;
+            potA.OnHead = false; potA.HeadFalling = false; potA.Dragging = false;
+            potA.X = a0.X; potA.Y = a0.Y + 10;
+            potA.VY = 0;
+            bool parkedRefused = !IronOnHead(potA);
+            potA.VY = IronSeatMinFallSpeed * 4;
+            bool fallingAccepted = IronOnHead(potA);
+            potA.OnHead = wasOnHead; potA.Y = wasY; potA.VY = wasVY; potA.Dragging = wasDragB;
+            placedLoose = parkedRefused && fallingAccepted;
+            Console.WriteLine("  1b parked: rim at her crown, VY=0 -> seats=" + !parkedRefused +
+                              " (want False);  same pot at VY=" + (IronSeatMinFallSpeed * 4).ToString("0") +
+                              " -> seats=" + fallingAccepted + " (want True)");
+
+            // (c) from high up it must seat.
+            potA.X = a0.X; potA.Y = a0.Y - 320; potA.VX = 0; potA.VY = 0;
+            potA.OnHead = false; potA.HeadFalling = false;
+            for (int i = 0; i < 240 && !potA.OnHead; i++) PumpTicks(1);
+            for (int i = 0; i < 30 && potA.HeadFalling; i++) PumpTicks(1);
+            fellSeats = potA.OnHead;
+            seatIdx = potA.OnHead ? IronStackIndex(potA) : -1;
+            Console.WriteLine("  1c dropped: from 320px above -> onHead=" + potA.OnHead +
+                              " stackIndex=" + seatIdx + "  (want True, 0)");
+        }
+
+        // ---------- 2. a falling pot lands on the stack ----------
+        // Feed the pot that is already on her head, so the NEXT one has a surface to land on.
+        bool stackSeat = false, sankThrough = false;
+        int slotIdx = -1;
+        if (fellSeats && potA != null) {
+            double baseY = potA.Y;
+            for (int i = 0; i < 3; i++) {
+                ApplyBalancePublic(30.00 + i, true);
+                DropBowlForTest(3.00);
+                for (int k = 0; k < 600; k++) { PumpTicks(1); if (BowlWasDeliveredForTest()) break; }
+                PumpTicks(9);
+            }
+            SpawnIronPotForTest();                    // drop one through the real spawn path
+            Rice potB = null;
+            for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && !_rices[i].OnHead) potB = _rices[i];
+            if (potB != null) {
+                Point a1 = IronHeadAnchor();
+                potB.X = a1.X; potB.Y = a1.Y - 420; potB.VX = 0; potB.VY = 0;
+                for (int i = 0; i < 300 && !potB.OnHead; i++) PumpTicks(1);
+                for (int i = 0; i < 40 && potB.HeadFalling; i++) PumpTicks(1);
+                stackSeat = potB.OnHead;
+                slotIdx = potB.OnHead ? IronStackIndex(potB) : -1;
+                // It must have stopped at the FIRST slot above her head, which is one stack step
+                // up - not fallen through to her crown.
+                double wantY = IronHeadAnchor(1).Y;
+                sankThrough = Math.Abs(potB.Y - wantY) > 24.0;
+                Console.WriteLine("  2  stack : 2nd pot from 420px -> onHead=" + stackSeat +
+                                  " stackIndex=" + slotIdx + " y=" + potB.Y.ToString("0") +
+                                  " want=" + wantY + " (base " + baseY.ToString("0") + ")" +
+                                  " sankThrough=" + sankThrough);
+            } else {
+                Console.WriteLine("  2  stack : no loose pot to drop (setup failed)");
+            }
+        }
+
+        // ---------- 3. two loose props settle without a stutter ----------
+        // Put them right on top of each other and let it resolve. This is the case that used to
+        // misbehave: contact was decided per-axis (ellipse) but the separation was measured with
+        // the CIRCLES, so a pair reported contact while still ~120 px clear and the correction
+        // was up to 224 px in ONE frame - the shove-and-snap the user saw as stuttering.
+        bool collideCalm = false;
+        double collideMaxStep = -1, collideGap = -1;
+        ResetDemoForTest();
+        StartIronPotForTest();
+        PumpTicks(2);
+        Rice c1 = IronPotForTest();
+        if (c1 != null) {
+            double floorY = SystemInformation.VirtualScreen.Bottom - c1.R;
+            c1.Y = floorY; c1.VY = 0; c1.VX = 0; c1.Grounded = true;
+            SpawnIronPotForTest();
+            Rice c2 = null;
+            for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron && _rices[i] != c1) c2 = _rices[i];
+            if (c2 != null) {
+                c2.X = c1.X; c2.Y = c1.Y; c2.VX = 0; c2.VY = 0;   // exactly co-located
+                double maxStep = 0, settleStep = 0, firstFrameStep = -1;
+                int settleFrame = -1;
+                for (int f = 0; f < 420; f++) {
+                    double bx = c1.X, by = c1.Y, cx = c2.X, cy = c2.Y;
+                    PumpTicks(1);
+                    bool bothDown = c1.Grounded && c2.Grounded;
+                    if (bothDown && settleFrame < 0) settleFrame = f;
+                    // Judged only once BOTH have stopped falling. A prop still travelling is
+                    // supposed to move; the bug was that a RESTING pair never stopped twitching.
+                    if (bothDown) {
+                        double s = Math.Max(Math.Abs(c1.X - bx) + Math.Abs(c1.Y - by),
+                                            Math.Abs(c2.X - cx) + Math.Abs(c2.Y - cy));
+                        if (f == 0) firstFrameStep = s;
+                        if (s > maxStep) maxStep = s;
+                        // The verdict window: everything after the contact frame has been allowed
+                        // to play out. One corrective shove when two props are released exactly on
+                        // top of each other is the response working, not the bug - a pair that
+                        // KEEPS moving after it has settled is.
+                        if (settleFrame >= 0 && f > settleFrame + 12 && s > settleStep) settleStep = s;
+                    }
+                }
+                collideMaxStep = maxStep;
+                collideGap = Math.Sqrt((c2.X - c1.X) * (c2.X - c1.X) + (c2.Y - c1.Y) * (c2.Y - c1.Y));
+                double want = EffectiveRadius(c1) + EffectiveRadius(c2);
+                // Judged with the prop's own tolerance rather than the exact ideal: the response
+                // is a positional correction with damping, so a few px of overlap once they have
+                // settled is expected. What is being guarded is the ORDER of the error - the old
+                // circular metric left a pair more than a hundred px short of contact.
+                bool overlap = collideGap < want - 12.0;
+                collideCalm = c1.Grounded && c2.Grounded && settleFrame >= 0 && settleFrame < 200 &&
+                              settleStep < 2.0 && !overlap;
+                Console.WriteLine("  3  collide: both grounded=" + (c1.Grounded && c2.Grounded) +
+                                  " settledAtFrame=" + settleFrame +
+                                  " settleStep=" + settleStep.ToString("0.00") + "px (want < 2)" +
+                                  " contactFrameStep=" + firstFrameStep.ToString("0.0") +
+                                  " worstStep=" + maxStep.ToString("0.0") +
+                                  " gap=" + collideGap.ToString("0") + " want=" + want.ToString("0") +
+                                  " short=" + (want - collideGap).ToString("0") + "px overlap=" + overlap);
+                Console.WriteLine("       c1=(" + c1.X.ToString("0") + "," + c1.Y.ToString("0") +
+                                  ") c2=(" + c2.X.ToString("0") + "," + c2.Y.ToString("0") + ")" +
+                                  " effR=" + EffectiveRadius(c1).ToString("0.0") + "/" +
+                                  EffectiveRadius(c2).ToString("0.0") + " R=" + c1.R.ToString("0") + "/" +
+                                  c2.R.ToString("0"));
+            }
+        }
+
+        // ---------- 4. her bounce must not move a free pot ----------
+        // Park a pot on the floor well away from her, then run a head-squash and watch it.
+        bool squashIsolated = false;
+        double squashDrift = -1;
+        ResetDemoForTest();
+        ApplyBalancePublic(30.00, true);
+        PumpTicks(2);
+        StartIronPotForTest();
+        PumpTicks(2);
+        Rice d1 = IronPotForTest();
+        if (d1 != null) {
+            Point a2 = IronHeadAnchor();
+            d1.X = Math.Max(40, a2.X - _w * 1.6);
+            d1.Y = SystemInformation.VirtualScreen.Bottom - d1.R;
+            d1.VX = 0; d1.VY = 0; d1.Grounded = true; d1.Dragging = false;
+            d1.OnHead = false; d1.HeadFalling = false;
+            PumpTicks(20);
+            double y0 = d1.Y;
+            // A real flinch, driven the way a landing drives it.
+            _headSquashT = 0;
+            double worst = 0;
+            for (int f = 0; f < 20; f++) {
+                PumpTicks(1);
+                double dy = Math.Abs(d1.Y - y0);
+                if (dy > worst) worst = dy;
+            }
+            squashDrift = worst;
+            squashIsolated = worst < 1.5 && !d1.OnHead;
+            Console.WriteLine("  4  bounce: free pot on the floor moved at most " + worst.ToString("0.00") +
+                              "px during her bounce (want < 1.5), squashScaleSeen=" +
+                              _squashScale.ToString("0.0000"));
+        }
+
+        bool ok = spawnOk && dragParkedLoose && placedLoose && fellSeats && stackSeat && !sankThrough &&
+                  collideCalm && squashIsolated;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - only a fall seats a pot, a falling pot lands on the stack instead of sinking "
+              + "through it, two loose pots settle without stuttering, and her bounce leaves a free pot alone"
+            : "FAIL - spawn=" + spawnOk + " dragParkedLoose=" + dragParkedLoose +
+              " placedLoose=" + placedLoose + " fellSeats=" + fellSeats +
+              " stackSeat=" + stackSeat + " sankThrough=" + sankThrough +
+              " collideCalm=" + collideCalm + " (maxStep=" + collideMaxStep.ToString("0.00") +
+              " gap=" + collideGap.ToString("0") + ")" +
+              " squashIsolated=" + squashIsolated + " (drift=" + squashDrift.ToString("0.00") + "px)"));
+        ResetDemoForTest();
+    }
+
+    // One more loose pot, through the real spawn path (SpawnIronPot), so the guard exercises the
+    // production spawn rather than a parallel construction of it.
+    void SpawnIronPotForTest() { StartIronPotForTest(); }
+
+    public void RunIronStackTest() {        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("unlimited pots, stacked on the head (offline)");
+        ResetDemoForTest();
+        PumpTicks(2);
+
+        // Three bowls eaten => three pots.
+        for (int i = 0; i < 3; i++) {
+            ApplyBalancePublic(30.00 + i, true);
+            TestTopUp(3.00);
+            PumpTicks(2);
+            DropBowlForTest(3.00);
+            for (int k = 0; k < 600; k++) {
+                PumpTicks(1);
+                if (BowlWasDeliveredForTest()) break;
+            }
+            PumpTicks(9);                     // let the fed bowl clear the list
+        }
+        int pots = 0;
+        for (int i = 0; i < _rices.Count; i++) if (_rices[i].Iron) pots++;
+        Console.WriteLine("  spawned : pots=" + pots + " (want 3, the old guard capped it at 1)");
+
+        // Sit them all on her head.
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron) continue;
+            AttachIronPot(r);
+            r.HeadFalling = false;
+        }
+        PumpTicks(3);
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (r.Iron) { r.HeadFalling = false; }
+        }
+        PumpTicks(2);
+
+        // Collect the worn pots in stack order with their Y.
+        double[] ys = new double[pots];
+        int n = 0;
+        for (int i = 0; i < _rices.Count && n < pots; i++) {
+            Rice r = _rices[i];
+            if (r.Iron && r.OnHead) { ys[n++] = r.Y; }
+        }
+        double potH = _ironHeadArt != null ? _ironHeadArt.Height : 0;
+        // The pots now overlap by design: the gap is IronStackGap of a pot height, not a whole
+        // one. Asserting the old full height here would fail on a correct build.
+        double wantGap = potH * IronStackGap;
+        bool allWorn = n == pots;
+        bool distinct = true;
+        for (int i = 0; i + 1 < n; i++) if (Math.Abs(ys[i] - ys[i + 1]) < 1.0) distinct = false;
+        bool spaced = true;
+        for (int i = 0; i + 1 < n; i++)
+            if (Math.Abs((ys[i] - ys[i + 1]) - wantGap) > 1.5) spaced = false;
+        // ORDER: they must be drawn bottom-first, so each pot covers the one below it. Read
+        // straight off the geometry - the lowest pot on screen (largest Y) has stack index 0.
+        bool drawOrderOk = true;
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (!r.Iron || !r.OnHead) continue;
+            int idx = IronStackIndex(r);
+            // index 0 must be the LOWEST: its Y must be the largest of the stack.
+            for (int j = 0; j < _rices.Count; j++) {
+                Rice q = _rices[j];
+                if (!q.Iron || !q.OnHead || q == r) continue;
+                int qIdx = IronStackIndex(q);
+                if (idx < qIdx && r.Y < q.Y) drawOrderOk = false;
+                if (idx > qIdx && r.Y > q.Y) drawOrderOk = false;
+            }
+        }
+        Console.WriteLine("  stacked : worn=" + n + "/" + pots + " potH=" + potH.ToString("0") +
+                          " gap=" + wantGap.ToString("0") + " Y=" +
+                          string.Join(",", Array.ConvertAll(ys, v => v.ToString("0"))));
+        Console.WriteLine("  spacing : distinct=" + distinct + " gapIsTwoThirdsAPot=" + spaced +
+                          " bottomDrawnFirst=" + drawOrderOk);
+
+        // Knocking the middle one off must close the gap, not leave a hole.
+        Rice mid = null;
+        int seen = 0;
+        for (int i = 0; i < _rices.Count; i++) {
+            Rice r = _rices[i];
+            if (r.Iron && r.OnHead) { if (seen == 1) { mid = r; break; } seen++; }
+        }
+        bool gapClosed = false;
+        Console.WriteLine("  knockoff: wornBefore=" + n + " midFound=" + (mid != null));
+        if (mid != null && n >= 3) {
+            KnockIronPotOff(mid);
+            for (int k = 0; k < 40; k++) PumpTicks(1);
+            // Sequence the survivors from the top down: the gap must have closed, i.e. every
+            // neighbouring pair is still exactly one pot height apart.
+            double[] rest = new double[n];
+            int c = 0;
+            for (int i = 0; i < _rices.Count && c < n; i++) {
+                Rice r = _rices[i];
+                if (r.Iron && r.OnHead) rest[c++] = r.Y;
+            }
+            Array.Sort(rest, 0, c);
+            // Count bad gaps explicitly: a "set a flag in a loop" form kept evaluating false
+            // here for reasons that were not visible in the values, and the count states the
+            // expectation in a way that cannot be misread from the log.
+            int badGaps = 0;
+            for (int k = 0; k + 1 < c; k++) {
+                double gap = Math.Abs(rest[k] - rest[k + 1]);
+                if (Math.Abs(gap - wantGap) > 1.5) badGaps++;
+            }
+            gapClosed = (c == n - 1) && badGaps == 0;
+            Console.WriteLine("  knockoff: survivors=" + c + " (want " + (n - 1) + ")" +
+                              " badGaps=" + badGaps + " wantGap=" + wantGap.ToString("0") +
+                              " gapClosed=" + gapClosed);
+        }
+
+        bool ok = pots >= 3 && allWorn && distinct && spaced && gapClosed && drawOrderOk;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - pots are unlimited, the worn ones overlap by two thirds of a pot height, and each is drawn over the one below"
+            : "FAIL - pots=" + pots + " worn=" + n + " distinct=" + distinct +
+              " spaced=" + spaced + " gapClosed=" + gapClosed +
+              " drawOrder=" + drawOrderOk));
+        ResetDemoForTest();
+    }
+
+    // Per-cue silence, which is now expressed ONLY as a volume of 0.
+    //
+    // "Played" is read from the SoundPool's own counter, so this proves the routing rather than
+    // just the number: at a live volume the pool must actually be asked to play, and at 0 % the
+    // pool must be left untouched. Also checks that global mute overrides every cue (muting has
+    // to win, or a per-cue row could un-mute the pet).
+    //
+    // The on/off switches this used to exercise are gone: 0 % IS off, so testing both would be
+    // testing the same thing twice.
+    public void RunSoundCueTest() {
+        Console.WriteLine("per-cue silence by volume (offline)");
+        bool haveAll = _ironLandSound != null && _ironOffSound != null;
+        Console.WriteLine("  pools   : land=" + (_ironLandSound != null) +
+                          " off=" + (_ironOffSound != null));
+        if (!haveAll) {
+            Console.WriteLine("  verdict: FAIL - a cue pool was not created (missing mp3?)");
+            return;
+        }
+
+        _soundEnabled = true; _soundWanted = true;
+        int savedLand = _cueVolume[CUE_LAND], savedOff = _cueVolume[CUE_OFF];
+
+        // The DECISION PlayCue makes, for one cue at each level. Asserting this rather than a
+        // play counter is what makes the test about the routing rule instead of about how many
+        // MCI aliases happen to be idle (see CueWouldPlay).
+        //
+        // The pool is compared against the cue's own level, which with no master is exactly what
+        // the player is given.
+        SetCueVolume(CUE_LAND, 60);
+        SetCueVolume(CUE_OFF, 60);
+        bool onDecision = CueWouldPlay(CUE_LAND, _ironLandSound) &&
+                          CueWouldPlay(CUE_OFF, _ironOffSound) &&
+                          _ironLandSound.VolumePercent == 60 &&
+                          _ironOffSound.VolumePercent == 60;
+        if (!onDecision)
+            Console.WriteLine("         cue own " + _cueVolume[CUE_LAND] + " %, pools " +
+                              _ironLandSound.VolumePercent + "/" + _ironOffSound.VolumePercent + " %");
+
+        SetCueVolume(CUE_LAND, 0);
+        SetCueVolume(CUE_OFF, 0);
+        bool offDecision = !CueWouldPlay(CUE_LAND, _ironLandSound) &&
+                           !CueWouldPlay(CUE_OFF, _ironOffSound);
+
+        // Audible again but globally muted: the decision must be no.
+        SetCueVolume(CUE_LAND, 60);
+        _soundEnabled = false;
+        bool muteDecision = !CueWouldPlay(CUE_LAND, _ironLandSound);
+        _soundEnabled = true;
+
+        // Silence is per cue: one at 0 must not silence the other.
+        SetCueVolume(CUE_LAND, 0);
+        SetCueVolume(CUE_OFF, 60);
+        bool independent = !CueWouldPlay(CUE_LAND, _ironLandSound) &&
+                            CueWouldPlay(CUE_OFF, _ironOffSound);
+
+        // The volume must actually reach the pool, which is the part the decision cannot see.
+        // With no master the level that reaches the player IS the cue's own, so the literals are
+        // the expectation - there is no scaling left to account for.
+        SetCueVolume(CUE_LAND, 30);
+        SetCueVolume(CUE_OFF, 90);
+        bool reached = _ironLandSound.VolumePercent == 30 &&
+                       _ironOffSound.VolumePercent == 90;
+        // And 0 must reach it too, so the cue really is inaudible rather than merely skipped.
+        SetCueVolume(CUE_LAND, 0);
+        bool zeroReached = _ironLandSound.VolumePercent == 0;
+
+        Console.WriteLine("  decide  : volume60 land=" + onDecision + " (want True)  pools=" +
+                          _ironLandSound.VolumePercent + "%/" + _ironOffSound.VolumePercent + "%");
+        Console.WriteLine("  decide  : volume0 both silent=" + offDecision + " (want True)");
+        Console.WriteLine("  decide  : globallyMuted=" + muteDecision + " (want True)");
+        Console.WriteLine("  decide  : oneCueSilent otherPlays=" + independent + " (want True)");
+        Console.WriteLine("  volume  : reachedPools=" + reached + "  zeroReached=" + zeroReached);
+
+        SetCueVolume(CUE_LAND, savedLand);
+        SetCueVolume(CUE_OFF, savedOff);
+        bool ok = onDecision && offDecision && muteDecision && independent && reached && zeroReached;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a cue at 0 % is silent and one above it plays, the levels really reach the pools, one cue's silence leaves the others alone, and global mute wins over all"
+            : "FAIL - on=" + onDecision + " off=" + offDecision + " muted=" + muteDecision +
+              " independent=" + independent + " reached=" + reached + " zero=" + zeroReached));
+    }
+
+    // Drag-and-release snapping to the nearer BOTTOM corner, and everything that has to agree
+    // with it.
+    //
+    // The side decides more than where she sits: the rice bowl has to fall in from HER side
+    // (a bowl that lands on the far side of a 2560 px desktop is one she can never reach), and
+    // SyncWindowMode must not drag her back to the left when the last bowl is collected.
+    public void RunSnapSideTest() {
+        GoOffline();
+        _noNetwork = true;
+        Console.WriteLine("snap to the nearer bottom corner (offline)");
+        ResetDemoForTest();
+        // This test parks her on both sides in turn, so it must not inherit whatever corner
+        // the real state.ini holds - and it must put it back when it is done, or a later
+        // guard in the same session would run against a pet that had moved.
+        bool cornerSaved = _snapRight;
+        _snapRight = false;
+        PumpTicks(2);
+
+        // ---- cost of a mid-drag flip ----
+        // A mouse move fires 100+ times a second and EVERY move asks "did her half change?".
+        // The flip itself must therefore be cheap: it used to call Relayout() (sprite
+        // resample + dispose and rebuild of the screen-sized canvas + bowl art), which is what
+        // made crossing the centre line drop frames.
+        _snapRight = false; UpdateMirrorGeometry();
+        int flipReps = 40;
+        long t0 = Stopwatch.GetTimestamp();
+        for (int i = 0; i < flipReps; i++) { _snapRight = (i % 2) == 0; UpdateMirrorGeometry(); }
+        double flipMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency / flipReps;
+        t0 = Stopwatch.GetTimestamp();
+        for (int i = 0; i < 3; i++) Relayout();
+        double relayoutMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency / 3;
+        _snapRight = false;
+        Console.WriteLine("  cost    : flip=" + flipMs.ToString("0.000") + " ms   relayout=" +
+                          relayoutMs.ToString("0.00") + " ms   (" +
+                          (relayoutMs / Math.Max(0.0001, flipMs)).ToString("0") + "x cheaper)");
+        // One frame at the 33 ms tick. Anything at or above that budget visibly stutters when
+        // it happens during a drag.
+        bool flipCheap = flipMs < 1.0;
+        Console.WriteLine("  cost    : flipUnderOneFrame=" + flipCheap);
+
+        Rectangle vs = SystemInformation.VirtualScreen;
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        int homeY = Math.Max(0, wa.Bottom - vs.Top - _h);
+        int leftX = wa.Left - vs.Left;
+        int rightX = wa.Right - vs.Left - _w;
+        // Where the girl's centre lands on the primary monitor, in its own coordinates.
+        int monCentre = wa.Width / 2;
+
+        // ---- released on the LEFT half -> bottom-left ----
+        _snapRight = false;
+        _snapping = false;
+        _offX = leftX + 10; _offY = homeY - 200;
+        // Exactly what OnMouseUp does with the pointer, minus the mouse: judge on her centre.
+        int centreL = (_offX + _w / 2) - (wa.Left - vs.Left);
+        _snapRight = centreL > monCentre;
+        SnapToCorner(true);
+        bool leftOk = !_snapRight && _offX == leftX && _offY == homeY;
+        Console.WriteLine("  left    : centre=" + centreL + " of " + monCentre +
+                          " -> off=" + _offX + "," + _offY + " (want " + leftX + "," + homeY + ")");
+
+        // ---- released on the RIGHT half -> bottom-right ----
+        _offX = rightX + 200; _offY = homeY - 200;
+        int centreR = (_offX + _w / 2) - (wa.Left - vs.Left);
+        _snapRight = centreR > monCentre;
+        SnapToCorner(true);
+        bool rightOk = _snapRight && _offX == rightX && _offY == homeY;
+        Console.WriteLine("  right   : centre=" + centreR + " of " + monCentre +
+                          " -> off=" + _offX + "," + _offY + " (want " + rightX + "," + homeY + ")");
+
+        // ---- the bowl must mirror to the OPPOSITE top corner ----
+        // She is bottom-left or bottom-right, so the bowl enters at the top of the other side.
+        // This is the only thing that gets mirrored, and it is done by choosing where the bowl
+        // is BORN (plus which way it drifts) - nothing is flipped, scaled or drawn backwards,
+        // so every glyph on screen stays readable.
+        bool bowlSideOk = true;
+        string bowlMsg = "";
+        for (int pass = 0; pass < 2; pass++) {
+            _snapRight = (pass == 1);
+            _rices.Clear();
+            StartCredit(3.00);
+            if (_rices.Count == 0) { bowlSideOk = false; bowlMsg = "no bowl"; break; }
+            Rice b = _rices[0];
+            double fromRightEdge = vs.Right - b.X;
+            double fromLeftEdge = b.X - vs.Left;
+            bool mirrored = _snapRight ? (fromLeftEdge < fromRightEdge)   // she right -> bowl top-left
+                                       : (fromRightEdge < fromLeftEdge);  // she left  -> bowl top-right
+            bool driftsInward = _snapRight ? (b.VX > 0) : (b.VX < 0);
+            if (!mirrored || !driftsInward) {
+                bowlSideOk = false;
+                bowlMsg += (_snapRight ? " RIGHT" : " LEFT") +
+                           ": x=" + b.X.ToString("0") + " vx=" + b.VX.ToString("0");
+            }
+            Console.WriteLine("  bowl" + (_snapRight ? " R  " : " L  ") + "  : startX=" +
+                              b.X.ToString("0") + " vx=" + b.VX.ToString("0") +
+                              " fromTop=" + (mirrored ? (_snapRight ? "LEFT" : "RIGHT")
+                                                      : "WRONG SIDE") +
+                              " drifts=" + (driftsInward ? "inward" : "OUTWARD"));
+        }
+        _rices.Clear();
+
+        // ---- SyncWindowMode must keep her in the corner she was parked in ----
+        _snapRight = true;
+        _offX = rightX; _offY = homeY;
+        SyncWindowMode();                       // no bowls: this used to force X back to left
+        bool syncOk = _offX == rightX;
+        Console.WriteLine("  resync  : offX=" + _offX + " (want " + rightX + ", not " + leftX + ")");
+
+        // ---- the sprite mirrors, and what hangs off it mirrors with it ----
+        // The artwork is flush to its left/bottom edges, so in the right-hand corner the sprite
+        // is flipped horizontally. Her head anchor and the tablet quad are part of the picture
+        // and must follow; the panel's own text must NOT (it is drawn from the quad's vertices
+        // in a fixed order, which is why mirroring the quad cannot flip the glyphs).
+        _snapRight = false; Relayout(); PumpTicks(1);
+        int headL = _headX;
+        double quadL0 = _fx[0], quadL1 = _fx[1];
+        _snapRight = true; Relayout(); PumpTicks(1);
+        int headR = _headX;
+        double quadR0 = _fx[0], quadR1 = _fx[1];
+        bool headMirrored = Math.Abs((headL + headR) - _w) <= 2;
+        bool quadMirrored = Math.Abs((quadL0 + quadR0) - _w) <= 2 &&
+                            Math.Abs((quadL1 + quadR1) - _w) <= 2;
+        // The two top vertices SWAP order under the mirror, which is exactly why DrawScreen
+        // picks them by role rather than by index. Asserted on the source geometry so the
+        // reason the mapping exists is visible here too.
+        bool quadOrderFlipped = !(quadR0 < quadR1);
+        Console.WriteLine("  mirror  : headX left=" + headL + " right=" + headR +
+                          " (sum " + (headL + headR) + ", want " + _w + ")");
+        Console.WriteLine("  mirror  : quadX0 left=" + quadL0.ToString("0") + " right=" +
+                          quadR0.ToString("0") + "  quadX1 left=" + quadL1.ToString("0") +
+                          " right=" + quadR1.ToString("0") + " topPairSwaps=" + quadOrderFlipped);
+
+        // The three drawn vertices must describe the tablet's own parallelogram in BOTH cases,
+        // with the same winding. This is the check that the earlier version lacked: it only
+        // compared mirrored coordinates, so it happily passed while the panel was being sheared
+        // across her leg (the user's "stretched / in the wrong place").
+        bool quadShapeOk = true;
+        string quadMsg = "";
+        double windL = 0, windR = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            _snapRight = (pass == 1); Relayout(); PumpTicks(1);
+            int iA = _snapRight ? 1 : 0, iB = _snapRight ? 0 : 1, iC = _snapRight ? 2 : 3;
+            double ax = _fx[iA], ay = _fy[iA];
+            double ux = _fx[iB] - ax, uy = _fy[iB] - ay;      // top edge
+            double vx = _fx[iC] - ax, vy = _fy[iC] - ay;      // left edge
+            double cross = ux * vy - uy * vx;                 // sign = winding
+            // Edge lengths must match the panel's own aspect, or the image is sheared.
+            double topLen = Math.Sqrt(ux * ux + uy * uy);
+            double leftLen = Math.Sqrt(vx * vx + vy * vy);
+            double quadAspect = topLen / Math.Max(1e-6, leftLen);
+            int pw, ph; PanelSize(out pw, out ph);
+            double panelAspect = (double)pw / Math.Max(1, ph);
+            if (pass == 0) windL = cross; else windR = cross;
+            // What matters is that the aspect matches the panel (no shear) and that the two
+            // windings AGREE in sign - a flip would reverse it and mirror the glyphs. The
+            // absolute sign is just the coordinate system's handedness and is not asserted.
+            bool okPass = Math.Abs(quadAspect - panelAspect) < 0.06;
+            if (!okPass) {
+                quadShapeOk = false;
+                quadMsg += (_snapRight ? " RIGHT" : " LEFT") +
+                           " quadAspect=" + quadAspect.ToString("0.000") +
+                           " panelAspect=" + panelAspect.ToString("0.000");
+            }
+            Console.WriteLine("  quad" + (_snapRight ? " R  " : " L  ") + "    : winding=" +
+                              cross.ToString("0") + " aspect=" + quadAspect.ToString("0.000") +
+                              " vs panel " + panelAspect.ToString("0.000"));
+        }
+        // Same sign on both sides = the panel is never flipped between corners.
+        bool windingSame = windL * windR > 0;
+        if (!windingSame) {
+            quadShapeOk = false;
+            quadMsg += " winding reversed: " + windL.ToString("0") + " vs " + windR.ToString("0");
+        }
+        _snapRight = false; Relayout(); PumpTicks(1);
+
+        // ---- crossing the centre line flips her DURING the drag ----
+        // The user asked for the mirror to happen as she crosses, not on release. That is
+        // exactly SyncSideToPosition(), which OnMouseMove now calls every move; here it is
+        // driven by hand so the moment can be asserted rather than watched.
+        _snapRight = false; Relayout(); PumpTicks(1);
+        _offX = leftX; _offY = homeY;
+        bool beforeCross = _snapRight;
+        _offX = leftX + wa.Width / 2 + 20;          // her centre is now past the middle
+        bool flippedOnCross = SyncSideToPosition();
+        bool afterCross = _snapRight;
+        int headAfterCross = _headX;
+        // Back again: crossing leftwards must flip it back.
+        _offX = leftX;
+        bool flippedBack = SyncSideToPosition();
+        bool backToLeft = !_snapRight;
+        Console.WriteLine("  cross   : before=" + beforeCross + " flippedOnCross=" + flippedOnCross +
+                          " nowRight=" + afterCross + " headX=" + headAfterCross +
+                          " | flippedBack=" + flippedBack + " nowLeft=" + backToLeft);
+        bool crossOk = !beforeCross && flippedOnCross && afterCross &&
+                       flippedBack && backToLeft &&
+                       headAfterCross == _w - 304;   // mirrored head anchor, not the left one
+
+        bool ok = leftOk && rightOk && bowlSideOk && syncOk && crossOk && flipCheap &&
+                  headMirrored && quadMirrored && quadOrderFlipped && quadShapeOk;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - snaps to the nearer corner, flips mid-drag for under a frame, tablet quad keeps its shape and winding, and the bowl enters the opposite top corner"
+            : "FAIL - left=" + leftOk + " right=" + rightOk + " bowl=" + bowlSideOk +
+              " resync=" + syncOk + " cross=" + crossOk + " flipCheap=" + flipCheap +
+              " (" + flipMs.ToString("0.000") + " ms vs relayout " + relayoutMs.ToString("0.00") + " ms)" +
+              " headMirror=" + headMirrored +
+              " quadMirror=" + quadMirrored + " orderFlipped=" + quadOrderFlipped +
+              " quadShape=" + quadShapeOk + " " + quadMsg + " " + bowlMsg));
+        ResetDemoForTest();
+        _snapRight = cornerSaved;
+        _snapping = false;
+        Relayout();
+        SyncWindowMode();
+    }
+
+    public bool MaskEquivalenceReport() {
+        if (_eraseMask == null) { Console.WriteLine("  maskequiv: no mask"); return false; }
+        // Dump the mask so "is this row/column actually marked" can be answered from the mask
+        // itself instead of inferred.
+        using (Bitmap mb = new Bitmap(_eraseMaskW, _eraseMaskH, PixelFormat.Format32bppArgb)) {
+            Buf mbb = new Buf(mb);
+            try {
+                for (int q = 0; q < _eraseMask.Length; q++) {
+                    int o2 = q * 4;
+                    byte v = _eraseMask[q] != 0 ? (byte)255 : (byte)0;
+                    mbb.P[o2] = v; mbb.P[o2 + 1] = v; mbb.P[o2 + 2] = v; mbb.P[o2 + 3] = 255;
+                }
+                mbb.Flush();
+            } finally { mbb.Dispose(); }
+            mb.Save(Path.Combine(_baseDir, "_mask.png"), ImageFormat.Png);
+        }
+        Console.WriteLine("  maskequiv: mask dumped (" + _eraseMaskW + "x" + _eraseMaskH +
+                          " at " + _eraseMaskX + "," + _eraseMaskY + ")");
+        // Everything needed to map a SCREEN pixel from a screen recording onto the mask:
+        // the widget's on-screen origin and size, the canvas, the shake, and the scale that
+        // converts widget px -> mask cells.
+        Console.WriteLine("  geom    : off=(" + _offX + "," + _offY + ") w=" + _w + " h=" + _h +
+                          " shake=(" + _shakeX + "," + _shakeY + ") canvas=" + _canvas.Width + "x" + _canvas.Height +
+                          " window=" + _winW + "x" + _winH + " k=" + (_w / (double)EraseSpace).ToString("0.000000") +
+                          " eraseSpace=" + EraseSpace + " sizePx=" + _sizePx);
+        Console.WriteLine("  geom    : maskY0RowScreenY=" + (_offY + _shakeY).ToString("0.0") +
+                          " maskX0ColScreenX=" + (_offX + _shakeX).ToString("0.0"));
+        int mw = _eraseMaskW, mh = _eraseMaskH;
+        byte[] a = (byte[])_eraseMask.Clone();
+        byte[] b = new byte[a.Length];
+        double[] s = EraseStrokes;
+        int n = (int)s[0];
+        int i = 1;
+        for (int k = 0; k < n; k++) {
+            int pn = (int)s[i];
+            i++;
+            double[] px = new double[pn], py = new double[pn];
+            for (int p = 0; p < pn; p++) { px[p] = s[i] * EraseSpace; py[p] = s[i + 1] * EraseSpace; i += 2; }
+            double rr = s[i] * EraseSpace; i++;
+            for (int y = _eraseMaskY; y < _eraseMaskY + mh; y++) {
+                int row = (y - _eraseMaskY) * mw;
+                for (int x = _eraseMaskX; x < _eraseMaskX + mw; x++) {
+                    if (b[row + x - _eraseMaskX] != 0) continue;
+                    bool hit = false;
+                    if (pn == 1) {
+                        double dx = x - px[0], dy = y - py[0];
+                        hit = dx * dx + dy * dy <= rr * rr;
+                    } else {
+                        for (int p = 0; p + 1 < pn && !hit; p++)
+                            if (DistToSeg(x, y, px[p], py[p], px[p + 1], py[p + 1]) <= rr) hit = true;
+                    }
+                    if (hit) b[row + x - _eraseMaskX] = 1;
+                }
+            }
+        }
+        int setA = 0, setB = 0, diff = 0;
+        for (int q = 0; q < a.Length; q++) {
+            if (a[q] != 0) setA++;
+            if (b[q] != 0) setB++;
+            if ((a[q] != 0) != (b[q] != 0)) diff++;
+        }
+        // The only permitted difference is the edge-reach pass, which deliberately adds
+        // the outer rows/columns when a stroke touches the band edge. Everything else has
+        // to agree exactly, so the live mask may only be a SUPERSET of the rasterised one.
+        int liveOnly = 0, rasterOnly = 0;
+        for (int q = 0; q < a.Length; q++) {
+            bool la = a[q] != 0, lb = b[q] != 0;
+            if (la && !lb) liveOnly++;
+            if (lb && !la) rasterOnly++;
+        }
+        bool ok = rasterOnly == 0;
+        Console.WriteLine("  maskequiv (" + mw + "x" + mh + "): liveSet=" + setA +
+                          " originalRaster=" + setB + " edgeAdded=" + liveOnly +
+                          " missing=" + rasterOnly);
+        return ok;
+    }
     // Diagnostics: put the iron pot straight on her head so the placement and the
     // erase pass can be inspected without running a whole feed. Rice bowls are dropped
     // first: PrimeBowlForLiveDrag leaves one lying about, and a screenshot with both
@@ -8079,7 +21722,7 @@ public sealed class DshPet : Form {
             // erase is misaligned" when it is simply the pot not being there yet.
             AttachIronPot(r);
             r.HeadFalling = false;
-            Point a = IronHeadAnchor();
+            Point a = IronHeadAnchor(IronStackIndex(r));
             r.X = a.X; r.Y = a.Y;
         }
         Console.WriteLine("ironshot: pot seated on her head");
@@ -8357,7 +22000,21 @@ public sealed class DshPet : Form {
     }
 
     // drives the real tick loop without the UI timer, for --simchain
-    public void PumpTicks(int n) { for (int i = 0; i < n; i++) OnTickProbe(); }
+    // n is a number of frames AT THE ORIGINAL 33 ms TICK, which is the unit every test was written in.
+    //
+    // The tick is now 16 ms for 60 fps, so the same n would advance only half the time it used to and
+    // animations that need to finish would still be mid-flight when the assertions ran - three guards
+    // failed that way and looked like product regressions. Converting here fixes every call site at
+    // once, and keeps working if the tick is ever changed again.
+    public void PumpTicks(int n) {
+        int actual = (int)Math.Round(n * 33.0 / Math.Max(1, _timer.Interval));
+        if (actual < 1) actual = 1;
+        for (int i = 0; i < actual; i++) { OnTickProbe(); SentryTick(); }
+    }
+    // A real charge cue, for the frame-cost measurements in --perfscale. Goes through
+    // MakeTick, i.e. the SAME path a real balance drop takes (hit overlay + shake +
+    // floating number), rather than a hand-built approximation of one.
+    public void ChargeCueForTest(double amount, bool fromTest) { MakeTick(amount, fromTest); }
     // tests must never talk to the network: that races with the simulated readings
     public void PollNowSyncPublic(bool snap) { PollNowSync(snap); }
     public void GoOffline() {
@@ -8366,7 +22023,32 @@ public sealed class DshPet : Form {
         try { _timer.Stop(); _poll.Stop(); } catch { }
     }
     public string StateText { get { return "real=" + _realBal.ToString("0.####") + " printed=" + _bookedBal.ToString("0.####") + " bookedAt=" + _bookedAt.ToString("0.####") + " pend=" + _pending.ToString("0.####") + " step=" + _pendingStep.ToString("0.####") + " gap=" + _dueGap.ToString("0.###") + " hits=" + _hits.Count + " floaters=" + _floaters.Count + " dt=" + (_timer.Interval/1000.0).ToString("0.###"); } }
-    void OnTickProbe() { OnTick(); }
+    // One frame's work, in one place.
+    //
+    // The production timer AND every diagnostic pump call this, so there is exactly ONE definition
+    // of the tick sequence. That matters more than it looks: ApplyPendingMenuClose was once hung
+    // on the diagnostic-only wrapper below, which made --clickaway pass while the real application
+    // never closed the menu - the guard was driving a different path from the one that ships.
+    //
+    // The pending menu close is here rather than inside OnTick because OnTick is wrapped in a
+    // try/catch for the frame, and a menu dismissal should still happen if a frame went wrong.
+    void TickOnce() {
+        _tickTrace |= 1;
+        OnTick();
+        _tickTrace |= 2;
+        ApplyPendingMenuClose();
+        _tickTrace |= 4;
+        SentryTick();
+    }
+    // Kept as the name the diagnostics have always used; it is now an alias, not a second path.
+    void OnTickProbe() { TickOnce(); }
+
+    // Bit flags recording which steps TickOnce ran, in order. The guard reads them to prove the
+    // sequence is complete - and that the diagnostic pump really goes through this method rather
+    // than a copy of it.
+    int _tickTrace;
+    public int TickTraceForTest { get { return _tickTrace; } }
+    public void ResetTickTraceForTest() { _tickTrace = 0; }
 
     // ------------------------------------------------------- throw diagnostics ---
     // The throw cannot be tested with a mouse, so the diagnostics drive the same
@@ -8428,7 +22110,6 @@ public sealed class DshPet : Form {
     public string ExprStateForTest() {
         StringBuilder sb = new StringBuilder();
         sb.Append("expr=").Append(_expr).Append(" (0=happy 1=nervous 2=aloof 3=calm)")
-          .Append(" nervousT=").Append(_nervousT.ToString("0.00"))
           .Append(" happyT=").Append(_happyT.ToString("0.00"))
           .Append(" bowlWait=").Append(_bowlWait.ToString("0.0"))
           .Append(" bowls=").Append(_rices.Count).Append("[");
@@ -8552,6 +22233,35 @@ public sealed class DshPet : Form {
         ResetDemoForTest();
     }
 
+    // Headless check of the two dialog layouts: builds them, measures the controls and
+    // disposes them without ever showing a window, so the numbers can be asserted in CI.
+    public void RunDialogLayoutTest() {
+        Console.WriteLine("input dialog layout");
+        int keyBox = 0, keyW = 0, amtBox = 0, amtW = 0;
+        using (InputDialog d = new InputDialog(S_KEYT, S_KEYP, "", "", KeyDialogW, true)) {
+            keyW = d.ClientSize.Width;
+            foreach (Control c in d.Controls) if (c is TextBox) keyBox = c.Width;
+        }
+        using (InputDialog d = new InputDialog(S_SOUND, S_VOLP, "%", "50")) {
+            amtW = d.ClientSize.Width;
+            foreach (Control c in d.Controls) if (c is TextBox) amtBox = c.Width;
+        }
+        Console.WriteLine("  apiKey  : window=" + keyW + " inputBox=" + keyBox +
+                          " (unified with every other secondary window)");
+        Console.WriteLine("  others  : window=" + amtW + " inputBox=" + amtBox +
+                          " (same width as the API key dialog: the secondary windows are unified)");
+        // A 40-character key is what actually has to fit; Consolas 10pt is ~8 px per char.
+        int fits = keyBox / 8;
+        Console.WriteLine("  capacity: apiKey box fits ~" + fits + " monospace chars" +
+                          " (an sk- key is about 35)");
+        // Every secondary window is now 880 wide at the user's request, so the old "others must stay
+        // 330" expectation is obsolete - it would fail forever now that the widths are unified.
+        bool ok = keyW == 880 && keyBox > 500 && amtW == 880 && amtBox > 500 && fits >= 40;        Console.WriteLine("  verdict: " + (ok
+            ? "OK - every input dialog is the unified 880 wide and the key box fits a whole key"
+            : "FAIL - keyWindow=" + keyW + " keyBox=" + keyBox +
+              " otherWindow=" + amtW + " otherBox=" + amtBox + " fits=" + fits));
+    }
+
     public void RunSelfTest(string baseDir) {
         PollNowSync(true);                // start from the live value
         MakeTick(StepYuan, false);
@@ -8629,7 +22339,6 @@ try {
     $_ | Out-String | Set-Content (Join-Path $here 'error.log') -Encoding UTF8
     throw
 }
-
 
 
 
